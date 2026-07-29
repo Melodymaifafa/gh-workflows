@@ -1,0 +1,493 @@
+name: Merge after clean Codex review
+
+# Codex does not submit APPROVED reviews when it finds no issues. It either
+# posts a clean result with the reviewed commit or reacts 👍 to the PR body /
+# trusted "@codex review" comment. GitHub Actions has no reaction event, so
+# start a short-lived watcher from the request event as a fallback. The trusted
+# workflow runs from main and never checks out or executes PR code.
+#
+# Reusable. Callers declare the triggers and pass `base_branch`; see
+# README.md in this repository for the caller stub.
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        description: Integration branch that is eligible for unattended merge.
+        type: string
+        default: develop
+
+permissions:
+  actions: read
+  checks: read
+  contents: write
+  issues: read
+  pull-requests: write
+
+jobs:
+  watch-and-merge:
+    if: |
+      (
+        github.event_name == 'pull_request_target' &&
+        github.event.pull_request.state == 'open' &&
+        github.event.pull_request.draft == false &&
+        github.event.pull_request.base.ref == inputs.base_branch &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        !contains(github.event.pull_request.title, '[no-codex-merge]')
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(github.event.comment.body, '@codex review') &&
+        (
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+        contains(
+          github.event.comment.body,
+          'Codex Review: Didn''t find any major issues.'
+        )
+      )
+    concurrency:
+      group: codex-clean-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      # Only an eligible newer request can supersede the old watcher. A skipped
+      # issue_comment job never enters this job-level concurrency group.
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+      EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+      TRIGGERED_AT: ${{ github.event.comment.created_at || github.event.pull_request.updated_at }}
+      TARGET_ID: ${{ github.event.comment.id || github.event.pull_request.number }}
+      PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+      PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+    steps:
+      - name: Wait for Codex and merge a clean exact head
+        run: |
+          set -euo pipefail
+
+          # 链路断点告警（同 iterate workflow）：每次 run 至多一条，不重复。
+          push_alert() {
+            if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
+              curl -sf -X POST https://api.pushover.net/1/messages.json \
+                --form-string "token=$PUSHOVER_TOKEN" \
+                --form-string "user=$PUSHOVER_USER" \
+                --form-string "title=$1" \
+                --form-string "message=$2" >/dev/null 2>&1 || true
+            fi
+          }
+
+          codex_login='chatgpt-codex-connector[bot]'
+          clean_phrase="Codex Review: Didn't find any major issues."
+          watch_seconds=1200
+          poll_seconds=30
+          # Keep this synchronized with the job's timeout-minutes value.
+          job_timeout_seconds=1800
+          # $SECONDS starts when this step begins, so reserve a conservative
+          # allowance for runner provisioning and step startup.
+          startup_buffer_seconds=120
+          # Preserve enough time for the five-minute mergeability wait and the
+          # final merge request after all checks succeed.
+          post_checks_reserve_seconds=360
+          min_checks_wait_seconds=60
+
+          pr="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
+          state="$(jq -r .state <<<"$pr")"
+          draft="$(jq -r .draft <<<"$pr")"
+          title="$(jq -r .title <<<"$pr")"
+          base_ref="$(jq -r .base.ref <<<"$pr")"
+          expected_head="$(jq -r .head.sha <<<"$pr")"
+          head_repo="$(jq -r .head.repo.full_name <<<"$pr")"
+
+          if [ "$state" != open ] ||
+            [ "$draft" != false ] ||
+            [ "$base_ref" != "$BASE_BRANCH" ] ||
+            [ "$head_repo" != "$REPO" ] ||
+            [[ "$title" == *'[no-codex-merge]'* ]]
+          then
+            echo "::notice::PR #$PR_NUMBER is outside the auto-merge policy"
+            exit 0
+          fi
+
+          reaction_route=
+          signoff_id=
+          signoff_at=
+          signoff_kind=
+
+          if [ -n "$EVENT_HEAD" ]; then
+            # For automatic reviews, bind the watcher to the event's head SHA.
+            if [ "$expected_head" != "$EVENT_HEAD" ]; then
+              echo "::notice::PR head changed before the watcher started"
+              exit 0
+            fi
+            reaction_route="repos/$REPO/issues/$PR_NUMBER/reactions"
+          else
+            # For comment-triggered reviews, revalidate both the author and the
+            # request text. Only automation-created requests carrying the exact
+            # requested HEAD are eligible for unattended merge.
+            comment="$(gh api "repos/$REPO/issues/comments/$TARGET_ID")"
+            association="$(jq -r .author_association <<<"$comment")"
+            author="$(jq -r .user.login <<<"$comment")"
+            body="$(jq -r .body <<<"$comment")"
+            comment_created_at="$(jq -r .created_at <<<"$comment")"
+
+            if [ "$author" = "$codex_login" ] &&
+              [[ "$body" == *"$clean_phrase"* ]]
+            then
+              reviewed_prefix="$(
+                sed -nE \
+                  's/^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`.*/\1/p' \
+                  <<<"$body" |
+                  head -1
+              )"
+              if [ -z "$reviewed_prefix" ]; then
+                echo "::notice::Codex clean result has no reviewed commit"
+                exit 0
+              fi
+              reviewed_head="$(
+                gh api "repos/$REPO/commits/$reviewed_prefix" --jq .sha
+              )"
+              if [ "$expected_head" != "$reviewed_head" ]; then
+                echo "::notice::Codex clean result targets a stale PR head"
+                exit 0
+              fi
+
+              signoff_id="$TARGET_ID"
+              signoff_at="$comment_created_at"
+              signoff_kind=comment
+            elif [[ "$association" =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]] &&
+              grep -Eiq \
+                '@codex[[:space:]]+review([[:space:]]|$)' <<<"$body"
+            then
+              requested_head="$(
+                sed -nE \
+                  's/.*<!--[[:space:]]*codex-review-head:[[:space:]]*([0-9a-f]{40})[[:space:]]*-->.*/\1/p' \
+                  <<<"$body" |
+                  head -1
+              )"
+              if [ -z "$requested_head" ]; then
+                echo "::notice::Manual review request has no exact HEAD binding"
+                exit 0
+              fi
+              if [ "$expected_head" != "$requested_head" ]; then
+                echo "::notice::Review request targets a stale PR head"
+                exit 0
+              fi
+              reaction_route="repos/$REPO/issues/comments/$TARGET_ID/reactions"
+            else
+              echo "::notice::Review request is no longer eligible"
+              exit 0
+            fi
+          fi
+
+          if [ "$signoff_kind" != comment ]; then
+            deadline="$((SECONDS + watch_seconds))"
+
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              current_head="$(
+                gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha
+              )"
+              if [ "$current_head" != "$expected_head" ]; then
+                echo "::notice::PR head changed while Codex was reviewing; skipping"
+                exit 0
+              fi
+
+              signoff="$(
+                gh api --paginate --slurp "$reaction_route?per_page=100" |
+                  jq -c \
+                    --arg bot "$codex_login" \
+                    --arg since "$TRIGGERED_AT" '
+                      add
+                      | [
+                          .[]
+                          | select(
+                              .content == "+1" and
+                              .user.login == $bot and
+                              .created_at >= $since
+                            )
+                        ]
+                      | max_by(.created_at) // empty
+                    '
+              )"
+              signoff_id="$(jq -r '.id // empty' <<<"$signoff")"
+              signoff_at="$(jq -r '.created_at // empty' <<<"$signoff")"
+
+              finding_at="$(
+                gh api --paginate --slurp \
+                  "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" |
+                  jq -r \
+                    --arg bot "$codex_login" \
+                    --arg head "$expected_head" \
+                    --arg since "$TRIGGERED_AT" '
+                      add
+                      | [
+                          .[]
+                          | select(
+                              .user.login == $bot and
+                              .commit_id == $head and
+                              .submitted_at >= $since
+                            )
+                          | .submitted_at
+                        ]
+                      | max // empty
+                    '
+              )"
+
+              # The newest Codex signal wins. A COMMENTED review means Codex
+              # found issues, so leave the existing Claude workflow to handle it.
+              if [ -n "$finding_at" ] &&
+                {
+                  [ -z "$signoff_at" ] ||
+                    [[ "$finding_at" > "$signoff_at" ||
+                      "$finding_at" == "$signoff_at" ]]
+                }
+              then
+                echo "::notice::Codex reported findings for PR #$PR_NUMBER"
+                exit 0
+              fi
+              if [ -n "$signoff_at" ]; then
+                signoff_kind=reaction
+                break
+              fi
+
+              sleep "$poll_seconds"
+            done
+
+            if [ -z "$signoff_id" ]; then
+              echo "::notice::Codex produced no clean sign-off before timeout"
+              # 只有 Codex 全程零动静才告警：clean 评论会由它自己的
+              # issue_comment run 接手合并（本 run 超时是正常竞态），findings
+              # review 由迭代 workflow 接手。两者都没有 = 召唤后 Codex 再无
+              # 下文（20 分钟），链路断了，需要人工。
+              merged="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .merged 2>/dev/null || echo false)"
+              codex_comments="$(
+                gh api --paginate --slurp \
+                  "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null |
+                  jq -r \
+                    --arg bot "$codex_login" \
+                    --arg since "$TRIGGERED_AT" '
+                      add
+                      | [.[] | select(.user.login == $bot and .created_at >= $since)]
+                      | length
+                    ' || echo 0
+              )"
+              codex_reviews="$(
+                gh api --paginate --slurp \
+                  "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" 2>/dev/null |
+                  jq -r \
+                    --arg bot "$codex_login" \
+                    --arg since "$TRIGGERED_AT" '
+                      add
+                      | [.[] | select(.user.login == $bot and .submitted_at >= $since)]
+                      | length
+                    ' || echo 0
+              )"
+              if [ "$merged" != true ] &&
+                [ "$(( ${codex_comments:-0} + ${codex_reviews:-0} ))" -eq 0 ]
+              then
+                push_alert "🤖 Codex 复审超时无产出" "PR #$PR_NUMBER 的 review 请求发出后 20 分钟内 Codex 没有任何回应（无 review/评论/👍）。自动合并链路停在等待，需人工查看 PR 并重新评论 @codex review。"
+              fi
+              exit 0
+            fi
+          fi
+
+          # Wait for every PR check except this watcher itself. pull_request_target
+          # associates this job with the PR head, so `gh pr checks --watch` would
+          # otherwise wait forever on its own pending check.
+          checks_wait_seconds="$((
+            job_timeout_seconds - startup_buffer_seconds -
+            SECONDS - post_checks_reserve_seconds
+          ))"
+          if [ "$checks_wait_seconds" -lt "$min_checks_wait_seconds" ]; then
+            checks_wait_seconds="$min_checks_wait_seconds"
+          fi
+          checks_deadline="$((SECONDS + checks_wait_seconds))"
+          stable_check_polls=0
+          while [ "$SECONDS" -lt "$checks_deadline" ]; do
+            checks="$(
+              gh pr checks "$PR_NUMBER" --repo "$REPO" \
+                --json name,state,bucket,link,workflow 2>/dev/null ||
+                true
+            )"
+            if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$checks"; then
+              sleep 10
+              continue
+            fi
+
+            relevant_checks="$(
+              jq -c \
+                --arg current_run "/actions/runs/$GITHUB_RUN_ID/" \
+                --arg current_workflow "$GITHUB_WORKFLOW" '
+                [
+                  .[]
+                  | select(
+                      .workflow != $current_workflow and
+                      (((.link // "") | contains($current_run)) | not)
+                    )
+                ]
+              ' <<<"$checks"
+            )"
+            failed_checks="$(
+              jq -c \
+                '[.[] | select(.bucket == "fail" or .bucket == "cancel")]' \
+                <<<"$relevant_checks"
+            )"
+            unknown_checks="$(
+              jq -c '
+                [
+                  .[]
+                  | select(
+                      .bucket != "pass" and
+                      .bucket != "skipping" and
+                      .bucket != "pending" and
+                      .bucket != "fail" and
+                      .bucket != "cancel"
+                    )
+                ]
+              ' <<<"$relevant_checks"
+            )"
+            if [ "$(jq length <<<"$failed_checks")" -gt 0 ] ||
+              [ "$(jq length <<<"$unknown_checks")" -gt 0 ]
+            then
+              echo "::error::A PR check failed or returned an unknown state"
+              jq -c '.[]' <<<"$failed_checks"
+              jq -c '.[]' <<<"$unknown_checks"
+              exit 1
+            fi
+
+            pending_count="$(
+              jq '[.[] | select(.bucket == "pending")] | length' \
+                <<<"$relevant_checks"
+            )"
+            check_count="$(jq length <<<"$relevant_checks")"
+            if [ "$check_count" -gt 0 ] && [ "$pending_count" -eq 0 ]; then
+              stable_check_polls="$((stable_check_polls + 1))"
+              if [ "$stable_check_polls" -ge 2 ]; then
+                break
+              fi
+            else
+              stable_check_polls=0
+            fi
+
+            sleep 10
+          done
+          if [ "$stable_check_polls" -lt 2 ]; then
+            echo "::error::PR checks did not settle before timeout"
+            exit 1
+          fi
+
+          # Revalidate all privileged merge conditions after waiting for CI.
+          # GitHub may briefly report mergeable=null or mergeable_state=unknown
+          # while recomputing, so give it a bounded window to settle.
+          mergeability_deadline="$((SECONDS + 300))"
+          while true; do
+            pr="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
+            state="$(jq -r .state <<<"$pr")"
+            draft="$(jq -r .draft <<<"$pr")"
+            title="$(jq -r .title <<<"$pr")"
+            base_ref="$(jq -r .base.ref <<<"$pr")"
+            current_head="$(jq -r .head.sha <<<"$pr")"
+            head_repo="$(jq -r .head.repo.full_name <<<"$pr")"
+            mergeable="$(jq -r .mergeable <<<"$pr")"
+            mergeable_state="$(jq -r .mergeable_state <<<"$pr")"
+
+            if [ "$state" != open ] ||
+              [ "$draft" != false ] ||
+              [ "$base_ref" != "$BASE_BRANCH" ] ||
+              [ "$head_repo" != "$REPO" ] ||
+              [ "$current_head" != "$expected_head" ] ||
+              [[ "$title" == *'[no-codex-merge]'* ]]
+            then
+              echo "::notice::PR changed after Codex signed off; skipping"
+              exit 0
+            fi
+            # A pull_request_target job is attached to the PR head. GitHub
+            # therefore reports `unstable` while this watcher's own check is
+            # pending, even after every independently filtered check passed.
+            # The merge API remains the final branch-protection authority.
+            if [ "$mergeable" = true ] &&
+              [[ "$mergeable_state" =~ ^(clean|unstable)$ ]]
+            then
+              break
+            fi
+            if [ "$SECONDS" -ge "$mergeability_deadline" ]; then
+              echo "::notice::PR #$PR_NUMBER did not become cleanly mergeable"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          if [ "$signoff_kind" = reaction ]; then
+            reaction="$(
+              gh api --paginate --slurp "$reaction_route?per_page=100" |
+                jq -c --argjson id "$signoff_id" '
+                  add | .[] | select(.id == $id)
+                '
+            )"
+            if [ "$(jq -r '.content // empty' <<<"$reaction")" != '+1' ] ||
+              [ "$(jq -r '.user.login // empty' <<<"$reaction")" != "$codex_login" ]
+            then
+              echo "::notice::Codex sign-off was removed; skipping"
+              exit 0
+            fi
+          else
+            clean_comment="$(
+              gh api "repos/$REPO/issues/comments/$signoff_id"
+            )"
+            clean_author="$(jq -r .user.login <<<"$clean_comment")"
+            clean_body="$(jq -r .body <<<"$clean_comment")"
+            reviewed_prefix="$(
+              sed -nE \
+                's/^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`.*/\1/p' \
+                <<<"$clean_body" |
+                head -1
+            )"
+            reviewed_head="$(
+              gh api "repos/$REPO/commits/$reviewed_prefix" --jq .sha
+            )"
+            if [ "$clean_author" != "$codex_login" ] ||
+              [[ "$clean_body" != *"$clean_phrase"* ]] ||
+              [ "$reviewed_head" != "$expected_head" ]
+            then
+              echo "::notice::Codex clean comment changed; skipping"
+              exit 0
+            fi
+          fi
+
+          later_finding="$(
+            gh api --paginate --slurp \
+              "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" |
+              jq -r \
+                --arg bot "$codex_login" \
+                --arg head "$expected_head" \
+                --arg signoff "$signoff_at" '
+                  add
+                  | [
+                      .[]
+                      | select(
+                          .user.login == $bot and
+                          .commit_id == $head and
+                          .submitted_at >= $signoff
+                        )
+                      | .id
+                    ]
+                  | first // empty
+                '
+          )"
+          if [ -n "$later_finding" ]; then
+            echo "::notice::Codex reported findings after its sign-off; skipping"
+            exit 0
+          fi
+
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch \
+            --match-head-commit "$expected_head"

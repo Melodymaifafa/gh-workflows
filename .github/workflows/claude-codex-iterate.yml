@@ -1,0 +1,310 @@
+# Codex 提交 PR review 后，让 Claude 读取评论内容并迭代这个 PR，随后请求复审。
+# 逃生阀：PR 标题里加 [no-claude] 即可对单个 PR 关闭此自动化。
+name: Claude iterates on Codex review
+
+#
+# Reusable. Callers declare the trigger and pass `runtime`; see README.md in
+# this repository for the caller stub.
+on:
+  workflow_call:
+    inputs:
+      runtime:
+        description: python | node — picks the toolchain, verify commands and tool allowlist.
+        type: string
+        default: python
+      verify_cmd:
+        description: Override the verify commands Claude must run before pushing (one per line).
+        type: string
+        default: ''
+      extra_tools:
+        description: Override the runtime-specific entries appended to --allowedTools.
+        type: string
+        default: ''
+      project_note:
+        description: One extra sentence appended to the prompt for repo-specific caveats.
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+# 同一个 PR 上的多轮触发排队执行，不并行互踩
+concurrency:
+  group: claude-codex-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  iterate:
+    # 仅响应 Codex 的 review、仅在 PR 还开着时（合并后分支已删，checkout 会扑空）
+    if: |
+      github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.pull_request.state == 'open' &&
+      !contains(github.event.pull_request.title, '[no-claude]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      # prompt 要求跑构建/测试命令，runner 不预装这些工具链；
+      # 缺了它 Claude 会耗几轮尝试自装（pip 不在白名单）直到轮数耗尽
+      - uses: astral-sh/setup-uv@v5
+        if: inputs.runtime == 'python'
+
+      - uses: actions/setup-node@v4
+        if: inputs.runtime == 'node'
+        with:
+          node-version: '20'
+
+      # 把 runtime 展开成「验证命令」和「工具白名单」两个值，供下一步引用。
+      # 放在 step 里而不是内联三元表达式，是为了让默认值可读、可扩展。
+      - name: Resolve runtime defaults
+        env:
+          RUNTIME: ${{ inputs.runtime }}
+          VERIFY_OVERRIDE: ${{ inputs.verify_cmd }}
+          TOOLS_OVERRIDE: ${{ inputs.extra_tools }}
+        run: |
+          set -euo pipefail
+
+          case "$RUNTIME" in
+            python)
+              default_verify=$'uv sync --dev\nuv run ruff check .\nuv run pytest'
+              default_tools='Bash(uv:*),Bash(uvx:*)'
+              ;;
+            node)
+              default_verify=$'npm ci || npm install\nnpm run lint --if-present\nnpm test'
+              default_tools='Bash(npm:*),Bash(npx:*),Bash(node:*)'
+              ;;
+            *)
+              echo "::error::unknown runtime '$RUNTIME' (expected python or node)"
+              exit 1
+              ;;
+          esac
+
+          verify="$VERIFY_OVERRIDE"
+          if [ -z "$verify" ]; then
+            verify="$default_verify"
+          fi
+
+          tools="$TOOLS_OVERRIDE"
+          if [ -z "$tools" ]; then
+            tools="$default_tools"
+          fi
+
+          {
+            echo "VERIFY_CMD<<__GHA_EOF__"
+            printf '%s\n' "$verify"
+            echo "__GHA_EOF__"
+            echo "EXTRA_TOOLS=$tools"
+          } >>"$GITHUB_ENV"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # action 默认无视 bot 发起的触发（防循环）；本工作流的触发者恰恰是 Codex bot
+          allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"
+          # 全量输出进日志，否则只有 init/result 两行，排障全靠猜
+          show_full_output: true
+          # runner 里 Bash 默认被禁；按需放行，不用宽泛的 git:* / gh pr:*
+          # （review 内容属于外部输入，配合 write 权限的 token 需收窄注入面）
+          # 注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件
+          claude_args: |
+            --max-turns 80
+            --allowedTools "Edit,MultiEdit,Write,Bash(gh api:*),Bash(git fetch:*),Bash(git pull:*),Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git status),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),${{ env.EXTRA_TOOLS }}"
+          prompt: |
+            Codex 刚刚 review 了 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }}。
+            本次 reviewed commit：${{ github.event.review.commit_id }}
+
+            Review 正文：
+            ---
+            ${{ github.event.review.body }}
+            ---
+
+            请按以下步骤迭代这个 PR：
+            1. 用 gh 拉取本次 review（id=${{ github.event.review.id }}）的行内评论，获得完整上下文：
+               gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews/${{ github.event.review.id }}/comments" --paginate
+            2. 逐条判断建议：真 bug 或明确改进 → 修；纯风格偏好、误报、
+               或之前轮次已经处理过的 → 跳过并记录理由。
+            3. 如有代码改动，push 前必须验证：
+            ${{ env.VERIFY_CMD }}
+               ${{ inputs.project_note }}
+            4. commit 并 push 到当前 PR 分支，然后发一条 PR 评论总结（简体中文）。
+               评论读者是非程序员的仓库主人，手机上扫一眼用，必须短、大白话：
+               - 第一行就是结论：「修了 N 条，跳过 M 条」。
+               - 之后每条建议单独一个 Markdown 列表项（必须 `- ` 开头——相邻
+                 裸行会被 GitHub 渲染合并成一段，用列表才能一条占一行）：
+                 - ✅ 修：<一句话：原来会出什么问题 → 改后行为怎么变>
+                 - ⏭️ 跳过：<一句话理由（如：纯风格偏好 / 上轮已处理过）>
+               - 不写实现细节、不贴代码、不复述 diff；函数名/变量名尽量不出现，
+                 非提不可就放句尾括号，去掉括号后句子仍要通顺。
+               - 最后一行给验证结果（如「lint + 测试全绿」）。若本仓库有无法在
+                 runner 上验证的改动，在那一行注明还需要什么人工验证。
+            5. 如果没有任何可采纳的建议，不要 push，只发一条一两句话的评论说明原因。
+            6. 不要自行请求 Codex 复审或 merge PR。后续 workflow step 会在确认 HEAD
+               变化后等待冷却并请求复审；Codex 无重大问题且 CI 全绿时，
+               本仓库的 codex-approved-merge 工作流会负责合并。
+
+      - name: Request Codex re-review after a new commit
+        env:
+          # 必须属于已连接 Codex 的真人账号；GITHUB_TOKEN 的 bot 评论会被 Codex 拒绝。
+          GH_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEWED_SHA: ${{ github.event.review.commit_id }}
+          REVIEWED_AT: ${{ github.event.review.submitted_at }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+        run: |
+          set -euo pipefail
+
+          # 链路断点告警：静默失败过一次就没人知道流水线停了（同 adb 看门狗的
+          # 教训），每个终态失败路径都推一条 Pushover；每次 run 至多一条，不重复。
+          push_alert() {
+            if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
+              curl -sf -X POST https://api.pushover.net/1/messages.json \
+                --form-string "token=$PUSHOVER_TOKEN" \
+                --form-string "user=$PUSHOVER_USER" \
+                --form-string "title=$1" \
+                --form-string "message=$2" >/dev/null 2>&1 || true
+            fi
+          }
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::CODEX_TRIGGER_TOKEN is missing; request @codex review manually"
+            push_alert "🤖 Codex 召唤令牌缺失" "repo secret CODEX_TRIGGER_TOKEN 为空，PR #$PR_NUMBER 无法自动召唤复审。需在仓库 Settings→Secrets 补上 fine-grained PAT，并对该 PR 手动评论 @codex review。"
+            exit 0
+          fi
+
+          # 令牌探活：fine-grained PAT 过期/被撤销时后续 gh 调用全 401，
+          # 早发现早告警，而不是让 set -e 无声炸掉。
+          if ! gh api "repos/$REPO" --jq .id >/dev/null 2>&1; then
+            echo "::warning::CODEX_TRIGGER_TOKEN cannot read $REPO (expired or revoked?)"
+            push_alert "🤖 Codex 召唤令牌失效" "CODEX_TRIGGER_TOKEN 无法访问仓库（疑似过期/被撤销），PR #$PR_NUMBER 无法自动召唤复审。需重建 fine-grained PAT 更新 repo secret，并对该 PR 手动评论 @codex review。"
+            exit 0
+          fi
+
+          head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          if [ "$head_sha" = "$REVIEWED_SHA" ]; then
+            echo "HEAD unchanged; skipping Codex re-review"
+            exit 0
+          fi
+
+          reviewed_epoch="$(date -d "$REVIEWED_AT" +%s)"
+
+          # 召唤窗口 6/12/18 分钟（自上轮 review 起算）。实测（2026-07-15 PR
+          # #54/#62）连发数次后 Codex 会限流静默，固定等多久都是赌；改成短窗口
+          # 先试 + 👀 回执验证，没回执再到下个窗口重试，快于一刀切等 11 分钟，
+          # 也不再静默失败。Codex 收到召唤通常 1 分钟内在评论上点 👀。
+          # 回执 = 以下任意一种（都只认 Codex bot，且回应必须绑定当前 HEAD——
+          # 迟到的旧结果会被 merge watcher 以 stale 拒掉，不能当回执把重试吃掉，
+          # Codex review #101 P2-a）：
+          #   a) 召唤评论上的 👀（旁人手滑点的不算，#98 P2）
+          #   b) commit_id == 当前 HEAD 的 review（翻页查，#100 P2）
+          #   c) Reviewed commit 前缀匹配当前 HEAD 的 clean 评论
+          comment_id=""
+          export SUMMONED_AT=""
+          codex_acked() {
+            if [ -n "$comment_id" ]; then
+              eyes="$(gh api "repos/$REPO/issues/comments/$comment_id/reactions" \
+                --jq '[.[] | select(.content == "eyes" and .user.login == "chatgpt-codex-connector[bot]")] | length' 2>/dev/null || echo 0)"
+              if [ "${eyes:-0}" -gt 0 ]; then
+                return 0
+              fi
+            fi
+            if [ -z "$SUMMONED_AT" ]; then
+              return 1
+            fi
+            reviews_after="$(
+              gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" 2>/dev/null |
+                jq -r --arg head "$head_sha" '
+                  add
+                  | [.[] | select(
+                      .user.login == "chatgpt-codex-connector[bot]" and
+                      .commit_id == $head and
+                      .submitted_at > env.SUMMONED_AT
+                    )]
+                  | length
+                ' || echo 0
+            )"
+            if [ "${reviews_after:-0}" -gt 0 ]; then
+              return 0
+            fi
+            clean_after="$(
+              gh api --paginate --slurp "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null |
+                jq -r --arg head "$head_sha" '
+                  add
+                  | [.[] | select(
+                      .user.login == "chatgpt-codex-connector[bot]" and
+                      .created_at > env.SUMMONED_AT and
+                      (.body | test("\\*\\*Reviewed commit:\\*\\* `[0-9a-f]{7,40}`"))
+                    )
+                    | (.body | capture("\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`").sha)
+                    | select(. as $short | $head | startswith($short))]
+                  | length
+                ' || echo 0
+            )"
+            if [ "${clean_after:-0}" -gt 0 ]; then
+              return 0
+            fi
+            return 1
+          }
+
+          last_summon=0
+          for attempt in 1 2 3; do
+            target="$((reviewed_epoch + attempt * 360))"
+            # 前面的 Claude 步骤跑得久时，窗口可能已全部过期（delay 全为负），
+            # 三连发只隔 ~150s 会复刻限流 burst；强制每次召唤距上一次真实召唤
+            # ≥360s（Codex review P1）。
+            floor="$((last_summon + 360))"
+            if [ "$floor" -gt "$target" ]; then
+              target="$floor"
+            fi
+            delay="$((target - $(date +%s)))"
+            if [ "$delay" -gt 0 ]; then
+              echo "attempt $attempt: waiting ${delay}s for the summon window"
+              sleep "$delay"
+            fi
+
+            # 上一轮召唤可能在 150s 检查之后才被接住；此时再发会启动新的
+            # merge watcher 并 cancel 掉正在等 CI 的有效 clean-result watcher
+            # （codex-approved-merge 的 concurrency 是 cancel-in-progress），
+            # 白白丢掉签核（Codex review #101 P2-b）。发前先重查。
+            if codex_acked; then
+              echo "previous summon was acknowledged after its poll window; not re-summoning"
+              exit 0
+            fi
+
+            current_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+            if [ "$current_sha" != "$head_sha" ]; then
+              echo "PR HEAD changed while waiting; skipping stale Codex re-review"
+              exit 0
+            fi
+
+            SUMMONED_AT="$(date -u +%FT%TZ)"
+            printf -v request_body \
+              '@codex review\n\n<!-- codex-review-head: %s -->' \
+              "$head_sha"
+            comment_url="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$request_body")"
+            comment_id="${comment_url##*issuecomment-}"
+            last_summon="$(date +%s)"
+            echo "attempt $attempt: summoned ($comment_url)"
+
+            ack_deadline="$(( $(date +%s) + 150 ))"
+            while [ "$(date +%s)" -lt "$ack_deadline" ]; do
+              sleep 15
+              if codex_acked; then
+                echo "Codex acknowledged attempt $attempt"
+                exit 0
+              fi
+            done
+
+            echo "::warning::attempt $attempt got no Codex acknowledgment within 150s"
+          done
+
+          echo "::warning::Codex never acknowledged after 3 summon attempts; comment '@codex review' manually"
+          push_alert "🤖 Codex 三次召唤均无回应" "PR #$PR_NUMBER 在 6/12/18 分钟窗口召唤三次，均无 👀/review 回应，自动复审链路中断。需人工在 PR 上评论 @codex review。"

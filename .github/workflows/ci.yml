@@ -1,0 +1,98 @@
+# 可复用 CI：安装依赖 → lint → 测试。任何一步失败，PR 上就显示红叉。
+#
+# 调用方只需要传 runtime（python 或 node），命令走默认值；
+# 仓库有特殊情况时再用 install_cmd / lint_cmd / test_cmd 单独覆盖。
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      runtime:
+        description: python | node
+        type: string
+        default: python
+      install_cmd:
+        description: Override the dependency install command.
+        type: string
+        default: ''
+      lint_cmd:
+        description: Override the lint command. Pass "skip" to disable linting.
+        type: string
+        default: ''
+      test_cmd:
+        description: Override the test command. Pass "skip" to disable tests.
+        type: string
+        default: ''
+      node_version:
+        type: string
+        default: '20'
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        if: inputs.runtime == 'python'
+
+      - uses: actions/setup-node@v4
+        if: inputs.runtime == 'node'
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      # 把 runtime 展开成三条命令。默认值放在这里而不是各仓库的调用桩里，
+      # 以后要统一改 lint 规则只改这一处。
+      - name: Resolve commands
+        env:
+          RUNTIME: ${{ inputs.runtime }}
+          INSTALL_OVERRIDE: ${{ inputs.install_cmd }}
+          LINT_OVERRIDE: ${{ inputs.lint_cmd }}
+          TEST_OVERRIDE: ${{ inputs.test_cmd }}
+        run: |
+          set -euo pipefail
+
+          case "$RUNTIME" in
+            python)
+              default_install='uv sync --dev'
+              default_lint='uv run ruff check .'
+              default_test='uv run pytest'
+              ;;
+            node)
+              # 没有 lockfile 时 npm ci 会直接失败，退回 npm install。
+              default_install='if [ -f package-lock.json ]; then npm ci; else npm install; fi'
+              default_lint='npm run lint --if-present'
+              default_test='npm test'
+              ;;
+            *)
+              echo "::error::unknown runtime '$RUNTIME' (expected python or node)"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "INSTALL_CMD=${INSTALL_OVERRIDE:-$default_install}"
+            echo "LINT_CMD=${LINT_OVERRIDE:-$default_lint}"
+            echo "TEST_CMD=${TEST_OVERRIDE:-$default_test}"
+          } >>"$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: eval "$INSTALL_CMD"
+
+      # "skip" 是给暂时没有 lint/测试的仓库的逃生阀：显式跳过，
+      # 而不是让一条不存在的命令报错、或让空命令伪装成通过。
+      - name: Lint
+        run: |
+          if [ "$LINT_CMD" = skip ]; then
+            echo "::notice::lint skipped by caller"
+            exit 0
+          fi
+          eval "$LINT_CMD"
+
+      - name: Test
+        run: |
+          if [ "$TEST_CMD" = skip ]; then
+            echo "::notice::tests skipped by caller"
+            exit 0
+          fi
+          eval "$TEST_CMD"
