@@ -54,15 +54,20 @@ for f in ci claude-codex-iterate codex-approved-merge; do
   sed "s|__RUNTIME__|$runtime|g" "$STUB_DIR/$f.yml" >".github/workflows/$f.yml"
 done
 
-if git diff --quiet -- .github/workflows; then
+# 必须先 add 再比对：调用桩是全新文件时 git diff 看不见未跟踪文件，
+# 会误报「无需提交」。
+git add .github/workflows
+if git diff --cached --quiet; then
   echo "    调用桩已是最新，无需提交"
 else
-  git add .github/workflows
   git -c user.name=Melody -c user.email=melodystitchqi@gmail.com \
     commit --quiet -m "ci: adopt shared workflows from $CENTRAL"
-  git push --quiet origin develop
-  echo "    调用桩已提交到 develop"
+  echo "    调用桩已提交"
 fi
+
+# develop 可能是刚建的本地分支，无论有没有新 commit 都要推一次
+git push --quiet origin develop
+echo "    develop 已推送"
 
 # 3. main fast-forward 到 develop。develop 是从 main 切出来的，
 #    只多了这一笔，所以一定能 FF；推不动就说明 main 有分叉，报错退出。
