@@ -22,7 +22,17 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 ./onboard.sh <repo> <python|node>
 ```
 
-脚本会建 develop、提交调用桩、把 main FF 过去、刷密钥。之后还剩**一件必须手动做的事**：在 ChatGPT 里把 Codex connector 授权给这个仓库（没有 API）。
+脚本会建 develop、提交调用桩、把 main FF 过去、刷密钥。
+
+仓库没有依赖清单 / lint 配置 / 测试时，把对应步骤设成 `skip`，避免第一天就满屏红叉：
+
+```
+INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip ./onboard.sh <repo> node
+```
+
+**只能用在私有仓库。** 公开仓库调用私有仓库里的可复用工作流会直接失败（run 0 秒、没有 job、只报 "workflow file issue"）。要给公开仓库用，得先把本仓库改成 public。
+
+Codex connector 是账号级授权，新仓库无需单独授权（2026-07-29 在 learn-api-integrations 实测：新开的 PR 2 分钟内就被自动 review 并 👍）。
 
 ## 调用桩长什么样
 
