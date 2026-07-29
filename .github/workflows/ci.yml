@@ -62,7 +62,8 @@ jobs:
               # 没有 lockfile 时 npm ci 会直接失败，退回 npm install。
               default_install='if [ -f package-lock.json ]; then npm ci; else npm install; fi'
               default_lint='npm run lint --if-present'
-              default_test='npm test'
+              # --if-present：没有 test 脚本的仓库跳过而不是报 "Missing script"
+              default_test='npm run test --if-present'
               ;;
             *)
               echo "::error::unknown runtime '$RUNTIME' (expected python or node)"

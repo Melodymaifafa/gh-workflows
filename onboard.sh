@@ -7,6 +7,10 @@
 # 做四件事：建 develop 分支、在 develop 上提交调用桩、把 main fast-forward
 # 到 develop、刷密钥。密钥从 ~/.config/gh-workflows/secrets.env 读，
 # 值不会打印到终端。缺哪个就跳过哪个并提示。
+#
+# 仓库没有依赖清单 / lint 配置 / 测试时，用环境变量把对应步骤设成 skip，
+# 避免第一次接入就满屏红叉：
+#   INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip ./onboard.sh <repo> node
 set -euo pipefail
 
 OWNER=Melodymaifafa
@@ -50,9 +54,33 @@ fi
 
 # 2. 调用桩。每个仓库只留这三个小文件，逻辑全在中央仓库。
 mkdir -p .github/workflows
+
+# 只有显式传了覆盖值才写进调用桩，没传就留空、走中央仓库的默认命令
+overrides=""
+for var in INSTALL_CMD LINT_CMD TEST_CMD; do
+  value="${!var:-}"
+  if [ -n "$value" ]; then
+    key="$(tr '[:upper:]' '[:lower:]' <<<"$var")"
+    overrides+="      $key: '$value'"$'\n'
+  fi
+done
+overrides="${overrides%$'\n'}"
+
 for f in ci claude-codex-iterate codex-approved-merge; do
   sed "s|__RUNTIME__|$runtime|g" "$STUB_DIR/$f.yml" >".github/workflows/$f.yml"
 done
+# __OVERRIDES__ 占位符只在 ci.yml 里；用 python 替换以免 sed 处理多行麻烦
+OVERRIDES="$overrides" python3 - <<'PY'
+import os, pathlib
+p = pathlib.Path(".github/workflows/ci.yml")
+body = p.read_text()
+block = os.environ.get("OVERRIDES", "")
+if block:
+    body = body.replace("__OVERRIDES__\n", block + "\n")
+else:
+    body = body.replace("__OVERRIDES__\n", "")
+p.write_text(body)
+PY
 
 # 必须先 add 再比对：调用桩是全新文件时 git diff 看不见未跟踪文件，
 # 会误报「无需提交」。
