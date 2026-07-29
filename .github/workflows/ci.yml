@@ -77,11 +77,16 @@ jobs:
             echo "TEST_CMD=${TEST_OVERRIDE:-$default_test}"
           } >>"$GITHUB_ENV"
 
+      # "skip" 是给暂时没有依赖清单 / lint 配置 / 测试的仓库的逃生阀：
+      # 显式跳过，而不是让一条不存在的命令报错、或让空命令伪装成通过。
       - name: Install dependencies
-        run: eval "$INSTALL_CMD"
+        run: |
+          if [ "$INSTALL_CMD" = skip ]; then
+            echo "::notice::install skipped by caller"
+            exit 0
+          fi
+          eval "$INSTALL_CMD"
 
-      # "skip" 是给暂时没有 lint/测试的仓库的逃生阀：显式跳过，
-      # 而不是让一条不存在的命令报错、或让空命令伪装成通过。
       - name: Lint
         run: |
           if [ "$LINT_CMD" = skip ]; then
