@@ -57,7 +57,7 @@ mkdir -p .github/workflows
 
 # 只有显式传了覆盖值才写进调用桩，没传就留空、走中央仓库的默认命令
 overrides=""
-for var in INSTALL_CMD LINT_CMD TEST_CMD; do
+for var in INSTALL_CMD LINT_CMD TEST_CMD RUNS_ON; do
   value="${!var:-}"
   if [ -n "$value" ]; then
     key="$(tr '[:upper:]' '[:lower:]' <<<"$var")"

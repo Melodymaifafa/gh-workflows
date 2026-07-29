@@ -26,10 +26,14 @@ on:
       node_version:
         type: string
         default: '20'
+      runs_on:
+        description: Runner label. Use macos-latest for packages restricted to darwin.
+        type: string
+        default: ubuntu-latest
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     steps:
       - uses: actions/checkout@v5
 
