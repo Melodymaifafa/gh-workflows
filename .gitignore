@@ -1,0 +1,5 @@
+# The filled-in secrets file lives at ~/.config/gh-workflows/secrets.env and must never
+# land here. Ignored anyway so a stray `git add -A` cannot publish it — this repo is public.
+secrets.env
+*.env
+!secrets.env.example
