@@ -6,7 +6,12 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 - `develop` 收 PR，所有 workflow 都由「PR 打向 develop」触发
 - `main` 只做 `develop` 的 fast-forward（约两周一次），保存真正能用的版本
-- 升级方式：点 **Actions → Fast-forward main → Run workflow**（`ff-main.yml`）。绝不用 merge / squash —— 一旦产生合并记录，两条分支从此永久分叉，再也回不到快进。
+- 升级方式：`ff-main.yml` 每月 1 / 15 号自动跑（约每两周），也能手动点 **Actions → Fast-forward main**。绝不用 merge / squash —— 一旦产生合并记录，两条分支从此永久分叉，再也回不到快进。
+- 自动挪安全的前提是**快进不销毁任何东西**：main 原来那个 commit 是新 commit 的祖先，一直在历史里。发现问题就把指针挪回去 —— `gh api -X PATCH repos/<slug>/git/refs/heads/main -f sha=<旧 sha> -F force=true`（往回是非快进，所以要 `force`；往前不用）。旧 sha 在 Actions 那次 run 的摘要里，或仓库 Insights → Network。
+- 定时挪的代价是 `main` 不再等于「我确认过这版能用」。两道闸门是那句话的自动替代品：
+  - **泡够 7 天**（`min_age_days`）—— 落点不是 develop 的最新位置，而是它 7 天前的位置。追到最新会让 main 和 develop 一模一样，那就没有可退的点了；泡 7 天保证 main 上每一笔都在 develop 上活过一周。填 `0` 关掉。
+  - **CI 全绿**（`require_green`）—— 落点 commit 有失败、还在跑、或压根没跑过 CI，都跳过并推一条 Pushover。「没跑过 CI」不是「没问题」，是「不知道」。
+  - 两道都想无视：手动跑一次，`min_age_days` 填 0、取消勾选 `require_green`。
 - 手动等价命令：`git push origin origin/develop:main`。**注意左边要写 `origin/develop`,不是 `develop`** —— `develop` 指的是你本地那个分支,忘了 `git fetch` 就会把 main 推到一个过期的位置,而且这仍然是一次合法快进,git 不报错、你也看不出来。workflow 走 API 读远端,不存在这个坑。
 
 ## 三个工作流
@@ -16,7 +21,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
 | `claude-codex-iterate.yml` | Codex 提交 review 后 | Claude 读评论、改代码、跑验证、push、发中文总结，然后召唤复审 |
 | `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` | 等 Codex 无意见 + CI 全绿，自动 squash 合入 develop |
-| `ff-main.yml` | 手动点（Actions → Fast-forward main） | 把 main 快进到 develop。纯 API 挪指针，分叉了就报错拒绝 |
+| `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
 
 ## 开一个新项目（从零）
 
