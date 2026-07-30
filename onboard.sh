@@ -66,7 +66,7 @@ for var in INSTALL_CMD LINT_CMD TEST_CMD RUNS_ON; do
 done
 overrides="${overrides%$'\n'}"
 
-for f in ci claude-codex-iterate codex-approved-merge; do
+for f in ci claude-codex-iterate codex-approved-merge ff-main; do
   sed "s|__RUNTIME__|$runtime|g" "$STUB_DIR/$f.yml" >".github/workflows/$f.yml"
 done
 # __OVERRIDES__ 占位符只在 ci.yml 里；用 python 替换以免 sed 处理多行麻烦
