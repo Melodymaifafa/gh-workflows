@@ -66,7 +66,7 @@ for var in INSTALL_CMD LINT_CMD TEST_CMD RUNS_ON; do
 done
 overrides="${overrides%$'\n'}"
 
-for f in ci claude-codex-iterate codex-approved-merge; do
+for f in ci claude-codex-iterate codex-approved-merge ff-main; do
   sed "s|__RUNTIME__|$runtime|g" "$STUB_DIR/$f.yml" >".github/workflows/$f.yml"
 done
 # __OVERRIDES__ 占位符只在 ci.yml 里；用 python 替换以免 sed 处理多行麻烦
@@ -121,4 +121,5 @@ else
   echo "    ⚠️  找不到 $SECRETS_FILE，本仓库未设置任何密钥" >&2
 fi
 
-echo "    完成。还需人工：在 ChatGPT 里把 Codex connector 授权给 $slug"
+# Codex connector 是账号级授权，新仓库自动覆盖（2026-07-29 实测），这里不用管。
+echo "    完成。还需人工：把 $slug 的默认分支改成 develop（gh repo edit $slug --default-branch develop）"

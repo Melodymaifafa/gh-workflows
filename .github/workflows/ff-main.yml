@@ -1,0 +1,102 @@
+# 把 main fast-forward 到 develop —— 只挪指针，绝不 merge / squash（那会让两条分支永久分叉）。
+# 纯 API 操作：不 checkout、不上传代码，跟谁的本地仓库是不是最新完全无关。
+name: Fast-forward main
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        description: 拿哪个分支的位置（默认 develop）。
+        type: string
+        default: develop
+      target:
+        description: 要挪的分支（默认 main）。
+        type: string
+        default: main
+      dry_run:
+        description: 只报告会发生什么，不真的挪。
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# 同一个仓库不并行挪同一个指针
+concurrency:
+  group: ff-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  fast-forward:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move ${{ inputs.target }} to ${{ inputs.source }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ inputs.target }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          say() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          # compare 的 status 一次回答「能不能快进」，比自己算祖先关系省一次 clone。
+          # base...head 的语义:head 相对 base 的位置。
+          cmp="$(gh api "repos/$REPO/compare/$TARGET...$SOURCE")"
+          status="$(jq -r .status <<<"$cmp")"
+          ahead="$(jq -r .ahead_by <<<"$cmp")"
+          behind="$(jq -r .behind_by <<<"$cmp")"
+          sha="$(jq -r .commits[-1].sha <<<"$cmp" 2>/dev/null || true)"
+
+          case "$status" in
+            identical)
+              say "### ✅ 无需操作"
+              say ""
+              say "\`$TARGET\` 已经和 \`$SOURCE\` 在同一个 commit 上。"
+              exit 0
+              ;;
+            ahead) ;;  # 唯一可以继续的情况
+            behind)
+              say "### ❌ 方向反了，没有动"
+              say ""
+              say "\`$TARGET\` 比 \`$SOURCE\` 还多 $behind 个 commit —— 说明有人直接往 \`$TARGET\` 上提交了。"
+              say "先把 \`$TARGET\` 的内容并回 \`$SOURCE\`，再来跑这个。"
+              exit 1
+              ;;
+            diverged)
+              say "### ❌ 两条分支已分叉，没有动"
+              say ""
+              say "\`$SOURCE\` 领先 $ahead 个、\`$TARGET\` 另有 $behind 个 commit，快进已不可能。"
+              say "**不要强推** —— 那会丢掉 \`$TARGET\` 上那 $behind 个 commit。"
+              say "[看两边差在哪](https://github.com/$REPO/compare/$TARGET...$SOURCE)"
+              exit 1
+              ;;
+            *)
+              say "### ❌ 未知的比对结果 \`$status\`，没有动"
+              exit 1
+              ;;
+          esac
+
+          # compare 只回最近 250 个 commit;超过就自己取 source 的 sha,别推错位置。
+          if [ -z "$sha" ] || [ "$sha" = null ]; then
+            sha="$(gh api "repos/$REPO/git/ref/heads/$SOURCE" --jq .object.sha)"
+          fi
+
+          if [ "$DRY_RUN" = true ]; then
+            say "### 🔍 试跑，什么都没改"
+            say ""
+            say "会把 \`$TARGET\` 前移 $ahead 个 commit,到 \`${sha:0:7}\`。"
+            exit 0
+          fi
+
+          # force 默认 false:GitHub 服务端自己拒绝非快进,这是最后一道保险。
+          gh api -X PATCH "repos/$REPO/git/refs/heads/$TARGET" -f sha="$sha" -F force=false >/dev/null
+
+          say "### ✅ \`$TARGET\` 已前移 $ahead 个 commit"
+          say ""
+          say "现在指向 \`${sha:0:7}\`,和 \`$SOURCE\` 一致。"
+          say ""
+          say "> 这次推送用的是 Actions 自带令牌,按 GitHub 的防递归规则**不会触发 \`$TARGET\` 上的 CI**。"
+          say "> 这些 commit 在 \`$SOURCE\` 上已经跑过一遍了,内容完全相同。"

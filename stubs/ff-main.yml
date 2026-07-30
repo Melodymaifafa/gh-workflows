@@ -1,0 +1,30 @@
+name: Fast-forward main
+
+# 手动触发：仓库 → Actions → Fast-forward main → Run workflow。
+# 不设定时：main 的意义是「我确认过这版能用」，自动挪就把那个判断删掉了。
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 拿哪个分支的位置
+        type: string
+        default: develop
+      target:
+        description: 要挪的分支
+        type: string
+        default: main
+      dry_run:
+        description: 只看会发生什么，不真的挪
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  fast-forward:
+    uses: Melodymaifafa/gh-workflows/.github/workflows/ff-main.yml@v1
+    with:
+      source: ${{ inputs.source }}
+      target: ${{ inputs.target }}
+      dry_run: ${{ inputs.dry_run }}

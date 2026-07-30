@@ -6,7 +6,8 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 - `develop` 收 PR，所有 workflow 都由「PR 打向 develop」触发
 - `main` 只做 `develop` 的 fast-forward（约两周一次），保存真正能用的版本
-- 升级命令：`git push origin develop:main`（绝不用 merge / squash，否则两个分支会分叉）
+- 升级方式：点 **Actions → Fast-forward main → Run workflow**（`ff-main.yml`）。绝不用 merge / squash —— 一旦产生合并记录，两条分支从此永久分叉，再也回不到快进。
+- 手动等价命令：`git push origin origin/develop:main`。**注意左边要写 `origin/develop`,不是 `develop`** —— `develop` 指的是你本地那个分支,忘了 `git fetch` 就会把 main 推到一个过期的位置,而且这仍然是一次合法快进,git 不报错、你也看不出来。workflow 走 API 读远端,不存在这个坑。
 
 ## 三个工作流
 
@@ -15,14 +16,23 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
 | `claude-codex-iterate.yml` | Codex 提交 review 后 | Claude 读评论、改代码、跑验证、push、发中文总结，然后召唤复审 |
 | `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` | 等 Codex 无意见 + CI 全绿，自动 squash 合入 develop |
+| `ff-main.yml` | 手动点（Actions → Fast-forward main） | 把 main 快进到 develop。纯 API 挪指针，分叉了就报错拒绝 |
 
-## 接一个新仓库
+## 开一个新项目（从零）
+
+```
+./newrepo.sh <name> <python|node> [--public]
+```
+
+建远端仓库（默认 private）→ 装自动化 → 默认分支改 `develop` → 克隆到 `~/projects/<name>`。新仓库还没有依赖清单，CI 三步默认 `skip`；写完代码删掉 `ci.yml` 里的 `install_cmd` / `lint_cmd` / `test_cmd` 三行就开启。
+
+## 接一个已有仓库
 
 ```
 ./onboard.sh <repo> <python|node>
 ```
 
-脚本会建 develop、提交调用桩、把 main FF 过去、刷密钥。
+脚本会建 develop、提交调用桩、把 main FF 过去、刷密钥。**接完记得手动把默认分支改成 `develop`**（`newrepo.sh` 已经代劳，见下方踩过的坑）。
 
 仓库没有依赖清单 / lint 配置 / 测试时，把对应步骤设成 `skip`，避免第一天就满屏红叉：
 
