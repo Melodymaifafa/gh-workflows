@@ -69,8 +69,17 @@ jobs:
               # --if-present：没有 test 脚本的仓库跳过而不是报 "Missing script"
               default_test='npm run test --if-present'
               ;;
+            shell)
+              # 给「只有 bash 脚本 + workflow YAML」的仓库用（本仓库自己就是）。
+              # 版本写死:上游的下载脚本某天悄悄变了会在这里炸,而这一处炸 = 所有仓库炸。
+              default_install='curl -sSfL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz | tar xz actionlint'
+              # actionlint 查 workflow YAML,并对里面的 run: 块自动跑 shellcheck；
+              # 独立的 .sh 文件它不管,所以再单独扫一遍(-r:没文件就别执行,否则 shellcheck 挂在等 stdin)。
+              default_lint='./actionlint -color && git ls-files "*.sh" | xargs -r shellcheck'
+              default_test='skip'
+              ;;
             *)
-              echo "::error::unknown runtime '$RUNTIME' (expected python or node)"
+              echo "::error::unknown runtime '$RUNTIME' (expected python, node or shell)"
               exit 1
               ;;
           esac
