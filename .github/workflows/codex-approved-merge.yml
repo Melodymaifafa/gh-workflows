@@ -144,6 +144,7 @@ jobs:
               [[ "$body" == *"$clean_phrase"* ]]
             then
               reviewed_prefix="$(
+                # shellcheck disable=SC2016  # \1 是 sed 的反向引用，不是 shell 变量
                 sed -nE \
                   's/^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`.*/\1/p' \
                   <<<"$body" |
@@ -447,6 +448,7 @@ jobs:
             clean_author="$(jq -r .user.login <<<"$clean_comment")"
             clean_body="$(jq -r .body <<<"$clean_comment")"
             reviewed_prefix="$(
+              # shellcheck disable=SC2016  # \1 是 sed 的反向引用，不是 shell 变量
               sed -nE \
                 's/^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`.*/\1/p' \
                 <<<"$clean_body" |
