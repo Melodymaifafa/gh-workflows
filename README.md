@@ -16,13 +16,21 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `claude-codex-iterate.yml` | Codex 提交 review 后 | Claude 读评论、改代码、跑验证、push、发中文总结，然后召唤复审 |
 | `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` | 等 Codex 无意见 + CI 全绿，自动 squash 合入 develop |
 
-## 接一个新仓库
+## 开一个新项目（从零）
+
+```
+./newrepo.sh <name> <python|node> [--public]
+```
+
+建远端仓库（默认 private）→ 装自动化 → 默认分支改 `develop` → 克隆到 `~/projects/<name>`。新仓库还没有依赖清单，CI 三步默认 `skip`；写完代码删掉 `ci.yml` 里的 `install_cmd` / `lint_cmd` / `test_cmd` 三行就开启。
+
+## 接一个已有仓库
 
 ```
 ./onboard.sh <repo> <python|node>
 ```
 
-脚本会建 develop、提交调用桩、把 main FF 过去、刷密钥。
+脚本会建 develop、提交调用桩、把 main FF 过去、刷密钥。**接完记得手动把默认分支改成 `develop`**（`newrepo.sh` 已经代劳，见下方踩过的坑）。
 
 仓库没有依赖清单 / lint 配置 / 测试时，把对应步骤设成 `skip`，避免第一天就满屏红叉：
 

@@ -121,4 +121,5 @@ else
   echo "    ⚠️  找不到 $SECRETS_FILE，本仓库未设置任何密钥" >&2
 fi
 
-echo "    完成。还需人工：在 ChatGPT 里把 Codex connector 授权给 $slug"
+# Codex connector 是账号级授权，新仓库自动覆盖（2026-07-29 实测），这里不用管。
+echo "    完成。还需人工：把 $slug 的默认分支改成 develop（gh repo edit $slug --default-branch develop）"
