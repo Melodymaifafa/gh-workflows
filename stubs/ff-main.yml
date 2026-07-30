@@ -16,14 +16,18 @@ on:
         description: 要挪的分支
         type: string
         default: main
-      dry_run:
-        description: 只看会发生什么，不真的挪
-        type: boolean
-        default: false
+      min_age_days:
+        description: 只挪到在 develop 上待够这么多天的 commit（填 0 = 直接追到最新）
+        type: string
+        default: "7"
       require_green:
         description: CI 必须全绿才挪（取消勾选可强行挪）
         type: boolean
         default: true
+      dry_run:
+        description: 只看会发生什么，不真的挪
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -36,6 +40,7 @@ jobs:
     with:
       source: ${{ inputs.source || 'develop' }}
       target: ${{ inputs.target || 'main' }}
-      dry_run: ${{ inputs.dry_run == true }}
+      min_age_days: ${{ fromJSON(inputs.min_age_days || '7') }}
       require_green: ${{ inputs.require_green != false }}
+      dry_run: ${{ inputs.dry_run == true }}
     secrets: inherit
