@@ -30,7 +30,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip ./onboard.sh <repo> node
 ```
 
-**只能用在私有仓库。** 公开仓库调用私有仓库里的可复用工作流会直接失败（run 0 秒、没有 job、只报 "workflow file issue"）。要给公开仓库用，得先把本仓库改成 public。
+**本仓库已是 public（2026-07-30），公开和私有仓库都能接。** 之前是 private 时，公开仓库调用它会失败得毫无线索：run 存在但 0 秒结束、一个 job 都没有、只报 "workflow file issue" —— 跨可见性调用不被允许，而报错完全不提这回事。顺带好处：公开仓库的 Actions 分钟数免费无上限，私有仓库每月 2000 分钟。
 
 Codex connector 是账号级授权，新仓库无需单独授权（2026-07-29 在 learn-api-integrations 实测：新开的 PR 2 分钟内就被自动 review 并 👍）。
 
@@ -50,7 +50,7 @@ jobs:
 
 ## 密钥
 
-四个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。
+四个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
 
 | 密钥 | 缺了会怎样 |
 |---|---|
@@ -58,7 +58,7 @@ jobs:
 | `CODEX_TRIGGER_TOKEN` | 无法自动召唤 Codex 复审，需人工评论 `@codex review` |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
 
-`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。**一个 PAT 可以勾选多个仓库**，接新仓库时去 PAT 设置里把新仓库加进去即可，不用重新建。
+`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write —— 覆盖全部仓库，接新仓库不用回去改 PAT。
 
 ## 版本
 
@@ -75,3 +75,6 @@ git tag -f v1 && git push -f origin v1
 - **绿勾 ≠ 有产出**：确认 Claude 真干了活要看 PR 时间线有没有评论和 commit。
 - **`@codex review` 会被限流静默**：连发几次后连 👀 都不回，约 10 分钟恢复。iterate 工作流为此做了 6/12/18 分钟三窗口重试 + 回执验证。
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
+- **密钥只写不读，个人账号也没有账号级密钥**：存进仓库后连 API 都取不回值（`gh api repos/X/actions/secrets/NAME` 只返回名字和日期），共享密钥是 organization 才有的功能。所以 `secrets.env` 是唯一母本 —— 在网页上手填过的值必须补回母本，否则接新仓库时无处可取（2026-07-30 为此翻了半天 `~/.claude/history.jsonl`）。
+- **Regenerate PAT 会立刻作废旧值**：换完要把所有仓库的 secret 一起刷新。漏掉的那个 CI 照样绿，只有 Codex 复审那步静默停住。
+- **接完要把仓库默认分支改成 `develop`**：`onboard.sh` 要求默认分支是 `main`（它靠 main 起手建 develop），但之后 `gh pr create` 不带 `--base` 会打向默认分支。linear-agent-team 忘了改，agent 开的 3 个 PR 全合进 main，develop 停在初始 commit（2026-07-30）。
