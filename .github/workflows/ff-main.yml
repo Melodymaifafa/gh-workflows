@@ -66,6 +66,34 @@ jobs:
               --form-string "title=$1" --form-string "message=$2" >/dev/null 2>&1 || true
           }
 
+          summarize_extra_commits() {
+            local from="$1"
+            local to="$2"
+            local limit="${3:-5}"
+
+            gh api "repos/$REPO/compare/$from...$to" |
+              jq -r --argjson limit "$limit" '
+                .commits[:$limit][] |
+                "- `" + (.sha[0:7]) + "` " +
+                ((.author.login // .commit.author.name // "unknown")) +
+                ": " + (.commit.message | split("\n")[0])
+              '
+          }
+
+          alert_with_details() {
+            local title="$1"
+            local body="$2"
+            local details="${3:-}"
+
+            if [ -n "$details" ]; then
+              body="$body"$'\n\n'"$details"
+            fi
+            if [ "${#body}" -gt 950 ]; then
+              body="${body:0:947}..."
+            fi
+            alert "$title" "$body"
+          }
+
           # ── 1. 落点：source 的最新位置，还是「泡够 N 天」的那个更早的位置 ──
           # 泡期存在的理由：追到最新时 target 和 source 完全一样，那就没有可退的点了。
           # 落点仍在 source 这条线上，所以依然是合法快进，只是停得早一点。
@@ -104,7 +132,13 @@ jobs:
               say ""
               say "\`$TARGET\` 比落点还多 $behind 个 commit —— 说明有人直接往 \`$TARGET\` 上提交了。"
               say "先把 \`$TARGET\` 的内容并回 \`$SOURCE\`，再来跑这个。"
-              alert "🔀 $REPO：main 反而领先" "有人直接往 main 提交了 $behind 个 commit，快进跳过。先把 main 并回 develop。"
+              target_extra="$(summarize_extra_commits "$goal" "$TARGET")"
+              if [ -n "$target_extra" ]; then
+                say ""
+                say "**\`$TARGET\` 上多出来的 commit：**"
+                say "$target_extra"
+              fi
+              alert_with_details "🔀 $REPO：$TARGET 反而领先" "有人直接往 $TARGET 提交了 $behind 个 commit，快进跳过。先把 $TARGET 并回 $SOURCE。" "$target_extra"
               exit 1
               ;;
             diverged)
@@ -113,7 +147,34 @@ jobs:
               say "落点领先 $ahead 个、\`$TARGET\` 另有 $behind 个 commit，快进已不可能。"
               say "**不要强推** —— 那会丢掉 \`$TARGET\` 上那 $behind 个 commit。"
               say "[看两边差在哪](https://github.com/$REPO/compare/$TARGET...$SOURCE)"
-              alert "🔀 $REPO：develop 和 main 已分叉" "develop 领先 $ahead、main 另有 $behind 个 commit，快进已不可能，需人工处理。"
+              target_extra="$(summarize_extra_commits "$goal" "$TARGET")"
+              source_extra="$(jq -r '
+                .commits[:5][] |
+                "- `" + (.sha[0:7]) + "` " +
+                ((.author.login // .commit.author.name // "unknown")) +
+                ": " + (.commit.message | split("\n")[0])
+              ' <<<"$cmp")"
+              if [ -n "$source_extra" ]; then
+                say ""
+                say "**落点侧多出来的 commit：**"
+                say "$source_extra"
+              fi
+              if [ -n "$target_extra" ]; then
+                say ""
+                say "**\`$TARGET\` 上多出来的 commit：**"
+                say "$target_extra"
+              fi
+              details=""
+              if [ -n "$source_extra" ]; then
+                details="落点侧:"$'\n'"$source_extra"
+              fi
+              if [ -n "$target_extra" ]; then
+                if [ -n "$details" ]; then
+                  details="$details"$'\n\n'
+                fi
+                details="$details$TARGET 侧:"$'\n'"$target_extra"
+              fi
+              alert_with_details "🔀 $REPO：$SOURCE 和 $TARGET 已分叉" "$SOURCE 领先 $ahead、$TARGET 另有 $behind 个 commit，快进已不可能，需人工处理。" "$details"
               exit 1
               ;;
             *)

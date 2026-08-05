@@ -37,7 +37,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 ./onboard.sh <repo> <python|node>
 ```
 
-脚本会建 develop、提交调用桩、把 main FF 过去、刷密钥。**接完记得手动把默认分支改成 `develop`**（`newrepo.sh` 已经代劳，见下方踩过的坑）。
+脚本会建 develop、提交调用桩、把 main FF 过去、把默认分支改成 `develop`、刷密钥。默认分支只会在 main 快进成功后自动切；如果被 GitHub 拒绝，脚本会打印需要手动执行的命令。
 
 仓库没有依赖清单 / lint 配置 / 测试时，把对应步骤设成 `skip`，避免第一天就满屏红叉：
 
@@ -100,4 +100,4 @@ git tag -f v1 && git push -f origin v1
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
 - **密钥只写不读，个人账号也没有账号级密钥**：存进仓库后连 API 都取不回值（`gh api repos/X/actions/secrets/NAME` 只返回名字和日期），共享密钥是 organization 才有的功能。所以 `secrets.env` 是唯一母本 —— 在网页上手填过的值必须补回母本，否则接新仓库时无处可取（2026-07-30 为此翻了半天 `~/.claude/history.jsonl`）。
 - **Regenerate PAT 会立刻作废旧值**：换完要把所有仓库的 secret 一起刷新。漏掉的那个 CI 照样绿，只有 Codex 复审那步静默停住。
-- **接完要把仓库默认分支改成 `develop`**：`onboard.sh` 要求默认分支是 `main`（它靠 main 起手建 develop），但之后 `gh pr create` 不带 `--base` 会打向默认分支。linear-agent-team 忘了改，agent 开的 3 个 PR 全合进 main，develop 停在初始 commit（2026-07-30）。
+- **接完要把仓库默认分支改成 `develop`**：`onboard.sh` 起手要求默认分支是 `main`（它靠 main 建 develop），但完成后会自动改成 `develop`。如果这步失败，必须手动补；否则 `gh pr create` 不带 `--base` 会打向默认分支。linear-agent-team 忘了改，agent 开的 3 个 PR 全合进 main，develop 停在初始 commit（2026-07-30）。

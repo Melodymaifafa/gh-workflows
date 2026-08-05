@@ -99,11 +99,25 @@ echo "    develop 已推送"
 
 # 3. main fast-forward 到 develop。develop 是从 main 切出来的，
 #    只多了这一笔，所以一定能 FF；推不动就说明 main 有分叉，报错退出。
+main_ff_ok=true
 if ! git push --quiet origin develop:main 2>/dev/null; then
+  main_ff_ok=false
   echo "    ⚠️  main 无法 fast-forward（有分叉或被保护），请人工处理" >&2
 fi
 
-# 4. 密钥。值只在 subshell 里流动，不打印。
+# 4. 默认分支。接入完成后，日常 PR 和 agent 都应该默认打到 develop。
+#    忘了这步会把 gh pr create / agent PR 送进 main，绕开泡期。
+if [ "$main_ff_ok" = true ]; then
+  if gh repo edit "$slug" --default-branch develop >/dev/null; then
+    echo "    默认分支已改为 develop"
+  else
+    echo "    ⚠️  默认分支未能自动改成 develop，请手动执行：gh repo edit $slug --default-branch develop" >&2
+  fi
+else
+  echo "    ⚠️  main 未快进，跳过默认分支切换，避免半接入状态" >&2
+fi
+
+# 5. 密钥。值只在 subshell 里流动，不打印。
 if [ -f "$SECRETS_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
@@ -122,4 +136,4 @@ else
 fi
 
 # Codex connector 是账号级授权，新仓库自动覆盖（2026-07-29 实测），这里不用管。
-echo "    完成。还需人工：把 $slug 的默认分支改成 develop（gh repo edit $slug --default-branch develop）"
+echo "    完成。"
