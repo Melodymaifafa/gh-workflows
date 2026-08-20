@@ -32,13 +32,16 @@ permissions:
   id-token: write
   actions: read
 
-# 同一个 PR 上的多轮触发排队执行，不并行互踩
-concurrency:
-  group: claude-codex-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
-
 jobs:
   iterate:
+    # 同一个 PR 上的多轮触发排队执行，不并行互踩。必须放在 job 层：调用桩
+    # 若也声明同名的顶层 concurrency，GitHub 会判定「top level workflow」与本
+    # job 死锁，整个 run 直接失败且不产生任何 job（无日志，只显示 "This run
+    # likely failed because of a workflow file issue"）。codex-approved-merge
+    # 一直是 job 层写法，所以它没踩到；本文件从 2026-07-29 起 11 次触发全挂。
+    concurrency:
+      group: claude-codex-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     # 仅响应 Codex 的 review、仅在 PR 还开着时（合并后分支已删，checkout 会扑空）
     if: |
       github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
