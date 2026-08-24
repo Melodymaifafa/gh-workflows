@@ -1,0 +1,14 @@
+# actionlint 的配置。只放「actionlint 内置数据过期了、但事实是对的」这一类例外，
+# 每条都写清依据 —— 忽略规则本身也会掩盖真错，不写理由就没人敢删。
+paths:
+  .github/workflows/claude-codex-iterate.yml:
+    ignore:
+      # actionlint 1.7.12 的 github context 属性清单里没有 job_workflow_sha，但它
+      # 是官方属性：被调用的那份可复用工作流文件所在 commit 的 SHA。取本仓库
+      # scripts/ 时正是靠它把脚本和 workflow 钉在同一个版本上。
+      - 'property "job_workflow_sha" is not defined'
+      # actionlint 内置的 openai/codex-action 输入清单停在旧版本。实际的 v1 tag
+      # （2026-08-25 拉 action.yml 核对过）有这两个输入，且官方文档推荐用
+      # permission-profile 取代 legacy 的 sandbox。
+      - 'input "permission-profile" is not defined in action "openai/codex-action@v1"'
+      - 'input "allow-bot-users" is not defined in action "openai/codex-action@v1"'

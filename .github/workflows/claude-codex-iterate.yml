@@ -12,6 +12,14 @@ on:
         description: python | node — picks the toolchain, verify commands and tool allowlist.
         type: string
         default: python
+      review_fixer:
+        description: auto | claude | codex — who fixes the PR this round. auto runs Claude first and hands over to Codex only when the provider itself fails.
+        type: string
+        default: auto
+      codex_model:
+        description: Model id for the Codex fixer. Empty keeps the action's own default; pin one to freeze the cost.
+        type: string
+        default: ''
       verify_cmd:
         description: Override the verify commands Claude must run before pushing (one per line).
         type: string
@@ -54,6 +62,26 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
+      # 可复用工作流只把「调用方的 PR 分支」checkout 进工作区，本仓库的
+      # scripts/ 不在里面。job_workflow_sha 就是本次实际运行的这份 workflow
+      # 文件所在的 commit，按它取脚本，脚本和 workflow 永远同一个版本。
+      - name: Fetch the shared fixer scripts
+        uses: actions/checkout@v4
+        with:
+          repository: Melodymaifafa/gh-workflows
+          ref: ${{ github.job_workflow_sha }}
+          path: .gh-workflows
+
+      - name: Move the fixer scripts out of the workspace
+        run: |
+          set -euo pipefail
+          # 留在工作区里，fixer 会把它当成本 PR 的改动一并 commit 出去。
+          mv .gh-workflows/scripts "$RUNNER_TEMP/fixer-scripts"
+          rm -rf .gh-workflows
+          # 起点 commit。Claude 若在失败前已经提交过，这一轮就不能再让 Codex
+          # 接手写第二笔（一轮只允许一个 fixer 写 PR）。
+          echo "BASE_SHA=$(git rev-parse HEAD)" >>"$GITHUB_ENV"
+
       # prompt 要求跑构建/测试命令，runner 不预装这些工具链；
       # 缺了它 Claude 会耗几轮尝试自装（pip 不在白名单）直到轮数耗尽
       - uses: astral-sh/setup-uv@v5
@@ -63,6 +91,13 @@ jobs:
         if: inputs.runtime == 'node'
         with:
           node-version: '20'
+
+      - name: Select the review fixer
+        id: select
+        env:
+          REVIEW_FIXER: ${{ inputs.review_fixer }}
+        run: |
+          "$RUNNER_TEMP/fixer-scripts/select-review-fixer.sh" "$REVIEW_FIXER"
 
       # 把 runtime 展开成「验证命令」和「工具白名单」两个值，供下一步引用。
       # 放在 step 里而不是内联三元表达式，是为了让默认值可读、可扩展。
@@ -107,6 +142,12 @@ jobs:
           } >>"$GITHUB_ENV"
 
       - uses: anthropics/claude-code-action@v1
+        id: claude
+        # review_fixer=codex 时整轮跳过 Claude。
+        if: steps.select.outputs.first == 'claude'
+        # 失败不立刻终止 job：下一步要先分清是 provider 侧失败还是业务失败，
+        # 再决定换 Codex 上还是把 job 打红。
+        continue-on-error: true
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # action 默认无视 bot 发起的触发（防循环）；本工作流的触发者恰恰是 Codex bot
@@ -151,6 +192,222 @@ jobs:
             6. 不要自行请求 Codex 复审或 merge PR。后续 workflow step 会在确认 HEAD
                变化后等待冷却并请求复审；Codex 无重大问题且 CI 全绿时，
                本仓库的 codex-approved-merge 工作流会负责合并。
+
+      # 整条链的裁决点：谁上、有没有换人、为什么，三件事都写进 job summary。
+      # 业务失败在这里把 job 打红，后面的步骤（含召唤复审）全部跳过 —— 额度耗尽
+      # 也好、代码没修好也好，都不许留下一个绿勾。
+      - name: Decide the takeover
+        id: decide
+        if: ${{ !cancelled() && steps.select.outcome == 'success' }}
+        env:
+          REVIEW_FIXER: ${{ inputs.review_fixer }}
+          FIRST: ${{ steps.select.outputs.first }}
+          FALLBACK_ALLOWED: ${{ steps.select.outputs.fallback_allowed }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+
+          run_codex=false
+          fell_back=false
+          fatal=''
+
+          if [ "$FIRST" = codex ]; then
+            fixer=codex
+            run_codex=true
+            why='caller pinned the Codex fixer; Claude was skipped'
+          elif [ "$CLAUDE_OUTCOME" = success ]; then
+            fixer=claude
+            why='Claude finished this round'
+          elif [ "$CLAUDE_OUTCOME" = skipped ]; then
+            # 前面某一步先挂了，Claude 根本没跑。沿用那一步的红，别另编一个原因。
+            fixer=claude
+            why='an earlier step failed before Claude could run'
+            fatal="$why"
+          else
+            # 只把「这次运行的终态字段」喂给分类器，绝不喂整份对话记录：记录里
+            # 原样带着 Codex 的 review 正文（外部输入），照抄一句额度报错就能骗
+            # 出一次换人，而接手的那个 token 有写权限。
+            diag="$RUNNER_TEMP/claude-failure.txt"
+            : >"$diag"
+            if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+              jq -r '[.. | objects | select(.type? == "result")]
+                     | map([.subtype, (.is_error | tostring), .result] | join(" "))
+                     | join("\n")' "$EXECUTION_FILE" >"$diag" 2>/dev/null || : >"$diag"
+            fi
+
+            verdict="$("$RUNNER_TEMP/fixer-scripts/classify-claude-failure.sh" "$diag")"
+            failure_class="$(printf '%s\n' "$verdict" | sed -n 's/^class=//p')"
+            failure_reason="$(printf '%s\n' "$verdict" | sed -n 's/^reason=//p')"
+
+            if [ "$failure_class" != quota ]; then
+              fixer=claude
+              why="Claude failed on the code, not on the provider ($failure_reason)"
+              fatal="$why"
+            elif [ "$FALLBACK_ALLOWED" != true ]; then
+              fixer=claude
+              why="Claude hit a provider limit ($failure_reason) but review_fixer=$REVIEW_FIXER forbids a fallback"
+              fatal="$why"
+            elif [ "$(git rev-parse HEAD)" != "${BASE_SHA:-}" ]; then
+              fixer=claude
+              why="Claude already committed before failing ($failure_reason); a second fixer must not write the same round"
+              fatal="$why"
+            else
+              fixer=codex
+              run_codex=true
+              fell_back=true
+              why="Claude hit a provider limit ($failure_reason); handing this round to Codex"
+            fi
+          fi
+
+          {
+            printf 'fixer=%s\n' "$fixer"
+            printf 'run_codex=%s\n' "$run_codex"
+            printf 'fell_back=%s\n' "$fell_back"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo '### Review fixer'
+            echo ''
+            echo "- requested: \`$REVIEW_FIXER\`"
+            echo "- ran: \`$fixer\`"
+            echo "- fell back to Codex: $fell_back"
+            echo "- why: $why"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$fatal" ]; then
+            echo '- result: **this round failed**' >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::$fatal"
+            exit 1
+          fi
+
+      # 以下四步是 Codex 接管路径。Codex 的沙箱既没有网络也不让写 .git
+      # （MEL-197 实测），所以它只负责「读 review → 改文件 → 写中文总结」；
+      # 取评论、装依赖、验证、commit/push、发评论全部由外层步骤做。
+      - name: Collect the review context for Codex
+        if: steps.decide.outputs.run_codex == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          REVIEWED_SHA: ${{ github.event.review.commit_id }}
+          # review 正文是外部输入：只经 env 落进文件，不进 run 块的字面量，
+          # 也不拼进 prompt。
+          REVIEW_BODY: ${{ github.event.review.body }}
+        run: |
+          set -euo pipefail
+          {
+            printf '# Codex review of PR #%s (%s), reviewed commit %s\n\n' \
+              "$PR_NUMBER" "$REPO" "$REVIEWED_SHA"
+            printf '## Review body\n\n%s\n\n## Inline comments\n\n' "$REVIEW_BODY"
+          } >codex-review-context.md
+          gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments" --paginate \
+            --jq '.[] | "- \(.path):\(.line // .original_line // 0) — \(.body)"' \
+            >>codex-review-context.md || true
+
+      - name: Codex fixes the PR
+        id: codex
+        if: steps.decide.outputs.run_codex == 'true'
+        uses: openai/codex-action@v1
+        with:
+          # 左边是 action 的参数名（不能改），右边是仓库 secret 名。CLI 真正读
+          # 的环境变量也叫 CODEX_API_KEY，OPENAI_API_KEY 读不到（MEL-197 实测）。
+          # 别设成 job 层 env：本 job 会 checkout PR 分支并执行其中的验证命令，
+          # 那等于把密钥和外部可控代码放进同一个环境。
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          # CLI 版本钉死，同 ci.yml 钉 actionlint / bats 的理由。
+          codex-version: '0.149.1'
+          model: ${{ inputs.codex_model }}
+          # 最小沙箱：工作区可写、无网络、.git 只读。review 正文是外部输入，
+          # 不给更大权限（同「别放宽 --allowedTools」那条规矩）。
+          permission-profile: ':workspace'
+          # action 默认拦 bot 发起的触发；本工作流的触发者恰恰是 Codex bot。
+          allow-bot-users: 'chatgpt-codex-connector[bot]'
+          # safety-strategy 保持默认 drop-sudo：本 job 后续步骤都不需要 sudo。
+          prompt: |
+            工作区根目录的 codex-review-context.md 是别人对本 PR 提的 review：
+            正文加行内评论。请据它迭代当前分支的代码。
+
+            1. 逐条判断建议：真 bug 或明确改进 → 改文件；纯风格偏好、误报、
+               或之前轮次已经处理过的 → 跳过并记录理由。
+            2. 只改文件。不要跑 git 命令、不要装依赖、不要联网 —— 沙箱里这些
+               都做不到（.git 只读、无网络）。验证、commit、push、发评论由外层
+               步骤负责。
+            3. 最后输出一段简体中文总结。读者是非程序员的仓库主人，手机上扫一眼
+               用，必须短、大白话：
+               - 第一行就是结论：「修了 N 条，跳过 M 条」。
+               - 之后每条建议单独一个 Markdown 列表项（必须 `- ` 开头——相邻
+                 裸行会被 GitHub 渲染合并成一段，用列表才能一条占一行）：
+                 - ✅ 修：<一句话：原来会出什么问题 → 改后行为怎么变>
+                 - ⏭️ 跳过：<一句话理由（如：纯风格偏好 / 上轮已处理过）>
+               - 不写实现细节、不贴代码、不复述 diff；函数名/变量名尽量不出现，
+                 非提不可就放句尾括号，去掉括号后句子仍要通顺。
+            4. 如果没有任何可采纳的建议，不要改文件，只输出一两句话说明原因。
+
+      - name: Verify, commit and push the Codex fix
+        id: codex_push
+        if: steps.decide.outputs.run_codex == 'true'
+        env:
+          VERIFY: ${{ env.VERIFY_CMD }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # 喂给 Codex 的临时上下文，不能跟着 PR 提交出去。
+          rm -f codex-review-context.md
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo 'pushed=false' >>"$GITHUB_OUTPUT"
+            echo '- Codex changed no files' >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -z "${VERIFY//[[:space:]]/}" ]; then
+            echo '::error::no verify command resolved; refusing to push an unverified fix'
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # 先入暂存区再验证：验证会造出 .venv / node_modules / __pycache__，
+          # 验证后才 add 就可能把它们一起提交（仓库没写 .gitignore 时必然发生）。
+          # 暂存区在验证前就定死 = 提交的正好是 Codex 改出来的那些文件。
+          git add -A
+
+          # 验证只能在沙箱外跑：装依赖要联网，放进 Codex 那边必挂。
+          if ! bash -euo pipefail -c "$VERIFY"; then
+            echo '- verification: **failed**, nothing was pushed' >>"$GITHUB_STEP_SUMMARY"
+            echo '::error::verification failed after the Codex fix; the change was not pushed'
+            exit 1
+          fi
+
+          git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
+          git push -q origin "HEAD:$HEAD_REF"
+          echo 'pushed=true' >>"$GITHUB_OUTPUT"
+          echo '- verification: passed, the fix was pushed' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Post the Codex summary comment
+        if: steps.decide.outputs.run_codex == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SUMMARY: ${{ steps.codex.outputs['final-message'] }}
+          PUSHED: ${{ steps.codex_push.outputs.pushed }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUMMARY//[[:space:]]/}" ]; then
+            echo '::warning::Codex returned no summary; skipping the PR comment'
+            exit 0
+          fi
+          {
+            printf '%s\n' "$SUMMARY"
+            if [ "$PUSHED" = true ]; then
+              printf '\n验证：本仓库的 lint 与测试已在沙箱外跑过，全绿后才推送。\n'
+            fi
+          } | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
 
       - name: Request Codex re-review after a new commit
         env:
