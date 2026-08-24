@@ -63,6 +63,12 @@ jobs:
 
 `runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm + npm test`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。
 
+## 测试
+
+测试放 `tests/*.bats`（bats-core）。本地跑：`brew install bats-core && bats tests/`。
+
+`shell` runtime 的测试步骤是「有 `tests/*.bats` 就跑 bats，没有就跳过」——只有脚本、没写过测试的仓库行为不变。测试不复制一份 `ci.yml` 的逻辑，而是直接把 `Resolve commands` 那段 run 块抠出来执行；复制的那份迟早和真身各改各的。
+
 ## 密钥
 
 四个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
@@ -101,4 +107,5 @@ git tag -f v1 && git push -f origin v1
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
 - **密钥只写不读，个人账号也没有账号级密钥**：存进仓库后连 API 都取不回值（`gh api repos/X/actions/secrets/NAME` 只返回名字和日期），共享密钥是 organization 才有的功能。所以 `secrets.env` 是唯一母本 —— 在网页上手填过的值必须补回母本，否则接新仓库时无处可取（2026-07-30 为此翻了半天 `~/.claude/history.jsonl`）。
 - **Regenerate PAT 会立刻作废旧值**：换完要把所有仓库的 secret 一起刷新。漏掉的那个 CI 照样绿，只有 Codex 复审那步静默停住。
+- **bats 里别直接写 `[[ ... ]]`**：中途失败的 `[[ ]]` bats 抓不住，只认最后一条命令的退出码，测试于是假绿（一条明知会挂的断言照样报 ok）。用 `tests/test_helper/common.bash` 里的 `assert_equal` / `assert_contains`，函数返回非零它抓得住。
 - **接完要把仓库默认分支改成 `develop`**：`onboard.sh` 起手要求默认分支是 `main`（它靠 main 建 develop），但完成后会自动改成 `develop`。如果这步失败，必须手动补；否则 `gh pr create` 不带 `--base` 会打向默认分支。linear-agent-team 忘了改，agent 开的 3 个 PR 全合进 main，develop 停在初始 commit（2026-07-30）。

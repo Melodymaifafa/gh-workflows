@@ -73,10 +73,14 @@ jobs:
               # 给「只有 bash 脚本 + workflow YAML」的仓库用（本仓库自己就是）。
               # 版本写死:上游的下载脚本某天悄悄变了会在这里炸,而这一处炸 = 所有仓库炸。
               default_install='curl -sSfL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz | tar xz actionlint'
+              # bats 同理钉死版本。解压到 /tmp 再安装,免得解压出来的目录落进被测仓库的工作区。
+              default_install="$default_install && curl -sSfL https://github.com/bats-core/bats-core/archive/refs/tags/v1.14.0.tar.gz | tar xz -C /tmp && sudo /tmp/bats-core-1.14.0/install.sh /usr/local"
               # actionlint 查 workflow YAML,并对里面的 run: 块自动跑 shellcheck；
               # 独立的 .sh 文件它不管,所以再单独扫一遍(-r:没文件就别执行,否则 shellcheck 挂在等 stdin)。
               default_lint='./actionlint -color && git ls-files "*.sh" | xargs -r shellcheck'
-              default_test='skip'
+              # 没有 tests/*.bats 的仓库保持原样跳过 —— shell runtime 是共享的,
+              # 这里一改,别的仓库会突然多出一条它们从没写过的测试命令。
+              default_test='if ls tests/*.bats >/dev/null 2>&1; then bats tests/; else echo "::notice::no bats tests"; fi'
               ;;
             *)
               echo "::error::unknown runtime '$RUNTIME' (expected python, node or shell)"
