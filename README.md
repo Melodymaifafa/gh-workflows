@@ -19,7 +19,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | 文件 | 什么时候跑 | 干什么 |
 |---|---|---|
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
-| `claude-codex-iterate.yml` | Codex 提交 review 后 | Claude 读评论、改代码、跑验证、push、发中文总结，然后召唤复审 |
+| `claude-codex-iterate.yml` | Codex 提交 review 后 | 选一个 fixer 读评论、改代码、跑验证、push、发中文总结，然后召唤复审。默认 Claude 先上，撞额度/限流/认证失效才换 Codex 接手 |
 | `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` | 等 Codex 无意见 + CI 全绿，自动 squash 合入 develop |
 | `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
 
@@ -63,6 +63,8 @@ jobs:
 
 `runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm + npm test`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。
 
+`claude-codex-iterate.yml` 另收一个 `review_fixer`：`auto`（默认，Claude 先上，只有额度耗尽 / 限流 / 认证失效 / 服务不可用才换 Codex）、`claude`（现有行为，永不换人）、`codex`（跳过 Claude）。**拼错直接红**，不会静默按 `auto` 跑掉一整轮。测试没修好、构建挂了这类业务失败**不换人**：换个模型一样挂，job 该红就红。谁上、有没有换人、为什么，三件事都写在那次 run 的 summary 里。
+
 ## 测试
 
 测试放 `tests/*.bats`（bats-core）。本地跑：`brew install bats-core && bats tests/`。
@@ -71,12 +73,13 @@ jobs:
 
 ## 密钥
 
-四个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
+五个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
 
 | 密钥 | 缺了会怎样 |
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude 迭代不跑（`claude setup-token` 生成，`sk-ant-oat01-` 开头） |
 | `CODEX_TRIGGER_TOKEN` | 无法自动召唤 Codex 复审，需人工评论 `@codex review` |
+| `CODEX_API_KEY` | Claude 撞额度时换不了人，`review_fixer: codex` 也跑不了（platform.openai.com 建的 API key，不是 ChatGPT 订阅） |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
 
 `CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write —— 覆盖全部仓库，接新仓库不用回去改 PAT。
@@ -100,6 +103,8 @@ git tag -f v1 && git push -f origin v1
 ## 踩过的坑
 
 - **顶层 `concurrency` 只能声明一次**：调用桩和被调用的可复用工作流若都在顶层声明同名 group，GitHub 判定「top level workflow」与该 job 死锁，run 立刻失败、零 job、无日志，只有一句 "This run likely failed because of a workflow file issue"。排队逻辑写在被调用方的 **job 层**，调用桩不要写 `concurrency`。`claude-codex-iterate` 踩了这个坑，2026-07-29 起 9 个仓库共 11 次触发全部空跑，直到 2026-08-20 才发现 —— 整条 Codex→Claude 迭代链从来没运行过。
+- **Codex 沙箱没网、`.git` 只读**：`codex exec` 在 `:workspace` 档下改得动工作区文件，但连不上网，也写不了 `.git`（MEL-197 实测，带对照组）。所以 Codex 接管那条路里，取评论、装依赖、跑验证、commit/push、发评论全部由外层 step 做，Codex 只负责改文件和写总结 —— 把给 Claude 的那套 prompt 照搬过去必炸。
+- **actionlint 内置的 action 输入清单会过期**：它报 `openai/codex-action@v1` 没有 `permission-profile` / `allow-bot-users`，实际 v1 tag 有。这类「工具数据旧了、事实是对的」的例外写在 `.github/actionlint.yaml`，每条都附核对依据；不写理由的忽略规则没人敢删，迟早掩盖真错。
 - **不要放宽 `--allowedTools`**：Codex 的 review 正文是外部输入，直接进 Claude 的 prompt，而那个 token 有写权限。只放行具体命令，别用 `Bash(git:*)`。
 - **`--allowedTools` 是全量清单**：`Edit,MultiEdit,Write` 不列出来 Claude 就改不了任何文件，只会干烧轮数。
 - **绿勾 ≠ 有产出**：确认 Claude 真干了活要看 PR 时间线有没有评论和 commit。

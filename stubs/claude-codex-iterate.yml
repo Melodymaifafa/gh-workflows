@@ -17,4 +17,7 @@ jobs:
     uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1
     with:
       runtime: __RUNTIME__
+      # 谁来修 PR：auto（默认，Claude 先上，撞额度才换 Codex）、claude、codex。
+      # 不写就是 auto，行为和加这行之前完全一样。
+      # review_fixer: auto
     secrets: inherit
