@@ -3,6 +3,8 @@
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
+ITERATE_WORKFLOW="$REPO_ROOT/.github/workflows/claude-codex-iterate.yml"
+SCRIPTS="$REPO_ROOT/scripts"
 
 # 打印 workflow 里某个 step 的 `run: |` 块，去掉 10 空格缩进。
 # 测试跑的是 ci.yml 里那段真代码——在测试里复制一份逻辑，两边迟早各改各的。
