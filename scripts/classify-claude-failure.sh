@@ -18,32 +18,27 @@
 # 换人。调用方负责裁剪，见 claude-codex-iterate.yml 的 Decide the takeover。
 set -euo pipefail
 
-# 只认 provider 侧的具体报错串。别加 "error" / "failed" 这种通用词：它们在
-# 业务失败里同样满地都是，加进来等于把 fail-closed 拆了。
-QUOTA_MARKERS=(
-  'usage limit reached'
-  'rate limit'
-  'rate_limit_error'
-  'error 429'
-  'status 429'
-  'insufficient_quota'
-  'quota exceeded'
-  'credit balance is too low'
-  'authentication_error'
-  'invalid api key'
-  'invalid_api_key'
-  'invalid_request_error: invalid bearer token'
-  'oauth token has expired'
-  'token expired'
-  '401 unauthorized'
-  'error 401'
-  'status 401'
-  'overloaded_error'
-  'error 529'
-  'status 529'
-  'service unavailable'
-  'error 503'
-  'status 503'
+# 只认 provider 真吐出来的报错结构，逐行按锚定的正则匹配，不做裸子串匹配。
+# 终态字段里的 `.result` 是 Claude 自己写的一段自然语言总结，「集成测试打下游
+# 返回 503 service unavailable，我修不好」这种句子里的字样必须判成 business：
+# 散文里出现同样的词不算数，得是整行的额度哨兵、`API Error: <状态码>` 这样的
+# 前缀、snake_case 的机器错误码，或 provider 的原话。
+#
+# 每项写成 `标签::正则`，取第一个 `::` 拆分（正则里不会出现 `::`）。
+# 匹配走 nocasematch，所以字符类一律写全大小写，别依赖折叠。
+QUOTA_PATTERNS=(
+  # Claude Code 用完订阅额度时，整个 result 字段就是这一句（可带 |<重置时间戳>）。
+  # 前面允许 `<subtype> <is_error> ` 这段调用方拼进来的前缀。
+  'usage limit reached::^[[:space:]]*([a-zA-Z_]+[[:space:]]+(true|false)[[:space:]]+)?claude ai usage limit reached(\|[0-9]+)?[[:space:]]*$'
+  # Anthropic API 的 HTTP 错误行，形如 `API Error: 429 {...}`。必须带 `API Error`
+  # 前缀 —— 光有状态码不算，业务日志里到处是 503。
+  'API Error with a provider status code::(^|[^a-zA-Z])API Error:?[[:space:]]+(401|429|503|529)([^0-9]|$)'
+  # 错误体里的机器错误码：snake_case，两侧要词边界，`test_rate_limit_error`
+  # 这种自己的测试名不算。
+  'structured provider error code::(^|[^a-zA-Z_])(rate_limit_error|authentication_error|overloaded_error|insufficient_quota|invalid_api_key)([^a-zA-Z_]|$)'
+  # 余额不足和令牌过期，用 provider 的原话，不拆成 `credit` / `expired` 这种词。
+  'credit balance is too low::(^|[^a-zA-Z])your credit balance is too low'
+  'OAuth token has expired::(^|[^a-zA-Z])OAuth token has expired'
 )
 
 source_file="${1:--}"
@@ -61,16 +56,21 @@ reason='no provider-side failure marker; treating this as a business failure'
 if [ -z "${text//[[:space:]]/}" ]; then
   reason='Claude left no diagnosable output; treating this as a business failure'
 else
-  lower="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
-  for marker in "${QUOTA_MARKERS[@]}"; do
-    case "$lower" in
-      *"$marker"*)
+  # 大小写不敏感交给 shell，别拿 tr 折叠：终态字段里有中文，多字节输入喂给
+  # tr 会炸。
+  shopt -s nocasematch
+  while IFS= read -r line; do
+    for entry in "${QUOTA_PATTERNS[@]}"; do
+      label="${entry%%::*}"
+      pattern="${entry#*::}"
+      if [[ $line =~ $pattern ]]; then
         class=quota
-        reason="provider-side failure marker: $marker"
-        break
-        ;;
-    esac
-  done
+        reason="provider-side failure marker: $label"
+        break 2
+      fi
+    done
+  done <<<"$text"
+  shopt -u nocasematch
 fi
 
 {

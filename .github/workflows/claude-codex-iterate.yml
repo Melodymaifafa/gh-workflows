@@ -285,6 +285,7 @@ jobs:
       # （MEL-197 实测），所以它只负责「读 review → 改文件 → 写中文总结」；
       # 取评论、装依赖、验证、commit/push、发评论全部由外层步骤做。
       - name: Collect the review context for Codex
+        id: context
         if: steps.decide.outputs.run_codex == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -297,14 +298,29 @@ jobs:
           REVIEW_BODY: ${{ github.event.review.body }}
         run: |
           set -euo pipefail
+
+          # 别在工作区根目录写死文件名：这条工作流跑在别人的仓库里，撞上同名的
+          # 已跟踪文件会先被覆盖、再被清理掉，然后当成 Codex 的改动提交出去。
+          # mktemp 保证不重名；文件仍留在工作区内，Codex 的沙箱才读得到。
+          context_file="$(mktemp "$GITHUB_WORKSPACE/codex-review-context.XXXXXXXX")"
+          printf 'file=%s\n' "$context_file" >>"$GITHUB_OUTPUT"
+
           {
             printf '# Codex review of PR #%s (%s), reviewed commit %s\n\n' \
               "$PR_NUMBER" "$REPO" "$REVIEWED_SHA"
             printf '## Review body\n\n%s\n\n## Inline comments\n\n' "$REVIEW_BODY"
-          } >codex-review-context.md
-          gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments" --paginate \
+          } >"$context_file"
+
+          # 行内评论才是 review 的实质内容（正文常常只是模板），拉不到必须停下。
+          # 吞掉这里的错误 = Codex 拿到一份空 review、不改任何文件、job 打绿勾
+          # 收工，正是「不许把失败伪装成成功」要挡的东西。本轮真没有行内评论时
+          # gh api --jq 对空数组本来就返回 0，不需要 `|| true` 兜底。
+          if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments" --paginate \
             --jq '.[] | "- \(.path):\(.line // .original_line // 0) — \(.body)"' \
-            >>codex-review-context.md || true
+            >>"$context_file"; then
+            echo "::error::could not read the inline comments of review $REVIEW_ID; refusing to hand Codex an incomplete review"
+            exit 1
+          fi
 
       - name: Codex fixes the PR
         id: codex
@@ -326,7 +342,7 @@ jobs:
           allow-bot-users: 'chatgpt-codex-connector[bot]'
           # safety-strategy 保持默认 drop-sudo：本 job 后续步骤都不需要 sudo。
           prompt: |
-            工作区根目录的 codex-review-context.md 是别人对本 PR 提的 review：
+            ${{ steps.context.outputs.file }} 是别人对本 PR 提的 review：
             正文加行内评论。请据它迭代当前分支的代码。
 
             1. 逐条判断建议：真 bug 或明确改进 → 改文件；纯风格偏好、误报、
@@ -352,11 +368,12 @@ jobs:
           VERIFY: ${{ env.VERIFY_CMD }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          CONTEXT_FILE: ${{ steps.context.outputs.file }}
         run: |
           set -euo pipefail
 
           # 喂给 Codex 的临时上下文，不能跟着 PR 提交出去。
-          rm -f codex-review-context.md
+          rm -f -- "$CONTEXT_FILE"
 
           if [ -z "$(git status --porcelain)" ]; then
             echo 'pushed=false' >>"$GITHUB_OUTPUT"

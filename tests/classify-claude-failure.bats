@@ -96,3 +96,54 @@ why() {
   out="$(classify 'error_during_execution true the reviewer wrote a comment about handling errors politely')"
   assert_equal "$(verdict "$out")" business
 }
+
+# 下面这组守的是「认字不能太宽」：判据只认 provider 真吐出来的报错结构。
+# `.result` 是 Claude 自己写的一段自然语言总结，散文里出现同样的词不算数 ——
+# 否则评审正文（外部输入）里写一句 503，Claude 复述一遍，就换出一次持写权限
+# token 的接管。
+
+@test "a downstream 503 quoted in a test report is a business failure — no handover" {
+  out="$(classify 'error_during_execution true 集成测试打下游服务返回 503 Service Unavailable，我修不好')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "a bare service unavailable in prose is a business failure — no handover" {
+  out="$(classify 'error_during_execution true the staging service was unavailable, status 503, so the smoke test failed')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "a test asserting on 401 unauthorized is a business failure — no handover" {
+  out="$(classify 'error_during_execution true the auth suite expected 401 unauthorized but got 200')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "our own rate limit guard tripping is a business failure — no handover" {
+  out="$(classify 'error_during_execution true the load test tripped our own rate limit guard')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "a test name containing a provider error code is a business failure — no handover" {
+  out="$(classify 'error_during_execution true test_rate_limit_error still fails after three attempts')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "a structured API error body still counts as a provider failure" {
+  out="$(classify 'error_during_execution true API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"too many requests"}}')"
+  assert_equal "$(verdict "$out")" quota
+}
+
+@test "the provider being overloaded still counts as a provider failure" {
+  out="$(classify 'error_during_execution true API Error: 503 upstream connect error')"
+  assert_equal "$(verdict "$out")" quota
+}
+
+@test "an exhausted credit balance counts as a provider failure" {
+  out="$(classify 'error_during_execution true Your credit balance is too low to access the Anthropic API')"
+  assert_equal "$(verdict "$out")" quota
+  assert_contains "$(why "$out")" 'credit balance is too low'
+}
+
+@test "a provider marker on any line of a multi-line verdict still counts" {
+  out="$(printf 'error_during_execution true I started on the failing test\nerror_during_execution true Claude AI usage limit reached|1756089600\n' | "$SCRIPTS/classify-claude-failure.sh")"
+  assert_equal "$(verdict "$out")" quota
+}
