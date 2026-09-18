@@ -1,0 +1,52 @@
+[
+  {
+    "name": "gh-workflows",
+    "full_name": "Melodymaifafa/gh-workflows",
+    "owner": {
+      "login": "Melodymaifafa"
+    },
+    "archived": false,
+    "default_branch": "develop",
+    "private": false
+  },
+  {
+    "name": "private-caller",
+    "full_name": "Melodymaifafa/private-caller",
+    "owner": {
+      "login": "Melodymaifafa"
+    },
+    "archived": false,
+    "default_branch": "develop",
+    "private": true
+  },
+  {
+    "name": "main-default",
+    "full_name": "Melodymaifafa/main-default",
+    "owner": {
+      "login": "Melodymaifafa"
+    },
+    "archived": false,
+    "default_branch": "main",
+    "private": false
+  },
+  {
+    "name": "old-archived",
+    "full_name": "Melodymaifafa/old-archived",
+    "owner": {
+      "login": "Melodymaifafa"
+    },
+    "archived": true,
+    "default_branch": "develop",
+    "private": true
+  },
+  {
+    "name": "someone-elses",
+    "full_name": "other-org/someone-elses",
+    "owner": {
+      "login": "other-org"
+    },
+    "archived": false,
+    "default_branch": "develop",
+    "private": false
+  }
+]

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# 假 curl：记一行日志就成功，不联网。Pushover 的 message 字段存成 body。
+# $FAKE_GH_DIR/curl.exit 存在时按里面的退出码失败（模拟 Pushover 挂掉）。
+# shellcheck source=tests/test_helper/fake-bin/_lib.sh
+. "$(dirname "$0")/_lib.sh"
+fake_require_env curl
+
+url="" body="" has_body=0 prev=""
+for a in "$@"; do
+  case "$prev" in
+    --form-string|-F|--form|-d|--data|--data-urlencode|--data-raw)
+      case "$a" in message=*) body="${a#message=}"; has_body=1 ;; esac ;;
+  esac
+  case "$a" in http://*|https://*) url="$a" ;; esac
+  prev="$a"
+done
+
+if [ "$has_body" = 1 ]; then fake_log "curl $*" "$body"; else fake_log "curl $*"; fi
+
+if [ -e "$FAKE_GH_DIR/curl.exit" ]; then
+  code="$(tr -d '[:space:]' <"$FAKE_GH_DIR/curl.exit")"
+  [ "$code" = 0 ] || { echo "curl: (22) fake failure for $url" >&2; exit "$code"; }
+fi
+case "$url" in
+  *api.pushover.net*) echo '{"status":1,"request":"fake-pushover"}' ;;
+esac
+exit 0

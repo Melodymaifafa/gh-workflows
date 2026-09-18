@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# 假 sleep：不真睡，只记日志。设了 FAKE_NOW 时把假时钟往前拨同样的秒数，
+# 这样「等到 deadline」的轮询循环在测试里能走完。支持 s/m/h/d 后缀和小数。
+# shellcheck source=tests/test_helper/fake-bin/_lib.sh
+. "$(dirname "$0")/_lib.sh"
+fake_require_env sleep
+fake_log "sleep $*"
+
+total=0
+for a in "$@"; do
+  secs="$(printf '%s' "$a" | awk '
+    /^[0-9]*\.?[0-9]+[smhd]?$/ {
+      n = $0; u = substr(n, length(n)); m = 1
+      if (u == "m") m = 60; else if (u == "h") m = 3600; else if (u == "d") m = 86400
+      if (u ~ /[smhd]/) n = substr(n, 1, length(n) - 1)
+      printf "%d", n * m; ok = 1
+    }
+    END { if (!ok) exit 1 }')" || fake_die "sleep: bad duration '$a'"
+  total=$((total + secs))
+done
+
+if [ -n "${FAKE_NOW:-}" ]; then
+  mkdir -p "$FAKE_DIR/state"
+  off=0
+  [ -f "$FAKE_DIR/state/clock_offset" ] && off="$(cat "$FAKE_DIR/state/clock_offset")"
+  echo $((off + total)) >"$FAKE_DIR/state/clock_offset"
+fi
+exit 0

@@ -7,6 +7,7 @@ on:
 
 jobs:
   ci:
-    uses: Melodymaifafa/gh-workflows/.github/workflows/ci.yml@v1
+    # 用本分支自己的 ci.yml（不是 @v1）：PR 里新加的 bats 和 lint 改动当场就跑。
+    uses: ./.github/workflows/ci.yml
     with:
       runtime: shell

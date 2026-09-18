@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# 假 date：设了 FAKE_NOW（ISO 8601 或 @epoch）时「现在」取假时钟（FAKE_NOW + 假 sleep 累计秒数）。
+# -d/--date 的 ISO 8601 / @epoch / YYYY-MM-DD 由这里自己算（macOS 的 date 没有 -d），
+# 其它写法、以及没设 FAKE_NOW 又没 -d 的调用，交给真 date。
+# 支持：-u/--utc、-d X/--date X/--date=X、+FORMAT（%s 由这里算，其余走 jq strftime）。
+# shellcheck source=tests/test_helper/fake-bin/_lib.sh
+. "$(dirname "$0")/_lib.sh"
+fake_require_env date
+fake_log "date $*"
+
+delegate() {
+  real="$(fake_real_cmd date "$0")" || fake_die "date: no real date on PATH"
+  exec "$real" "$@"
+}
+
+utc=0 d="" has_d=0 fmt="" has_fmt=0
+args=("$@")
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -u|--utc|--universal) utc=1; shift ;;
+    -d|--date) d="$2"; has_d=1; shift 2 ;;
+    --date=*) d="${1#--date=}"; has_d=1; shift ;;
+    +*) fmt="${1#+}"; has_fmt=1; shift ;;
+    *) delegate "${args[@]}" ;;
+  esac
+done
+
+if [ "$has_d" = 1 ]; then
+  if [ "$d" = now ]; then
+    epoch="$(fake_clock_epoch)" || delegate "${args[@]}"
+  else
+    epoch="$(fake_parse_epoch "$d")" || delegate "${args[@]}"
+  fi
+else
+  epoch="$(fake_clock_epoch)" || delegate "${args[@]}"
+fi
+
+[ "$has_fmt" = 1 ] || fmt='%a %b %e %H:%M:%S %Z %Y'
+# %s 先换成 epoch（jq 的 strftime 按本地时区算 %s，会错）；%% 先保护起来。
+fmt="${fmt//%%/$'\001'}"
+fmt="${fmt//%s/$epoch}"
+fmt="${fmt//$'\001'/%%}"
+if [ "$utc" = 1 ]; then
+  jq -rn --argjson e "$epoch" --arg f "$fmt" '$e | gmtime | strftime($f)'
+else
+  jq -rn --argjson e "$epoch" --arg f "$fmt" '$e | localtime | strflocaltime($f)'
+fi
