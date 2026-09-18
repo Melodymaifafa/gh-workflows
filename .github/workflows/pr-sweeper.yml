@@ -1,0 +1,115 @@
+# PR 巡检：每 15 分钟扫一遍所有 develop 仓库，给卡住的 PR 补一脚（规则见 scripts/pr-sweep.sh）。
+# 只在 gh-workflows 里跑（公开仓库，分钟免费）。总开关是仓库变量 SWEEP_MODE：off / dry / live，没设 = off。
+name: PR sweeper
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 只扫这些仓库（逗号分隔的仓库名），空 = 全部。
+        type: string
+        default: ''
+      dry_run:
+        description: 只报告会做什么，不动手（SWEEP_MODE=off 时照样不跑）。
+        type: boolean
+        default: true
+
+# GITHUB_TOKEN 只用来读自己和保活；写 PR 用的是 owner 的 PAT。
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: pr-sweeper
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      REPO: ${{ github.repository }}
+      PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+      PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Resolve sweep mode
+        id: mode
+        env:
+          SWEEP_MODE: ${{ vars.SWEEP_MODE }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          case "${SWEEP_MODE:-off}" in
+            off|dry|live) mode="${SWEEP_MODE:-off}" ;;
+            *) echo "::warning::SWEEP_MODE='$SWEEP_MODE' 不认识，按 off 处理"; mode=off ;;
+          esac
+          # 手动跑且勾了 dry_run：live 也只报告。
+          if [ "$mode" = live ] && [ "${DRY_RUN:-}" = true ]; then mode=dry; fi
+          echo "mode=$mode" >>"$GITHUB_OUTPUT"
+          echo "巡检模式：$mode"
+
+      # 公开仓库 60 天没提交，定时 workflow 会被自动停用；每轮都显式启用一次。
+      - name: Keep the schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/$REPO/actions/workflows/pr-sweeper.yml/enable" --silent ||
+            echo "::warning::保活调用失败"
+
+      - name: Sweep open PRs
+        if: steps.mode.outputs.mode != 'off'
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          SWEEP_MODE: ${{ steps.mode.outputs.mode }}
+          ONLY_REPOS: ${{ inputs.repos }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::CODEX_TRIGGER_TOKEN 没设，巡检没法跑"
+            exit 1
+          fi
+          ./scripts/pr-sweep.sh
+
+      # 保活不一定管用，45 天没提交时提醒一次：只在「上一轮还没满 45 天、这一轮满了」时推。
+      - name: Alert when gh-workflows goes quiet
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          last="$(gh api "repos/$REPO/commits?per_page=1" --jq '.[0].commit.committer.date | fromdateiso8601')"
+          prev="$(gh api "repos/$REPO/actions/workflows/pr-sweeper.yml/runs?status=completed&per_page=1" \
+            --jq '(.workflow_runs[0].run_started_at // .workflow_runs[0].created_at // "1970-01-01T00:00:00Z") | fromdateiso8601')"
+          due=$((last + 45 * 86400))
+          now="$(date +%s)"
+          if [ "$due" -le "$now" ] && [ "$due" -gt "$prev" ] &&
+            [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
+            curl -sf -X POST https://api.pushover.net/1/messages.json \
+              --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
+              --form-string "title=🤖 gh-workflows 45 天没提交" \
+              --form-string "message=再过 15 天 GitHub 会停掉 PR 巡检的定时任务；随便推一个提交到 develop 就能续上。" >/dev/null ||
+              echo "::warning::Pushover 发送失败"
+          fi
+
+      # 巡检挂了只推一次：上一轮成功、这一轮失败才推，连着失败不重复。
+      - name: Alert when the sweep starts failing
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          prev="$(gh api "repos/$REPO/actions/workflows/pr-sweeper.yml/runs?status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion // "none"')"
+          if [ "$prev" = success ] && [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
+            curl -sf -X POST https://api.pushover.net/1/messages.json \
+              --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
+              --form-string "title=🤖 PR 巡检挂了" \
+              --form-string "message=巡检这一轮失败了，卡住的 PR 暂时没人补；请打开日志看原因。$RUN_URL" >/dev/null ||
+              echo "::warning::Pushover 发送失败"
+          fi
