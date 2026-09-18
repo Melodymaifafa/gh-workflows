@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# 假 gh：按路由回放 $FAKE_GH_DIR 里的 fixture，每次调用在 $FAKE_LOG 记一行。
+# 没准备 fixture 的读请求、认不出的子命令一律 exit 97，测试不会误绿。
+# 文件名规则见 tests/test_helper/common.bash 顶部。
+set -o pipefail
+# shellcheck source=tests/test_helper/fake-bin/_lib.sh
+. "$(dirname "$0")/_lib.sh"
+fake_require_env gh
+
+token_tag=" [token=${GH_TOKEN:-${GITHUB_TOKEN:-}}]"
+
+# 读 stdin 只在参数明确要求时（--input - / @- / --body-file -），否则会卡住。
+stdin_data=""
+stdin_read=0
+stdin_log=""
+# 不能在 $( ) 里调用（子 shell 改不了这里的变量），读完用 $stdin_data。
+read_stdin() {
+  if [ "$stdin_read" = 0 ]; then
+    stdin_data="$(cat)"
+    stdin_read=1
+    # 日志里的 JSON 压成一行，方便 grep '"commit_id":"…"'。
+    stdin_log="$(printf '%s' "$stdin_data" | jq -c . 2>/dev/null)" || stdin_log="$stdin_data"
+  fi
+}
+
+# serve <slot> <jq-expr> <has-jq> <silent>：输出槽里的内容，按槽里的 .exit 退出。
+serve() {
+  local slot="$1" expr="$2" has_jq="$3" silent="$4" code=0 file=""
+  [ -e "$slot.exit" ] && code="$(tr -d '[:space:]' <"$slot.exit")"
+  if [ -e "$slot.json" ]; then file="$slot.json"; elif [ -e "$slot.out" ]; then file="$slot.out"; fi
+  if [ "$code" != 0 ]; then
+    [ -n "$file" ] && cat "$file"
+    echo "gh: fake HTTP error (exit $code)" >&2
+    exit "$code"
+  fi
+  [ "$silent" = 1 ] && exit 0
+  [ -n "$file" ] || exit 0
+  if [ "$has_jq" = 1 ]; then
+    jq -r "$expr" <"$file"
+  else
+    cat "$file"
+  fi
+  exit
+}
+
+gh_api() {
+  local method="" route="" slurp=0 expr="" has_jq=0 silent=0 input=""
+  local fields=() f body="" query="" k v
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -X|--method) method="$2"; shift 2 ;;
+      --method=*) method="${1#--method=}"; shift ;;
+      --paginate) shift ;;
+      --slurp) slurp=1; shift ;;
+      --jq|-q) expr="$2"; has_jq=1; shift 2 ;;
+      --jq=*) expr="${1#--jq=}"; has_jq=1; shift ;;
+      -f|-F|--field|--raw-field) fields+=("$1" "$2"); shift 2 ;;
+      --input) input="$2"; shift 2 ;;
+      -H|--header) shift 2 ;;
+      --silent) silent=1; shift ;;
+      -*) fake_die "gh api: unsupported flag '$1' (args: $*)" ;;
+      *)
+        [ -z "$route" ] || fake_die "gh api: second positional '$1' (route already '$route')"
+        route="$1"; shift ;;
+    esac
+  done
+  [ -n "$route" ] || fake_die "gh api: no route"
+  case "$route" in *'{'*) fake_die "gh api: placeholder in route '$route' is not supported by the fake" ;; esac
+  route="${route#/}"
+
+  # 和真 gh 一样：带了字段或 --input 且没写 -X，默认 POST。
+  if [ -z "$method" ]; then
+    if [ "${#fields[@]}" -gt 0 ] || [ -n "$input" ]; then method=POST; else method=GET; fi
+  fi
+  method="$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')"
+
+  local i=0
+  while [ "$i" -lt "${#fields[@]}" ]; do
+    f="${fields[$((i + 1))]}"
+    k="${f%%=*}"
+    v="${f#*=}"
+    if [ "${fields[$i]}" = -F ] || [ "${fields[$i]}" = --field ]; then
+      case "$v" in
+        @-) read_stdin; v="$stdin_data" ;;
+        @*) v="$(cat "${v#@}")" ;;
+      esac
+    fi
+    [ "$k" = body ] && body="$v"
+    query="${query:+$query&}$k=$v"
+    i=$((i + 2))
+  done
+  if [ -n "$input" ]; then
+    local data
+    if [ "$input" = - ]; then read_stdin; data="$stdin_data"; else data="$(cat "$input")"; fi
+    if printf '%s' "$data" | jq -e 'type == "object" and has("body")' >/dev/null 2>&1; then
+      body="$(printf '%s' "$data" | jq -r '.body')"
+    else
+      body="$data"
+    fi
+  fi
+
+  # GET 带字段 = 查询参数，拼进路由（不做 URL 编码）。
+  if [ "$method" = GET ] && [ -n "$query" ]; then
+    case "$route" in *\?*) route="$route&$query" ;; *) route="$route?$query" ;; esac
+  fi
+
+  local line="gh api $method $route ::" a
+  for a in "${ORIG_ARGS[@]:1}"; do line="$line $a"; done
+  [ "$stdin_read" = 1 ] && line="$line <<< $stdin_log"
+  if [ -n "$body" ] || [ "${#fields[@]}" -gt 0 ] || [ -n "$input" ]; then
+    fake_log "$line$token_tag" "$body"
+  else
+    fake_log "$line$token_tag"
+  fi
+
+  local key dir n slot
+  key="$(fake_route_key "$route")"
+  dir="$FAKE_GH_DIR/api/$method"
+  n="$(fake_next_count "api_${method}_$key")"
+  slot="$(fake_slot "$dir" "$key" "$n")"
+  if [ -z "$slot" ]; then
+    [ "$method" = GET ] &&
+      fake_die "no fixture for 'gh api GET $route' (call $n; expected $dir/$key.json or $key.<n>.json)"
+    [ "$silent" = 1 ] || { if [ "$has_jq" = 1 ]; then echo '{}' | jq -r "$expr"; else echo '{}'; fi; }
+    exit 0
+  fi
+
+  if [ "$slurp" = 1 ] && [ -e "$slot.json" ] && [ ! -e "$slot.exit" ]; then
+    # 单页 fixture：--slurp 把它包成 [page]，和真 gh 的「页数组」形状一致。
+    local tmp="$FAKE_DIR/state/slurp.$$"
+    jq -s . <"$slot.json" >"$tmp.json"
+    serve "$tmp" "$expr" "$has_jq" "$silent"
+  fi
+  serve "$slot" "$expr" "$has_jq" "$silent"
+}
+
+# gh <group> <sub> ...：槽名 <group>_<sub>，放在 $FAKE_GH_DIR/cli/。
+gh_cli() {
+  local group="$1" sub="$2"
+  shift 2
+  local expr="" has_jq=0 body="" has_body=0 repo="" num="" a
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --jq|-q) expr="$2"; has_jq=1; shift 2 ;;
+      --body|-b) body="$2"; has_body=1; shift 2 ;;
+      -F|-f)
+        # gh pr/issue 的 -F 是 --body-file；gh workflow run 的 -f/-F 是输入字段。
+        if [ "$1" = -f ] || [ "$group" = workflow ]; then shift 2; continue; fi
+        if [ "$2" = - ]; then read_stdin; body="$stdin_data"; else body="$(cat "$2")"; fi
+        has_body=1; shift 2 ;;
+      --body-file)
+        if [ "$2" = - ]; then read_stdin; body="$stdin_data"; else body="$(cat "$2")"; fi
+        has_body=1; shift 2 ;;
+      --repo|-R) repo="$2"; shift 2 ;;
+      --json|--match-head-commit|--subject|-t|--title|--ref|-r|--limit|-L|--workflow|-w|--author|--head|--base|-B) shift 2 ;;
+      *) [ -z "$num" ] && case "$1" in -*) ;; *) num="$1" ;; esac; shift ;;
+    esac
+  done
+
+  local line="gh"
+  for a in "${ORIG_ARGS[@]}"; do line="$line $a"; done
+  [ "$stdin_read" = 1 ] && line="$line <<< $stdin_log"
+  if [ "$has_body" = 1 ]; then fake_log "$line$token_tag" "$body"; else fake_log "$line$token_tag"; fi
+
+  local key="${group}_${sub}" n slot
+  n="$(fake_next_count "cli_$key")"
+  slot="$(fake_slot "$FAKE_GH_DIR/cli" "$key" "$n")"
+  if [ -n "$slot" ]; then
+    serve "$slot" "$expr" "$has_jq" 0
+  fi
+  # 没准备 fixture 时只有「写」类子命令有默认行为；读类必须显式给数据。
+  case "$key" in
+    pr_comment)
+      echo "https://github.com/${repo:-fake/repo}/pull/${num:-0}#issuecomment-$((900000 + n))"
+      exit 0 ;;
+    pr_merge|pr_edit|pr_close|pr_ready|workflow_*)
+      exit 0 ;;
+  esac
+  fake_die "no fixture for 'gh $group $sub' (expected $FAKE_GH_DIR/cli/$key.out or .json)"
+}
+
+ORIG_ARGS=("$@")
+case "${1:-}" in
+  api) shift; gh_api "$@" ;;
+  pr|workflow|run|repo|issue|release|secret|variable|auth|label)
+    [ "$#" -ge 2 ] || fake_die "gh $1 without a subcommand"
+    gh_cli "$@" ;;
+  *) fake_log "gh $*"; fake_die "unsupported gh invocation: gh $*" ;;
+esac
