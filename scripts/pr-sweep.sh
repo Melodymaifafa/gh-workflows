@@ -5,10 +5,10 @@
 # 每个 open、非草稿、同仓库、合进 develop、标题不带 [no-codex-merge]/[no-claude] 的 PR，
 # 按顺序只走第一条命中的规则：
 #   1. 有冲突            → 告警一次（conflict），停。
-#   2. 这个 head 已停车  → 停（no-fix、round-cap、重试完的 fix-failed、CI 红且 unstable）。
-#   3. 额度还没恢复      → 停（未到期的 until）。
-#   4. head 有审查意见   → 空闲 ≥ 60 分钟或额度已恢复时发 M5 让 iterate 再修，每个 head 最多 2 次；
-#                          之后告警一次 fix-failed，停。
+#   2. 这个 head 已停车  → 停（no-fix、round-cap、retry-exhausted、CI 红且 unstable）。
+#   3. 额度还没恢复      → 停（这个 head 上最晚的 until 还没到）。
+#   4. head 有审查意见   → 空闲 ≥ 60 分钟或额度已恢复时发 M5 让 iterate 再修，每个 head 最多算 2 次
+#                          （M5 之后又撞额度的那次不算）；用完且空闲 ≥ 60 分钟就告警一次 retry-exhausted，停。
 #   5. 其余              → 没人碰过且空闲 ≥ 30 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
 #                          每个 head 最多 3 次、间隔 ≥ 60 分钟；然后告警一次 stalled；然后 7 天内每天一次。
 #
@@ -18,6 +18,9 @@
 #   ONLY_REPOS       只扫这些仓库（逗号或空格分隔，仓库名或 owner/名）
 #   NOW_EPOCH        测试用：假的「现在」
 #   PUSHOVER_TOKEN / PUSHOVER_USER  告警推送（都有才推）
+#
+# 日志和 $GITHUB_STEP_SUMMARY 是公开的：私有仓库只写 repo-<sha256 前 8 位>，不写名字、PR 号和 SHA，
+# gh 的报错也吞掉。Pushover 是私人通道，照写真名。
 set -euo pipefail
 
 : "${OWNER:?OWNER 没设}"
@@ -56,11 +59,15 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     | .created_at | ts] | sort as $kicks
 | [$r[] | select(.author_association == "OWNER" and has("<!-- fix-retry: head=" + $h + " review="))
     | .submitted_at | ts] | sort as $retries
+| [$alerts[] | select(.r == "fix-quota") | .at] as $quota_at
+# 某次 M5 之后、下一次 M5 之前又撞了 fix-quota，这次重试不算数。
+| [range(0; $retries | length) as $i | $retries[$i] as $t | ($retries[$i + 1] // 1e18) as $next
+    | select(any($quota_at[]; . > $t and . < $next) | not)] | length as $counted
 | [$r[] | select(.commit_id == $h and (.user.login == $codex
       or (.author_association == "OWNER" and has("claude-review-findings: " + $h))))]
     | sort_by(.submitted_at) as $findings
 | ($retries | last // 0) as $last_retry
-| [$alerts[] | select(.u != "-") | .u | tonumber] as $untils
+| ([$alerts[] | select(.u != "-") | .u | tonumber] | max // 0) as $until
 | ([$alerts[] | select(.r == "fix-quota" or .r == "auth" or .r == "fix-failed")] | sort_by(.at) | last | .r // "none") as $fix_reason
 | ([$p.updated_at | ts] + [$c[] | .created_at | ts] + [$r[] | .submitted_at | ts] | max) as $last
 | [ $now - $last,
@@ -70,20 +77,26 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
         or any($tr[]; has("claude-review-findings: " + $h)) then 1 else 0 end),
     ($findings | length),
     ($findings | last | .id // 0),
-    ($retries | length),
+    $counted,
     ($kicks | length),
     ($kicks | last // 0),
     ([$alerts[] | select(.r == "stalled") | .at] | min // 0),
     ([$alerts[] | .r] | unique | join(",") | if . == "" then "-" else . end),
-    (if any($untils[]; . > $now) then 1 else 0 end),
-    (if any($untils[]; . <= $now and . > $last_retry) then 1 else 0 end),
+    (if $until > $now then 1 else 0 end),
+    (if $until > 0 and $until <= $now and $until > $last_retry then 1 else 0 end),
     $fix_reason,
     ($p.mergeable_state // "unknown"),
     (if $p.merged then 1 else 0 end)
   ] | @tsv
 '
 
-# 下面这些函数读 sweep_pr 设的 repo / n / H / alerts / url。
+# 公开日志里的仓库名：私有仓库换成 repo-<sha256(full_name) 前 8 位>。
+repo_label() {
+  if [ "$2" = true ]; then printf 'repo-%s' "$(printf '%s' "$1" | sha256sum | cut -c1-8)"; else printf '%s' "$1"; fi
+}
+
+# 下面这些函数读 sweep_pr 设的 repo / n / H / alerts / url / who / hs。
+# who / hs 是日志用的：公开仓库 "owner/名#N" 和 " (sha7)"，私有仓库只有标签、hs 为空。
 post_comment() {
   gh api -X POST "repos/$repo/issues/$n/comments" -f "body=$1" --silent
 }
@@ -91,7 +104,7 @@ post_comment() {
 # 动手前再看一眼：PR 还开着、head 还是 H，才写。
 head_unchanged() {
   [ "$(gh api "repos/$repo/pulls/$n" --jq '.state + " " + .head.sha')" = "open $H" ] && return 0
-  echo "$repo#$n: head 变了或 PR 关了，这轮不动。"
+  echo "$who: head 变了或 PR 关了，这轮不动。"
   return 1
 }
 
@@ -99,24 +112,24 @@ head_unchanged() {
 alert_once() {
   local reason="$1" until="$2" msg="$3"
   case ",$alerts," in *",$reason,"*) return 0 ;; esac
-  if [ "$MODE" = dry ]; then summary "- would alert $repo#$n reason=$reason (${H:0:7})"; return 0; fi
+  if [ "$MODE" = dry ]; then summary "- would alert $who reason=$reason$hs"; return 0; fi
   head_unchanged || return 0
   if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
     # 推送失败就不留标记，下一轮巡检重发，免得告警丢了还当作已发。
     curl -sf -X POST https://api.pushover.net/1/messages.json \
       --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
       --form-string "title=🤖 PR 巡检：$repo#$n" --form-string "message=$msg $url" >/dev/null 2>&1 ||
-      { echo "::warning::$repo#$n Pushover 发送失败，下轮重试"; return 0; }
+      { echo "::warning::$who Pushover 发送失败，下轮重试"; return 0; }
   fi
   post_comment "$msg"$'\n\n'"<!-- pr-guard: alert head=$H reason=$reason until=$until -->"
-  summary "- alerted $repo#$n reason=$reason (${H:0:7})"
+  summary "- alerted $who reason=$reason$hs"
 }
 
 kick() {
-  if [ "$MODE" = dry ]; then summary "- would kick $repo#$n (${H:0:7}) $1"; return 0; fi
+  if [ "$MODE" = dry ]; then summary "- would kick $who$hs $1"; return 0; fi
   head_unchanged || return 0
   post_comment "@codex review"$'\n\n'"<!-- codex-review-head: $H -->"$'\n'"<!-- pr-sweeper: kick -->"
-  summary "- kicked $repo#$n (${H:0:7}) $1"
+  summary "- kicked $who$hs $1"
 }
 
 # retry_fix <review id> <上次失败原因>：M5，一条 COMMENT review，iterate 收到后重修同一批意见。
@@ -128,27 +141,28 @@ retry_fix() {
     fix-failed) why="修复出错" ;;
     *) why="一直没有结果" ;;
   esac
-  if [ "$MODE" = dry ]; then summary "- would retry fix $repo#$n (${H:0:7}) review=$1"; return 0; fi
+  if [ "$MODE" = dry ]; then summary "- would retry fix $who$hs review=$1"; return 0; fi
   head_unchanged || return 0
   gh api -X POST "repos/$repo/pulls/$n/reviews" -f event=COMMENT -f "commit_id=$H" \
     -f "body=🤖 巡检：上次自动修复没完成（$why），再修一次。"$'\n'"<!-- fix-retry: head=$H review=$1 -->" --silent
-  summary "- retried fix $repo#$n (${H:0:7}) review=$1"
+  summary "- retried fix $who$hs review=$1"
 }
 
 sweep_pr() {
-  repo="$1" n="$2"
+  repo="$1" n="$2" private="$3"
   gh api "repos/$repo/pulls/$n" >"$tmp/pr.json"
   gh api --paginate --slurp "repos/$repo/issues/$n/comments?per_page=100" | jq 'add // []' >"$tmp/comments.json"
   gh api --paginate --slurp "repos/$repo/pulls/$n/reviews?per_page=100" | jq 'add // []' >"$tmp/reviews.json"
   H="$(jq -r .head.sha "$tmp/pr.json")"
   url="$(jq -r .html_url "$tmp/pr.json")"
+  if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
 
   local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged
   facts="$(jq -rn --slurpfile pr "$tmp/pr.json" --slurpfile cs "$tmp/comments.json" --slurpfile rs "$tmp/reviews.json" \
     --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq")"
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
     until_active until_passed fix_reason state merged <<<"$facts"
-  echo "$repo#$n ${H:0:7}: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
+  echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
   # 1. 冲突：只有人能解。
   if [ "$state" = dirty ]; then
@@ -157,11 +171,10 @@ sweep_pr() {
   fi
 
   # 2. 已停车：等人处理，巡检不插手。
-  case ",$alerts," in *,no-fix,*|*,round-cap,*) echo "  已停车"; return 0 ;; esac
+  case ",$alerts," in *,no-fix,*|*,round-cap,*|*,retry-exhausted,*) echo "  已停车"; return 0 ;; esac
   case ",$alerts," in *,ci,*) [ "$state" != unstable ] || { echo "  CI 红，已停车"; return 0; } ;; esac
-  case ",$alerts," in *,fix-failed,*) [ "$retries" -lt "$max_retries" ] || { echo "  重修用完，已停车"; return 0; } ;; esac
 
-  # 3. 额度还没恢复。
+  # 3. 额度还没恢复（取这个 head 上最晚的 until）。
   [ "$until_active" = 0 ] || { echo "  等额度恢复"; return 0; }
 
   # 4. 有意见：重修，不重审。
@@ -169,8 +182,10 @@ sweep_pr() {
     [ "$idle" -ge 3600 ] || [ "$until_passed" = 1 ] || { echo "  修复可能还在跑"; return 0; }
     if [ "$retries" -lt "$max_retries" ]; then
       retry_fix "$target" "$fix_reason"
+    elif [ "$idle" -ge 3600 ]; then
+      alert_once retry-exhausted - "🤖 自动修复重试 2 次还是没完成，已停。你来点 Merge 或关掉；推新提交会重新开始。"
     else
-      alert_once fix-failed - "🤖 巡检：自动修复重试 $max_retries 次还是没完成，已停；请手动修改，或点 Merge / 关掉这个 PR。"
+      echo "  最后一次重修可能还在跑"
     fi
     return 0
   fi
@@ -201,24 +216,30 @@ repos="$(gh api --paginate --slurp "user/repos?affiliation=owner&per_page=100" |
     | add // [] | .[]
     | select(.owner.login == $o and (.archived | not) and .default_branch == "develop")
     | select(($only | length) == 0 or (.name as $n | .full_name as $f | any($only[]; . == $n or . == $f)))
-    | .full_name')"
+    | "\(.full_name):\(.private == true)"')"
 
 summary "### PR 巡检（$MODE）"
 failed=0
-for repo in $repos; do
+for entry in $repos; do
+  repo="${entry%:*}" private="${entry##*:}"
+  label="$(repo_label "$repo" "$private")"
+  # 私有仓库的 gh 报错里有仓库名，吞掉，只留一句通用警告。
+  err=/dev/stderr
+  [ "$private" = false ] || err=/dev/null
   if ! prs="$(gh api --paginate "repos/$repo/pulls?state=open&base=develop&per_page=100" --jq '
       .[] | select(.draft | not) | select(.base.ref == "develop")
       | select(.head.repo.full_name == .base.repo.full_name)
-      | select((.title | contains("[no-codex-merge]") or contains("[no-claude]")) | not) | .number')"; then
-    echo "::warning::$repo 列 PR 失败"; failed=1; continue
+      | select((.title | contains("[no-codex-merge]") or contains("[no-claude]")) | not) | .number' 2>"$err")"; then
+    echo "::warning::$label 列 PR 失败"; failed=1; continue
   fi
   for n in $prs; do
     # 一个 PR 出错不拖累其它 PR；子 shell 里重开 -e（|| 语境下 -e 会失效，所以不用 ||）。
     set +e
-    (set -e; sweep_pr "$repo" "$n")
+    (set -e; sweep_pr "$repo" "$n" "$private") 2>"$err"
     rc=$?
     set -e
-    [ "$rc" = 0 ] || { echo "::warning::$repo#$n 巡检出错（exit $rc）"; failed=1; }
+    if [ "$private" = true ]; then pr_label="$label"; else pr_label="$repo#$n"; fi
+    [ "$rc" = 0 ] || { echo "::warning::$pr_label 巡检出错（exit $rc）"; failed=1; }
   done
 done
 exit "$failed"

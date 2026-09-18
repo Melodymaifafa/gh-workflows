@@ -83,6 +83,8 @@ jobs:
       TRIGGERED_AT: ${{ github.event.comment.created_at || github.event.pull_request.updated_at }}
       TARGET_ID: ${{ github.event.comment.id || github.event.pull_request.number }}
       ACTOR_TYPE: ${{ github.event.sender.type }}
+      # 只传「有没有」，不把 PAT 本身交给这个 job。
+      HAS_PAT: ${{ secrets.CODEX_TRIGGER_TOKEN != '' }}
       PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
       PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
     steps:
@@ -182,6 +184,14 @@ jobs:
             fi
             if [ "${ACTOR_TYPE:-}" != User ]; then
               echo "::notice::Codex unavailable ($reason) for a ${ACTOR_TYPE:-unknown} actor; the sweeper re-requests review"
+              exit 0
+            fi
+            # 没有 PAT，Claude 审完也发不出结果：不白跑代审，告警一次。
+            if [ "${HAS_PAT:-}" != true ]; then
+              echo fallback=false >>"$GITHUB_OUTPUT"
+              echo "::warning::CODEX_TRIGGER_TOKEN is missing; skipping the Claude fallback"
+              alert_once "$expected_head" auth \
+                "🤖 这个仓库缺 CODEX_TRIGGER_TOKEN 密钥，Claude 代审没法发结果。重跑 onboard.sh 刷密钥后会自动继续。"
               exit 0
             fi
             {
@@ -510,7 +520,8 @@ jobs:
               jq -c '.[]' <<<"$unknown_checks"
               alert_once "$expected_head" ci \
                 "CI 检查没通过，这个 PR 先不合并；修好 CI 后巡检会自动重审并合并。"
-              exit 1
+              # 告警标记就是信号；本 run 再失败会让 head 一直 unstable，巡检就解不了停车。
+              exit 0
             fi
 
             pending_count="$(
@@ -533,7 +544,7 @@ jobs:
             echo "::error::PR checks did not settle before timeout"
             alert_once "$expected_head" ci \
               "CI 检查一直没跑完，这个 PR 先不合并；去 Actions 页面看看卡在哪，跑通后巡检会自动重审。"
-            exit 1
+            exit 0
           fi
 
           # Revalidate all privileged merge conditions after waiting for CI.
@@ -745,6 +756,8 @@ jobs:
         env:
           # 整个 job 里只有这一步拿得到主人的 PAT。
           GH_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
+          # 只读，只用来在缺 PAT 时查有没有告过警。
+          READ_TOKEN: ${{ github.token }}
           OUTCOME: ${{ steps.review.outcome }}
           STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output }}
           EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
@@ -763,32 +776,63 @@ jobs:
             fi
           }
 
-          # 同 watch-and-merge 的 alert_once：每个 (head, 原因) 只告警一次。
+          # 同 watch-and-merge 的 alert_once：每个 (head, 原因) 只推送一次。
+          # 额度类原因例外：新的 until 更晚时，再留一条不推送的标记，巡检按新时间等。
           alert_once() {
-            local head="$1" reason="$2" message="$3" until="${4:--}" comments
+            local head="$1" reason="$2" message="$3" until="${4:--}" comments prev at
             comments="$(
               gh api --paginate --slurp \
                 "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null
             )" || comments='[]'
-            if jq -e --arg p "pr-guard: alert head=$head reason=$reason " '
+            # none = 没有可信标记；否则是已有标记里最大的 until（没有数字就是 0）。
+            prev="$(
+              jq -r --arg p "pr-guard: alert head=$head reason=$reason " '
+                [ (add // [])[]
+                  | select(
+                      (.user.login == "github-actions[bot]" or
+                        .author_association == "OWNER") and
+                      ((.body // "") | contains($p)))
+                  | [(.body | scan($p + "until=([0-9]+)"))[0] | tonumber]
+                  | max // 0 ]
+                | if length == 0 then "none" else max end
+              ' <<<"$comments" 2>/dev/null
+            )" || prev=none
+            if [ "$prev" = none ]; then
+              push_alert "🤖 PR 自动合并需要你" "$REPO #$PR_NUMBER：$message"
+              gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+                -f body="$message"$'\n\n'"<!-- pr-guard: alert head=$head reason=$reason until=$until -->" \
+                >/dev/null || echo "::warning::Could not post the $reason alert marker"
+              return 0
+            fi
+            if [[ "$reason" =~ ^(fix-quota|review-quota)$ ]] &&
+              [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$prev" ]
+            then
+              at="$(date -u -d "@$((until + 28800))" '+%m-%d %H:%M')"
+              gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+                -f body="🤖 额度又用完了，改到北京时间 $at 后继续（不再重复推送）。"$'\n\n'"<!-- pr-guard: alert head=$head reason=$reason until=$until -->" \
+                >/dev/null || echo "::warning::Could not post the $reason until marker"
+              echo "::notice::Alert $reason for $head re-recorded quietly with a later until"
+              return 0
+            fi
+            echo "::notice::Alert $reason for $head was already sent"
+          }
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::CODEX_TRIGGER_TOKEN is missing; the Claude review cannot be posted"
+            # 兜底：watch job 已为这个 head 发过 auth 告警就不再推送。
+            if GH_TOKEN="${READ_TOKEN:-}" gh api --paginate --slurp \
+                "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null |
+              jq -e --arg p "pr-guard: alert head=$HEAD_SHA reason=auth " '
                 (add // [])
                 | any(.[];
                     (.user.login == "github-actions[bot]" or
                       .author_association == "OWNER") and
                     ((.body // "") | contains($p)))
-              ' <<<"$comments" >/dev/null 2>&1
+              ' >/dev/null 2>&1
             then
-              echo "::notice::Alert $reason for $head was already sent"
-              return 0
+              echo "::notice::Alert auth for $HEAD_SHA was already sent"
+              exit 0
             fi
-            push_alert "🤖 PR 自动合并需要你" "$REPO #$PR_NUMBER：$message"
-            gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
-              -f body="$message"$'\n\n'"<!-- pr-guard: alert head=$head reason=$reason until=$until -->" \
-              >/dev/null || echo "::warning::Could not post the $reason alert marker"
-          }
-
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::CODEX_TRIGGER_TOKEN is missing; the Claude review cannot be posted"
             push_alert "🤖 Codex 召唤令牌缺失" "repo secret CODEX_TRIGGER_TOKEN 为空，$REPO PR #$PR_NUMBER 的 Claude 代审结果发不出去。需在仓库 Settings→Secrets 补上 fine-grained PAT。"
             exit 0
           fi

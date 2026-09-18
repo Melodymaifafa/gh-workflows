@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       repos:
-        description: 只扫这些仓库（逗号分隔的仓库名），空 = 全部。
+        description: 只扫这些仓库（逗号分隔的仓库名），空 = 全部。私有仓库名不会进日志。
         type: string
         default: ''
       dry_run:
@@ -67,12 +67,14 @@ jobs:
           GH_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
           OWNER: ${{ github.repository_owner }}
           SWEEP_MODE: ${{ steps.mode.outputs.mode }}
-          ONLY_REPOS: ${{ inputs.repos }}
+        # repos 输入可能是私有仓库名，不放 env:（step 的 env 会原样打进公开日志），从事件文件里读。
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::error::CODEX_TRIGGER_TOKEN 没设，巡检没法跑"
             exit 1
           fi
+          ONLY_REPOS="$(jq -r '.inputs.repos // ""' "${GITHUB_EVENT_PATH:-/dev/null}" 2>/dev/null || true)"
+          export ONLY_REPOS
           ./scripts/pr-sweep.sh
 
       # 保活不一定管用，45 天没提交时提醒一次：只在「上一轮还没满 45 天、这一轮满了」时推。

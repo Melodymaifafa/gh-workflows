@@ -22,7 +22,7 @@ setup() {
   setup_fake_env
   export REPO=o/r PR_NUMBER=7 BASE_BRANCH=develop GH_TOKEN=actions-token
   export GITHUB_RUN_ID=111 GITHUB_WORKFLOW='Merge after clean Codex review'
-  export ACTOR_TYPE=User PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
+  export ACTOR_TYPE=User HAS_PAT=true PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
   export FAKE_NOW=2026-09-18T08:00:10Z TRIGGERED_AT=2026-09-18T08:00:00Z
   unset WATCH_SECONDS POLL_SECONDS SILENT_SECONDS
   fake_route repos/o/r/pulls/7 "$(pr_json)"
@@ -45,11 +45,11 @@ path_a() {
   fake_route "repos/o/r/issues/7/reactions?per_page=100" "${1:-[]}"
 }
 
-# 路径 B：主人令牌发的 M1 召唤评论。
+# 路径 B：主人令牌发的 M1 召唤评论。path_b [reactions] [m1_body 的第二个参数]
 path_b() {
   export EVENT_HEAD='' TARGET_ID=500
   fake_route repos/o/r/issues/comments/500 \
-    "$(gh_comment 500 Melodymaifafa OWNER "$(m1_body "$H" 1)" 2026-09-18T08:00:00Z)"
+    "$(gh_comment 500 Melodymaifafa OWNER "$(m1_body "$H" "${2:-1}")" 2026-09-18T08:00:00Z)"
   fake_route "repos/o/r/issues/comments/500/reactions?per_page=100" "${1:-[]}"
 }
 
@@ -197,6 +197,39 @@ refute_fallback() {
   assert_called 'sleep 30' 5
 }
 
+@test "missing CODEX_TRIGGER_TOKEN: one auth alert with GITHUB_TOKEN, no M2, no Claude review" {
+  path_a
+  export HAS_PAT=false TRIGGERED_AT=2026-09-17T08:02:54Z FAKE_NOW=2026-09-17T08:03:10Z
+  fake_route "repos/o/r/issues/7/comments?per_page=100" \
+    "$(json_array "$(cat "$FIXTURES_DIR/codex/quota-comment.json")")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_equal "$(step_output fallback)" false
+  refute_called 'pr-guard: fallback'
+  assert_called curl 1
+  assert_called 'gh api POST repos/o/r/issues/7/comments' 1
+  assert_called '[token=actions-token]'
+  assert_equal "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" \
+    "🤖 这个仓库缺 CODEX_TRIGGER_TOKEN 密钥，Claude 代审没法发结果。重跑 onboard.sh 刷密钥后会自动继续。
+
+<!-- pr-guard: alert head=$H reason=auth until=- -->"
+  assert_bodies_inert
+}
+
+@test "missing CODEX_TRIGGER_TOKEN with an (H, auth) marker already: no Pushover, no post" {
+  path_b
+  export HAS_PAT=false
+  fake_route "repos/o/r/issues/7/comments?per_page=100" \
+    "$(json_array "$(gh_comment 1 'github-actions[bot]' NONE "缺密钥。
+
+$(m6_marker "$H" auth)")")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_equal "$(step_output fallback)" false
+  refute_called curl
+  refute_called 'gh api POST'
+}
+
 @test "timeout on a PR that already merged does not fall back" {
   path_a
   export WATCH_SECONDS=60
@@ -232,6 +265,29 @@ refute_fallback() {
   assert_contains "$output" 'has review findings'
   refute_called 'gh pr merge'
   refute_fallback
+}
+
+@test "path B accepts an M1 that also carries a fix-round marker" {
+  path_b "$(thumbs_up)" 3
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+@test "path B accepts a sweeper kick M1" {
+  path_b "$(thumbs_up)" kick
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+@test "path B: a sweeper kick M1 still falls back when Codex stays silent" {
+  path_b '[]' kick
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_equal "$(step_output reason)" silent
 }
 
 @test "path B: an OWNER M3 on H blocks the merge" {
@@ -367,11 +423,11 @@ refute_fallback() {
 
 # ---------- 以前静默的出口：只告警一次 ----------
 
-@test "a failed CI check alerts once (Pushover first, then the M6 marker) and exits 1" {
+@test "a failed CI check alerts once (Pushover first, then the M6 marker) and exits 0" {
   path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
   fake_cli pr_checks '[{"name":"lint-and-test","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/222/job/1","workflow":"CI"}]'
   run run_block "$WF" "$STEP"
-  assert_equal "$status" 1
+  assert_equal "$status" 0
   assert_called 'curl' 1
   assert_called 'gh api POST repos/o/r/issues/7/comments' 1
   body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
@@ -392,7 +448,7 @@ refute_fallback() {
 
 $(m6_marker "$H" ci)")")"
   run run_block "$WF" "$STEP"
-  assert_equal "$status" 1
+  assert_equal "$status" 0
   refute_called 'curl'
   refute_called 'gh api POST'
 }
@@ -404,7 +460,7 @@ $(m6_marker "$H" ci)")")"
     "$(gh_comment 1 'claude[bot]' NONE "$(m6_marker "$H" ci)")" \
     "$(gh_comment 2 'github-actions[bot]' NONE "$(m6_marker "$H" unmergeable)")")"
   run run_block "$WF" "$STEP"
-  assert_equal "$status" 1
+  assert_equal "$status" 0
   assert_called 'curl' 1
   assert_called "reason=ci until=-" 1
 }
@@ -414,10 +470,12 @@ $(m6_marker "$H" ci)")")"
   fake_cli pr_checks '[{"name":"lint-and-test","state":"PENDING","bucket":"pending","link":"x","workflow":"CI"}]'
   fast_sleep 60
   run run_block "$WF" "$STEP"
-  assert_equal "$status" 1
+  assert_equal "$status" 0
   assert_contains "$output" 'did not settle'
   assert_called 'curl' 1
+  assert_called 'gh api POST repos/o/r/issues/7/comments' 1
   assert_called "reason=ci until=-" 1
+  refute_called 'gh pr merge'
 }
 
 @test "a PR that never becomes mergeable alerts unmergeable once" {
@@ -438,7 +496,7 @@ $(m6_marker "$H" ci)")")"
   fake_cli pr_checks '[{"name":"lint-and-test","state":"FAILURE","bucket":"fail","link":"x","workflow":"CI"}]'
   export PUSHOVER_USER=''
   run run_block "$WF" "$STEP"
-  assert_equal "$status" 1
+  assert_equal "$status" 0
   refute_called 'curl'
   assert_called "reason=ci until=-" 1
 }

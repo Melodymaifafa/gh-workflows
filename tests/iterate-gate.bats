@@ -99,6 +99,47 @@ gate() { run run_block "$WF" "Gate the fix round"; }
   assert_equal "$(step_output round)" 3
 }
 
+# m7_body <H> <N>：outcome 步骤推送后发的轮数标记（只用来造已有状态）
+m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fix-round head=%s round=%s -->' "$2" "$1" "$2"; }
+
+@test "gate: round = max(M1 fix-round, M7 round) for this head + 1" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 melody OWNER "$(m1_body "$H" 2)")" \
+    "$(gh_comment 2 'github-actions[bot]' NONE "$(m7_body "$H" 4)")" \
+    "$(gh_comment 3 'github-actions[bot]' NONE "$(m7_body "$H2" 9)")")"
+  gate
+  assert_equal "$(step_output round)" 5
+}
+
+@test "gate: kick-only head whose round came from M7 keeps counting; round 6 parks" {
+  # 每次召唤都没发出去：H 只有巡检 kick（无 fix-round）和 M7 round=5
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 'github-actions[bot]' NONE "$(m7_body "$H" 5)")" \
+    "$(gh_comment 2 melody OWNER "$(m1_body "$H" kick)")")"
+  gate
+  assert_equal "$status" 0
+  assert_equal "$(step_output run)" false
+  assert_contains "$output" "round 6 exceeds max_fix_rounds 5"
+  assert_contains "$(fake_last_body "gh pr comment")" "reason=round-cap until=- -->"
+  assert_called "curl " 1
+}
+
+@test "gate: M7 from claude[bot] does not count" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 1 'claude[bot]' NONE "$(m7_body "$H" 5)")")"
+  gate
+  assert_equal "$(step_output run)" true
+  assert_equal "$(step_output round)" 1
+}
+
 @test "gate: round 6 parks with the default cap of 5 and alerts once" {
   codex_event
   live_head "$H"
@@ -267,20 +308,33 @@ m5_event() { # m5_event <target-id> [head-in-marker]
 # ---------- Outcome ----------
 
 outcome_env() { # outcome_env <FIX_OUTCOME> <STRUCTURED> [exec fixture]
-  export HEAD_SHA="$H" FIX_OUTCOME="$1" STRUCTURED="$2" EXEC_FILE=""
+  export HEAD_SHA="$H" ROUND=3 FIX_OUTCOME="$1" STRUCTURED="$2" EXEC_FILE=""
   if [ -n "${3:-}" ]; then export EXEC_FILE="$FIXTURES_DIR/sdk/$3"; fi
 }
 
 outcome() { run run_block "$WF" "Check the fix outcome"; }
 
-@test "outcome: head moved -> summon, no alert (even if the step failed)" {
+@test "outcome: head moved -> summon + one M7 round marker on the new head, no alert (even if the step failed)" {
   outcome_env failure '' exec-429-weekly-limit.json
   live_head "$H2"
   outcome
   assert_equal "$status" 0
   assert_equal "$(step_output summon)" true
-  refute_called "gh pr comment"
+  assert_called "gh pr comment 7 --repo o/r" 1
+  assert_equal "$(fake_last_body "gh pr comment")" "🤖 自动修复第 3 轮已推送。
+
+<!-- pr-guard: fix-round head=$H2 round=3 -->"
   refute_called "curl "
+}
+
+@test "outcome: a failed M7 post still summons" {
+  outcome_env success '{"pushed":true,"fixed":1,"skipped":0}'
+  live_head "$H2"
+  fake_cli_fail pr_comment 1
+  outcome
+  assert_equal "$status" 0
+  assert_equal "$(step_output summon)" true
+  assert_contains "$output" "fix-round marker for $H2 not posted"
 }
 
 @test "outcome: 429 with resetsAt -> fix-quota alert with until and Beijing resume time" {
@@ -343,6 +397,48 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-quota until=1787569200 -->"
 }
 
+@test "outcome: a later quota until on an alerted head -> quiet re-record, no Pushover" {
+  export FAKE_NOW=2026-08-22T10:00:00Z
+  outcome_env failure '' exec-429-weekly-limit.json
+  live_head "$H"
+  # 已有两条可信 fix-quota 标记，最大 until 仍早于这次的 1787569200
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 'github-actions[bot]' NONE "x $(m6_marker "$H" fix-quota 1787000000)")" \
+    "$(gh_comment 2 'github-actions[bot]' NONE "y $(m6_marker "$H" fix-quota 1787500000)")" \
+    "$(gh_comment 3 'github-actions[bot]' NONE "z $(m6_marker "$H2" fix-quota 1799999999)")")"
+  outcome
+  assert_equal "$status" 0
+  refute_called "curl "
+  assert_called "gh pr comment" 1
+  assert_equal "$(fake_last_body "gh pr comment")" "🤖 额度又用完了，改到北京时间 08-24 19:00 后继续（不再重复推送）。
+
+<!-- pr-guard: alert head=$H reason=fix-quota until=1787569200 -->"
+}
+
+@test "outcome: a quota until not later than the recorded one -> nothing posted" {
+  outcome_env failure '' exec-429-weekly-limit.json
+  live_head "$H"
+  for u in 1787569200 1790000000; do
+    : >"$FAKE_LOG"
+    fake_route "$COMMENTS" "$(json_array \
+      "$(gh_comment 1 'github-actions[bot]' NONE "x $(m6_marker "$H" fix-quota 1787000000)")" \
+      "$(gh_comment 2 melody OWNER "y $(m6_marker "$H" fix-quota "$u")")")"
+    outcome
+    assert_equal "$status" 0
+    refute_called "gh pr comment"
+    refute_called "curl "
+  done
+}
+
+@test "outcome: an untrusted quota marker with a far until does not block the first alert" {
+  outcome_env failure '' exec-429-weekly-limit.json
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 1 'claude[bot]' NONE "$(m6_marker "$H" fix-quota 1999999999)")")"
+  outcome
+  assert_called "curl " 1
+  assert_contains "$(fake_last_body "gh pr comment")" "Claude 自动修复额度用完了"
+}
+
 @test "outcome: pushed=false -> one no-fix alert, PR parked" {
   outcome_env success '{"pushed":false,"fixed":0,"skipped":3}'
   live_head "$H"
@@ -386,7 +482,8 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   outcome
   assert_equal "$(step_output summon)" true
   assert_called "sleep 10" 2
-  refute_called "gh pr comment"
+  assert_called "gh pr comment" 1
+  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: fix-round head=$H2 round=3 -->"
 }
 
 @test "outcome: no alert body carries trigger text" {
@@ -396,8 +493,17 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   done
   outcome_env success '{"pushed":false,"fixed":0,"skipped":0}'; outcome
   outcome_env success '{"pushed":true,"fixed":1,"skipped":0}'; outcome
+  # 额度静默补记和 M7 也不能带触发词
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 1 'github-actions[bot]' NONE "$(m6_marker "$H" fix-quota 1)")")"
+  outcome_env failure '' exec-429-weekly-limit.json; outcome
+  live_head "$H2"; outcome
   bodies="$(fake_all_bodies)"
   assert_contains "$bodies" "reason=no-fix"
+  assert_contains "$bodies" "额度又用完了"
+  assert_contains "$bodies" "<!-- pr-guard: fix-round head=$H2 round=3 -->"
+  refute_contains "$bodies" "codex-review-head:"
+  refute_contains "$bodies" "claude-review-findings:"
+  refute_contains "$bodies" "fix-retry:"
   refute_contains "$bodies" "@codex review"
   refute_contains "$bodies" "claude-review-clean:"
 }

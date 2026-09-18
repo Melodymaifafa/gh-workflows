@@ -92,14 +92,15 @@ count_of() {
 }
 
 @test "P2-only is clean: M4 keeps the note, ends with the marker, never asks Codex" {
-  export STRUCTURED_OUTPUT="$(verdict clean '只有一条可选建议。' "$(finding P2 '标题拼写' '可选改动。' README.md 12)")"
+  export STRUCTURED_OUTPUT="$(structured_from exec-success-clean-p2.json)"
+  assert_equal "$(jq -r .verdict <<<"$STRUCTURED_OUTPUT")" clean
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   assert_called 'gh api POST repos/o/r/issues/7/comments' 1
   body="$(m4_post)"
   assert_equal "$(printf '%s\n' "$body" | head -n 1)" "$M4_HEAD"
   assert_contains "$body" '可选建议（不影响合并）：'
-  assert_contains "$body" '- **P2** `README.md`:12 标题拼写'
+  assert_contains "$body" '- **P2** `README.md`:12 Typo in heading'
   assert_equal "$(printf '%s\n' "$body" | tail -n 1)" "<!-- claude-review-clean: $H -->"
   refute_contains "$body" '@codex review'
   refute_called 'gh api POST repos/o/r/pulls/7/reviews'
@@ -243,6 +244,54 @@ $(m6_marker "$H" review-quota 1787569200)")")"
   refute_called 'gh api POST'
 }
 
+@test "review-quota with a later until: one quiet marker, no Pushover" {
+  failed_with exec-429-weekly-limit.json
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 'github-actions[bot]' NONE "额度用完。
+
+$(m6_marker "$H" review-quota 1787500000)")" \
+    "$(gh_comment 2 Melodymaifafa OWNER "额度用完。
+
+$(m6_marker "$H" review-quota 1787400000)")")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called curl
+  assert_called 'gh api POST repos/o/r/issues/7/comments' 1
+  assert_equal "$(m4_post)" "🤖 额度又用完了，改到北京时间 08-24 19:00 后继续（不再重复推送）。
+
+<!-- pr-guard: alert head=$H reason=review-quota until=1787569200 -->"
+  assert_alerts_inert
+}
+
+@test "review-quota with an earlier until than a marker on record: nothing" {
+  failed_with exec-429-weekly-limit.json
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 Melodymaifafa OWNER "$(m6_marker "$H" review-quota 1787400000)")" \
+    "$(gh_comment 2 Melodymaifafa OWNER "$(m6_marker "$H" review-quota 1787600000)")")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called curl
+  refute_called 'gh api POST'
+}
+
+@test "a later until only re-records quota reasons: auth stays deduped" {
+  failed_with exec-401-auth.json
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 Melodymaifafa OWNER "$(m6_marker "$H" auth 1)")")"
+  run run_block "$WF" "$STEP"
+  refute_called curl
+  refute_called 'gh api POST'
+}
+
+@test "a claude[bot] quota marker with a later until does not suppress the first Pushover" {
+  failed_with exec-429-weekly-limit.json
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 'claude[bot]' NONE "$(m6_marker "$H" review-quota 1799999999)")")"
+  run run_block "$WF" "$STEP"
+  assert_called curl 1
+  assert_called "reason=review-quota until=1787569200 -->" 1
+}
+
 @test "alert once ignores claude[bot] markers and markers for another head" {
   failed_with exec-401-auth.json
   fake_route "$COMMENTS" "$(json_array \
@@ -285,10 +334,32 @@ $(m6_marker "$H" review-quota 1787569200)")")"
 }
 
 @test "missing PAT: nothing is posted, one Pushover" {
-  export GH_TOKEN='' STRUCTURED_OUTPUT="$(verdict clean 'ok')"
+  export GH_TOKEN='' READ_TOKEN=actions-token STRUCTURED_OUTPUT="$(verdict clean 'ok')"
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
-  refute_called 'gh '
+  refute_called 'gh api POST'
+  refute_called 'gh pr'
+  assert_called '[token=actions-token]'
+  assert_called curl 1
+}
+
+@test "missing PAT with an (H, auth) marker from the watcher: no Pushover" {
+  export GH_TOKEN='' READ_TOKEN=actions-token STRUCTURED_OUTPUT="$(verdict clean 'ok')"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 'github-actions[bot]' NONE "缺密钥。
+
+$(m6_marker "$H" auth)")")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called curl
+  refute_called 'gh api POST'
+}
+
+@test "missing PAT and unreadable comments still sends the Pushover" {
+  export GH_TOKEN='' READ_TOKEN='' STRUCTURED_OUTPUT="$(verdict clean 'ok')"
+  fake_route_fail "$COMMENTS" 1
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
   assert_called curl 1
 }
 

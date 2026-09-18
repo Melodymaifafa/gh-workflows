@@ -7,6 +7,9 @@ H=1a7e81f6b5f27f0a1dbc33c6fafda1bb86f1483d
 OTHER=9b14fe3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 R=Melodymaifafa/private-caller
 SWEEPER=.github/workflows/pr-sweeper.yml
+# private-caller 是私有仓库：公开日志里只能出现这个标签。
+LABEL="repo-$(printf '%s' "$R" | sha256sum | cut -c1-8)"
+PUB=Melodymaifafa/gh-workflows
 
 setup() {
   setup_fake_env
@@ -72,7 +75,7 @@ refute_writes() {
   assert_called "gh api POST repos/$R/issues/7/comments" 1
   assert_called "[token=owner-pat]"
   assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
-  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "kicked $R#7"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "kicked $LABEL"
 }
 
 @test "an unreferenced head is kicked after 30 idle minutes, not before" {
@@ -287,18 +290,78 @@ refute_writes() {
   refute_writes
 }
 
-@test "M5 stops at 2 per head, then one final fix-failed alert, then parked" {
-  one_pr clean 200
+@test "two counted failed retries: one retry-exhausted alert after 60 idle minutes, then parked" {
+  export PUSHOVER_TOKEN=t PUSHOVER_USER=u
   reviews "$(codex_findings 4863267293 "$H" 600)" "$(m5_review 5 400)" "$(m5_review 6 200)"
-  sweep
-  refute_called "gh api POST repos/$R/pulls/7/reviews"
-  assert_called "gh api POST repos/$R/issues/7/comments" 1
-  assert_contains "$(fake_last_body "gh api POST")" "<!-- pr-guard: alert head=$H reason=fix-failed until=- -->"
-
-  : >"$FAKE_LOG"
-  comments "$(alert_comment 1 fix-failed - 100)"
+  comments "$(alert_comment 1 fix-failed - 300)"
+  # 第二次重修刚结束不久：先等。
+  one_pr clean 30
   sweep
   refute_writes
+
+  one_pr clean 200
+  sweep
+  refute_called "gh api POST repos/$R/pulls/7/reviews"
+  assert_called "curl" 1
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_equal "$(fake_last_body "gh api POST")" "🤖 自动修复重试 2 次还是没完成，已停。你来点 Merge 或关掉；推新提交会重新开始。
+
+<!-- pr-guard: alert head=$H reason=retry-exhausted until=- -->"
+
+  : >"$FAKE_LOG"
+  comments "$(alert_comment 1 fix-failed - 300)" "$(alert_comment 2 retry-exhausted - 100)"
+  sweep
+  refute_writes
+}
+
+@test "a second quota hit waits for the new until and does not burn a retry" {
+  one_pr clean 70
+  local first m5 quiet
+  first="$(alert_comment 1 fix-quota "$((NOW_EPOCH - 250 * 60))" 300)"
+  m5="$(m5_review 5 240)"
+  # M5 #1 之后又撞额度：iterate 补了一条不推送的新 until。
+  quiet() { gh_comment 2 'github-actions[bot]' NONE "🤖 额度又用完了，改到 x 后继续（不再重复推送）。"$'\n'"$(m6_marker "$H" fix-quota "$1")" "$(ago 200)"; }
+  reviews "$(codex_findings 4863267293 "$H" 600)" "$m5"
+  comments "$first" "$(quiet "$((NOW_EPOCH + 3600))")" "$(alert_comment 3 fix-failed - 245)"
+  sweep
+  refute_writes
+  assert_contains "$output" "等额度恢复"
+
+  # 新 until 过了：马上重修，这次重修不算数。
+  one_pr clean 5
+  comments "$first" "$(quiet "$((NOW_EPOCH - 60))")" "$(alert_comment 3 fix-failed - 245)"
+  sweep
+  assert_contains "$output" "retries=0"
+  assert_called "gh api POST repos/$R/pulls/7/reviews" 1
+  assert_contains "$(fake_last_body "gh api POST")" "（额度用完，现已恢复）"
+  refute_called "reason=fix-failed"
+  refute_called "reason=retry-exhausted"
+
+  # 又一次 M5 之后失败：算 1 次，还能再修一次，不停车。
+  : >"$FAKE_LOG"
+  one_pr clean 70
+  reviews "$(codex_findings 4863267293 "$H" 600)" "$m5" "$(m5_review 6 70)"
+  comments "$first" "$(quiet "$((NOW_EPOCH - 100 * 60))")" "$(alert_comment 3 fix-failed - 245)"
+  sweep
+  assert_contains "$output" "retries=1"
+  assert_called "gh api POST repos/$R/pulls/7/reviews" 1
+  refute_called "gh api POST repos/$R/issues/7/comments"
+}
+
+@test "the until is the latest one on the head, whichever alert carries it" {
+  one_pr clean 900
+  comments "$(alert_comment 1 review-quota "$((NOW_EPOCH - 600))" 900)" \
+    "$(alert_comment 2 review-quota "$((NOW_EPOCH + 600))" 800)"
+  sweep
+  refute_writes
+}
+
+@test "a head with only an M7 fix-round marker is still unreferenced and gets kicked" {
+  one_pr clean 31
+  comments "$(gh_comment 1 'github-actions[bot]' NONE "🤖 自动修复第 2 轮已推送。"$'\n\n'"<!-- pr-guard: fix-round head=$H round=2 -->" "$(ago 31)")"
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_equal "$(fake_last_body "gh api POST")" "$KICK_BODY"
 }
 
 # ── 信任：claude[bot] / 非 OWNER 写的标记一律不算 ──
@@ -386,9 +449,9 @@ refute_writes() {
   assert_equal "$status" 0
   refute_writes
   summary="$(cat "$GITHUB_STEP_SUMMARY")"
-  assert_contains "$summary" "would alert $R#1 reason=conflict"
-  assert_contains "$summary" "would kick $R#7"
-  assert_contains "$summary" "would retry fix $R#8"
+  assert_contains "$summary" "would alert $LABEL reason=conflict"
+  assert_contains "$summary" "would kick $LABEL"
+  assert_contains "$summary" "would retry fix $LABEL"
 }
 
 @test "SWEEP_MODE off or unset does nothing at all" {
@@ -453,7 +516,7 @@ refute_writes() {
   # PR #1 没有评论 fixture → 假 gh exit 97
   sweep
   assert_equal "$status" 1
-  assert_contains "$output" "$R#1 巡检出错"
+  assert_contains "$output" "$LABEL 巡检出错"
   assert_called "gh api POST repos/$R/issues/7/comments" 1
 }
 
@@ -479,9 +542,61 @@ refute_writes() {
     refute_contains "$body" "claude-review-clean:"
   done <"$FAKE_LOG"
   assert_contains "$(fake_all_bodies)" "reason=conflict"
-  assert_contains "$(fake_all_bodies)" "reason=fix-failed"
+  assert_contains "$(fake_all_bodies)" "reason=retry-exhausted"
   assert_contains "$(fake_all_bodies)" "fix-retry: head=$H"
   assert_contains "$(fake_all_bodies)" "reason=stalled"
+}
+
+# ── 公开日志不出现私有仓库 ──
+
+@test "private repo: logs and summary show only the opaque label, never the name, PR number or SHA" {
+  export PUSHOVER_TOKEN=t PUSHOVER_USER=u
+  local conflict kickme bad
+  conflict="$(pr_json 1 dirty 900)"
+  kickme="$(pr_json 7 clean 900)"
+  bad="$(pr_json 3 clean 900)"
+  fake_route "repos/$R/pulls?state=open&base=develop&per_page=100" "$(json_array "$conflict" "$kickme" "$bad")"
+  fake_route "repos/$R/pulls/1" "$conflict"
+  fake_route "repos/$R/pulls/7" "$kickme"
+  fake_route "repos/$R/pulls/3" "$bad"
+  fake_route "repos/$R/issues/1/comments?per_page=100" '[]'
+  fake_route "repos/$R/pulls/1/reviews?per_page=100" '[]'
+  # PR #3 没有评论 fixture → 假 gh 报错（报错里带仓库名）
+  for mode in dry live; do
+    : >"$FAKE_LOG"; : >"$GITHUB_STEP_SUMMARY"
+    SWEEP_MODE=$mode run bash "$REPO_ROOT/scripts/pr-sweep.sh"
+    assert_equal "$status" 1
+    local all; all="$output$(cat "$GITHUB_STEP_SUMMARY")"
+    assert_contains "$all" "$LABEL"
+    refute_contains "$all" "private-caller"
+    refute_contains "$all" "#1"
+    refute_contains "$all" "#7"
+    refute_contains "$all" "#3"
+    refute_contains "$all" "${H:0:7}"
+  done
+  # Pushover 是私人通道，照写真名。
+  assert_contains "$(fake_calls curl)" "$R#1"
+
+  # 列 PR 失败：只有标签和通用警告。
+  : >"$FAKE_LOG"
+  fake_route_fail "repos/$R/pulls?state=open&base=develop&per_page=100" 1 '{"message":"Not Found"}'
+  sweep
+  assert_contains "$output" "::warning::$LABEL 列 PR 失败"
+  refute_contains "$output" "private-caller"
+}
+
+@test "public repo: logs and summary may show the name, PR number and SHA" {
+  export ONLY_REPOS=gh-workflows
+  local pr
+  pr="$(pr_json 7 clean 900 | jq --arg r "$PUB" '.base.repo.full_name = $r | .head.repo.full_name = $r')"
+  fake_route "repos/$PUB/pulls?state=open&base=develop&per_page=100" "$(json_array "$pr")"
+  fake_route "repos/$PUB/pulls/7" "$pr"
+  fake_route "repos/$PUB/issues/7/comments?per_page=100" '[]'
+  fake_route "repos/$PUB/pulls/7/reviews?per_page=100" '[]'
+  sweep
+  assert_equal "$status" 0
+  assert_contains "$output" "$PUB#7 (${H:0:7}): idle="
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "kicked $PUB#7 (${H:0:7})"
 }
 
 # ── pr-sweeper.yml 的 run 块 ──
@@ -504,6 +619,18 @@ refute_writes() {
   GH_TOKEN="" run run_block "$SWEEPER" "Sweep open PRs"
   assert_equal "$status" 1
   assert_contains "$output" "CODEX_TRIGGER_TOKEN"
+}
+
+@test "workflow: the sweep step reads the repos input from the event file, not env" {
+  cd "$REPO_ROOT"
+  export GITHUB_EVENT_PATH="$BATS_TEST_TMPDIR/event.json"
+  echo '{"inputs":{"repos":"private-caller"}}' >"$GITHUB_EVENT_PATH"
+  one_pr clean 900
+  ONLY_REPOS="" run run_block "$SWEEPER" "Sweep open PRs"
+  assert_equal "$status" 0
+  refute_called "gh-workflows/pulls"
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  refute_contains "$(sed -n '/- name: Sweep open PRs/,/run: |/p' "$REPO_ROOT/$SWEEPER")" "inputs.repos"
 }
 
 @test "workflow: a failed sweep alerts only after a successful previous run" {

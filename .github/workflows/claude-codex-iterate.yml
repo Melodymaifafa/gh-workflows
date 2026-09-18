@@ -71,7 +71,7 @@ jobs:
           fetch-depth: 0
 
       # 告警工具函数写进 $RUNNER_TEMP，Gate 和 Outcome 两步共用一份。
-      # alert_once：同一 (head, 原因) 已有可信告警标记就不再发；否则先推 Pushover 再发标记。
+      # alert_once：同一 (head, 原因) 首次告警先推 Pushover 再发标记，之后不再推。
       - name: Define pr-guard helpers
         run: |
           set -euo pipefail
@@ -92,17 +92,27 @@ jobs:
               jq 'add // [] | map(select(.user.login == "github-actions[bot]" or .author_association == "OWNER"))'
           }
 
+          # 额度类（fix-quota / review-quota）：已告警过但这次 until 更晚 → 静默补一条新 until 的标记，
+          # 巡检才知道要等到新的重置时间；其余原因同 (head, 原因) 只发一次。
           alert_once() {
-            local head="$1" reason="$2" until="$3" msg="$4" seen body
-            seen="$(trusted_comments | jq --arg m "<!-- pr-guard: alert head=$head reason=$reason " \
-              '[.[] | select(.body | contains($m))] | length')"
-            if [ "$seen" -gt 0 ]; then
+            local head="$1" reason="$2" until="$3" msg="$4" prev body resume
+            # 已有可信标记里最大的 until：没有标记 = 空串，有标记但 until=- 记 0
+            prev="$(trusted_comments | jq -r --arg m "<!-- pr-guard: alert head=$head reason=$reason " '
+              [.[] | .body | select(contains($m))
+                | ((capture($m + "until=(?<u>[0-9]+) -->").u) // "0") | tonumber]
+              | if length == 0 then "" else max end')"
+            if [ -z "$prev" ]; then
+              pushover "🤖 PR #$PR_NUMBER 自动修复停了" "$msg"
+              printf -v body '%s\n\n<!-- pr-guard: alert head=%s reason=%s until=%s -->' \
+                "$msg" "$head" "$reason" "$until"
+            elif { [ "$reason" = fix-quota ] || [ "$reason" = review-quota ]; } && [ "$until" -gt "$prev" ]; then
+              resume="$(date -u -d "@$((until + 28800))" '+%m-%d %H:%M')"
+              printf -v body '🤖 额度又用完了，改到北京时间 %s 后继续（不再重复推送）。\n\n<!-- pr-guard: alert head=%s reason=%s until=%s -->' \
+                "$resume" "$head" "$reason" "$until"
+            else
               echo "alert $reason already posted for $head"
               return 0
             fi
-            pushover "🤖 PR #$PR_NUMBER 自动修复停了" "$msg"
-            printf -v body '%s\n\n<!-- pr-guard: alert head=%s reason=%s until=%s -->' \
-              "$msg" "$head" "$reason" "$until"
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$body" >/dev/null
           }
 
@@ -167,11 +177,15 @@ jobs:
             else "" end' <<<"$review")"
           [ -n "$reviewer" ] || skip "review $target is not a findings review on $H"
 
-          # 轮数 = 本 workflow 为 H 发的召唤（M1）上的 fix-round + 1；没有就是第 1 轮。
-          # M1 用主人令牌写，Claude 改不了它，所以轮数没法被清零。
+          # 轮数 = max(召唤 M1 上的 fix-round, 推送后 M7 上的 round) + 1；都没有就是第 1 轮。
+          # M7 让召唤没发出去（令牌缺失、超时）、H 靠巡检 kick 才被审时轮数照样累加。
+          # 两者都由可信作者写，Claude 改不了，所以轮数没法被清零。
           last_round="$(trusted_comments | jq -r --arg h "$H" '
-            [.[] | select(.body | contains("<!-- codex-review-head: " + $h + " -->"))
-              | .body | capture("<!-- fix-round: (?<n>[0-9]+) -->").n | tonumber]
+            [.[] | .body
+              | ((select(contains("<!-- codex-review-head: " + $h + " -->"))
+                  | capture("<!-- fix-round: (?<n>[0-9]+) -->").n),
+                 capture("<!-- pr-guard: fix-round head=" + $h + " round=(?<n>[0-9]+) -->").n)
+              | tonumber]
             | max // 0')"
           round="$((last_round + 1))"
           if [ "$round" -gt "$MAX_FIX_ROUNDS" ]; then
@@ -324,7 +338,7 @@ jobs:
             7. 最后按 JSON schema 返回结果：pushed = 这次有没有 push 新提交，
                fixed / skipped = 修了几条、跳过几条。
 
-      # 结果分流：head 变了 → 去召唤复审；否则按原因告警一次（同 head 同原因只发一次）。
+      # 结果分流：head 变了 → 发轮数标记 M7 并去召唤复审；否则按原因告警一次（同 head 同原因只发一次）。
       # 失败原因只看 execution_file 里的 SDK 字段，不看模型写的文字；没有结构化结果绝不当成功。
       - name: Check the fix outcome
         id: outcome
@@ -334,6 +348,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ steps.gate.outputs.head }}
+          ROUND: ${{ steps.gate.outputs.round }}
           FIX_OUTCOME: ${{ steps.fix.outcome }}
           STRUCTURED: ${{ steps.fix.outputs.structured_output }}
           EXEC_FILE: ${{ steps.fix.outputs.execution_file }}
@@ -364,6 +379,11 @@ jobs:
 
           if [ "$live" != "$H" ]; then
             echo "summon=true" >>"$GITHUB_OUTPUT"
+            # M7：用 GITHUB_TOKEN 记下新 head 的轮数，不靠召唤；它不是复审请求，不带任何触发词
+            printf -v m7 '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fix-round head=%s round=%s -->' \
+              "$ROUND" "$live" "$ROUND"
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" >/dev/null ||
+              echo "::warning::fix-round marker for $live not posted"
             echo "head moved $H -> $live; summoning re-review"
             exit 0
           fi
