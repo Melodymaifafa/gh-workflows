@@ -8,8 +8,9 @@ fake_die() {
 }
 
 fake_require_env() {
-  [ -n "${FAKE_DIR:-}" ] && [ -n "${FAKE_GH_DIR:-}" ] && [ -n "${FAKE_LOG:-}" ] ||
+  if [ -z "${FAKE_DIR:-}" ] || [ -z "${FAKE_GH_DIR:-}" ] || [ -z "${FAKE_LOG:-}" ]; then
     fake_die "$1 called without setup_fake_env (FAKE_DIR/FAKE_GH_DIR/FAKE_LOG unset)"
+  fi
 }
 
 # 路由 → 文件名：去掉开头的 /，[A-Za-z0-9._-] 以外的字符一律换成 _。
