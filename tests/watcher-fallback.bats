@@ -197,7 +197,7 @@ refute_fallback() {
   assert_called 'sleep 30' 5
 }
 
-@test "missing CODEX_TRIGGER_TOKEN: one auth alert with GITHUB_TOKEN, no M2, no Claude review" {
+@test "missing CODEX_TRIGGER_TOKEN: one pat-missing alert with GITHUB_TOKEN, no M2, no Claude review" {
   path_a
   export HAS_PAT=false TRIGGERED_AT=2026-09-17T08:02:54Z FAKE_NOW=2026-09-17T08:03:10Z
   fake_route "repos/o/r/issues/7/comments?per_page=100" \
@@ -212,17 +212,17 @@ refute_fallback() {
   assert_equal "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" \
     "🤖 这个仓库缺 CODEX_TRIGGER_TOKEN 密钥，Claude 代审没法发结果。重跑 onboard.sh 刷密钥后会自动继续。
 
-<!-- pr-guard: alert head=$H reason=auth until=- -->"
+<!-- pr-guard: alert head=$H reason=pat-missing until=- -->"
   assert_bodies_inert
 }
 
-@test "missing CODEX_TRIGGER_TOKEN with an (H, auth) marker already: no Pushover, no post" {
+@test "missing CODEX_TRIGGER_TOKEN with an (H, pat-missing) marker already: no Pushover, no post" {
   path_b
   export HAS_PAT=false
   fake_route "repos/o/r/issues/7/comments?per_page=100" \
     "$(json_array "$(gh_comment 1 'github-actions[bot]' NONE "缺密钥。
 
-$(m6_marker "$H" auth)")")"
+$(m6_marker "$H" pat-missing)")")"
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   assert_equal "$(step_output fallback)" false

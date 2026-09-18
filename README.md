@@ -14,14 +14,47 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
   - 两道都想无视：手动跑一次，`min_age_days` 填 0、取消勾选 `require_green`。
 - 手动等价命令：`git push origin origin/develop:main`。**注意左边要写 `origin/develop`,不是 `develop`** —— `develop` 指的是你本地那个分支,忘了 `git fetch` 就会把 main 推到一个过期的位置,而且这仍然是一次合法快进,git 不报错、你也看不出来。workflow 走 API 读远端,不存在这个坑。
 
-## 三个工作流
+## 工作流
 
 | 文件 | 什么时候跑 | 干什么 |
 |---|---|---|
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
-| `claude-codex-iterate.yml` | Codex 提交 review 后 | Claude 读评论、改代码、跑验证、push、发中文总结，然后召唤复审 |
-| `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` | 等 Codex 无意见 + CI 全绿，自动 squash 合入 develop |
+| `claude-codex-iterate.yml` | Codex 或 Claude 代审提交意见后 | Claude 读意见、改代码、跑验证、push、发中文总结，然后召唤复审；最多连修 5 轮 |
+| `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` / Claude 代审通过 | 先等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入 develop |
+| `pr-sweeper.yml` | 每 15 分钟（只在本仓库跑） | 扫所有默认分支是 develop 的仓库，给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
 | `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
+
+## 审核：Codex 优先，Claude 兜底（2026-09-18）
+
+每一次审核请求都先问 Codex。出现下面任一情况，**这一次**改由 Claude 只读代审，结果由 owner 的 PAT 发出（这样下一环才会被触发）：
+
+- Codex 回复「reached your Codex usage limits」（30 秒内发现）；
+- 喊了 `@codex review` 5 分钟没有 👀 也没有结论；
+- 20 分钟还没有结论。
+
+没有「Codex 已坏」的全局开关：下一轮照样先问 Codex，它额度恢复就自动接回。Claude 代审只读（Read/Glob/Grep），看不到任何密钥，结论必须是合法 JSON 才算数；空结果一律当「没审过」，绝不当「通过」。**有意见的 head 永远不会被合并。**
+
+机器之间靠藏在评论里的标记接力，只认 `github-actions[bot]` 或 OWNER 写的，`claude[bot]` 写什么都不算：
+
+| 标记 | 谁写 | 意思 |
+|---|---|---|
+| `codex-review-head: H` | PAT（iterate / 巡检） | 请审 H；可带 `fix-round: N` 或 `pr-sweeper: kick` |
+| `pr-guard: fallback head=H` | GITHUB_TOKEN | Codex 这次不行，换 Claude |
+| `claude-review-findings: H` | PAT | Claude 代审有意见（一条 COMMENT review） |
+| `claude-review-clean: H` | PAT | Claude 代审无意见，CI 绿就合 |
+| `fix-retry: head=H review=ID` | PAT（巡检） | 上次修复没完成，再修一次 |
+| `pr-guard: fix-round head=H round=N` | GITHUB_TOKEN | 第 N 轮修复已推送（轮数不靠召唤是否成功） |
+| `pr-guard: alert head=H reason=R until=T` | 各环节 | 已告警 R，同一 head 同一原因只推一次 |
+
+告警原因 R：`ci` `unmergeable` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `round-cap` `retry-exhausted` `stalled`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
+
+**巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted`、CI 红）等人处理。
+
+- **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`。
+- **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）。
+- 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、PR 号和 SHA。
+
+不在保证范围内：合进 main 的 PR、草稿、标题带 `[no-codex-merge]` / `[no-claude]` 的 PR，以及用内联副本的 Weibo--automation-android。
 
 ## 开一个新项目（从零）
 
@@ -67,6 +100,8 @@ jobs:
 
 测试放 `tests/*.bats`（bats-core）。本地跑：`brew install bats-core && bats tests/`。
 
+`tests/test_helper/common.bash` 带一套假 GitHub：假的 `gh` / `curl` / `sleep` / `date` 按剧本回放 API 响应并记下每次调用，测试直接执行 workflow 里抠出来的真 run 块。`tests/fixtures/` 里的 Codex 评论和 429 执行记录来自真实 run。本仓库自己的 CI 跑的是 PR 里的 `ci.yml`，所以 PR 自带的 bats 会在 PR 上跑。
+
 `shell` runtime 的测试步骤是「有 `tests/*.bats` 就跑 bats，没有就跳过」——只有脚本、没写过测试的仓库行为不变。测试不复制一份 `ci.yml` 的逻辑，而是直接把 `Resolve commands` 那段 run 块抠出来执行；复制的那份迟早和真身各改各的。
 
 ## 密钥
@@ -75,8 +110,8 @@ jobs:
 
 | 密钥 | 缺了会怎样 |
 |---|---|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Claude 迭代不跑（`claude setup-token` 生成，`sk-ant-oat01-` 开头） |
-| `CODEX_TRIGGER_TOKEN` | 无法自动召唤 Codex 复审，需人工评论 `@codex review` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude 修复和 Claude 代审都不跑（`claude setup-token` 生成，`sk-ant-oat01-` 开头）。和本人的订阅共用每周额度 |
+| `CODEX_TRIGGER_TOKEN` | 无法召唤 Codex 复审；Claude 代审结论发不出（告警 `pat-missing`）；巡检不能动手 |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
 
 `CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write —— 覆盖全部仓库，接新仓库不用回去改 PAT。
@@ -97,13 +132,16 @@ jobs:
 git tag -f v1 && git push -f origin v1
 ```
 
+回退到 Claude 兜底之前的版本：`git tag -f v1 34645cf && git push -f origin v1`。
+
 ## 踩过的坑
 
 - **顶层 `concurrency` 只能声明一次**：调用桩和被调用的可复用工作流若都在顶层声明同名 group，GitHub 判定「top level workflow」与该 job 死锁，run 立刻失败、零 job、无日志，只有一句 "This run likely failed because of a workflow file issue"。排队逻辑写在被调用方的 **job 层**，调用桩不要写 `concurrency`。`claude-codex-iterate` 踩了这个坑，2026-07-29 起 9 个仓库共 11 次触发全部空跑，直到 2026-08-20 才发现 —— 整条 Codex→Claude 迭代链从来没运行过。
 - **不要放宽 `--allowedTools`**：Codex 的 review 正文是外部输入，直接进 Claude 的 prompt，而那个 token 有写权限。只放行具体命令，别用 `Bash(git:*)`。
 - **`--allowedTools` 是全量清单**：`Edit,MultiEdit,Write` 不列出来 Claude 就改不了任何文件，只会干烧轮数。
 - **绿勾 ≠ 有产出**：确认 Claude 真干了活要看 PR 时间线有没有评论和 commit。
-- **`@codex review` 会被限流静默**：连发几次后连 👀 都不回，约 10 分钟恢复。iterate 工作流为此做了 6/12/18 分钟三窗口重试 + 回执验证。
+- **`@codex review` 会被限流静默**：连发几次后连 👀 都不回，约 10 分钟恢复。现在 iterate 只召唤一次，沉默由 watcher 的 5 分钟兜底接手。
+- **Codex 额度用完时它照样回一条评论**：旧版超时告警把它当成「Codex 有反应」，于是既不告警也不合并，PR 就这么卡住（2026-09-17，3 个 PR）。现在认出这句话就当场换 Claude。
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
 - **密钥只写不读，个人账号也没有账号级密钥**：存进仓库后连 API 都取不回值（`gh api repos/X/actions/secrets/NAME` 只返回名字和日期），共享密钥是 organization 才有的功能。所以 `secrets.env` 是唯一母本 —— 在网页上手填过的值必须补回母本，否则接新仓库时无处可取（2026-07-30 为此翻了半天 `~/.claude/history.jsonl`）。
 - **Regenerate PAT 会立刻作废旧值**：换完要把所有仓库的 secret 一起刷新。漏掉的那个 CI 照样绿，只有 Codex 复审那步静默停住。

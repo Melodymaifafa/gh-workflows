@@ -8,7 +8,8 @@
 #   2. 这个 head 已停车  → 停（no-fix、round-cap、retry-exhausted、CI 红且 unstable）。
 #   3. 额度还没恢复      → 停（这个 head 上最晚的 until 还没到）。
 #   4. head 有审查意见   → 空闲 ≥ 60 分钟或额度已恢复时发 M5 让 iterate 再修，每个 head 最多算 2 次
-#                          （M5 之后又撞额度的那次不算）；用完且空闲 ≥ 60 分钟就告警一次 retry-exhausted，停。
+#                          （M5 之后又撞额度的那次不算），但 M5 总数封顶 6 次；用完且空闲 ≥ 60 分钟就告警一次
+#                          retry-exhausted，停。
 #   5. 其余              → 没人碰过且空闲 ≥ 30 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
 #                          每个 head 最多 3 次、间隔 ≥ 60 分钟；然后告警一次 stalled；然后 7 天内每天一次。
 #
@@ -19,7 +20,9 @@
 #   NOW_EPOCH        测试用：假的「现在」
 #   PUSHOVER_TOKEN / PUSHOVER_USER  告警推送（都有才推）
 #
-# 日志和 $GITHUB_STEP_SUMMARY 是公开的：私有仓库只写 repo-<sha256 前 8 位>，不写名字、PR 号和 SHA，
+#   LABEL_KEY        私有仓库日志标签的 HMAC 密钥（默认用 GH_TOKEN）
+#
+# 日志和 $GITHUB_STEP_SUMMARY 是公开的：私有仓库只写 repo-<HMAC 前 8 位>，不写名字、PR 号和 SHA，
 # gh 的报错也吞掉。Pushover 是私人通道，照写真名。
 set -euo pipefail
 
@@ -39,6 +42,8 @@ trap 'rm -rf "$tmp"' EXIT
 max_kicks=3
 max_daily_kicks=7
 max_retries=2
+# 撞额度的重试不计数，但总次数也要封顶，免得额度一直不够时无限重试。
+max_total_retries=6
 
 summary() { printf '%s\n' "$*" >>"$summary_file"; }
 
@@ -86,13 +91,18 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     (if $until > 0 and $until <= $now and $until > $last_retry then 1 else 0 end),
     $fix_reason,
     ($p.mergeable_state // "unknown"),
-    (if $p.merged then 1 else 0 end)
+    (if $p.merged then 1 else 0 end),
+    ($retries | length)
   ] | @tsv
 '
 
-# 公开日志里的仓库名：私有仓库换成 repo-<sha256(full_name) 前 8 位>。
+# 公开日志里的仓库名：私有仓库换成 repo-<HMAC-SHA256(full_name) 前 8 位>。
+# 用带密钥的 HMAC，不然别人拿猜的仓库名算一下就能对上。没有密钥就只写 repo-private。
 repo_label() {
-  if [ "$2" = true ]; then printf 'repo-%s' "$(printf '%s' "$1" | sha256sum | cut -c1-8)"; else printf '%s' "$1"; fi
+  [ "$2" = true ] || { printf '%s' "$1"; return 0; }
+  local key="${LABEL_KEY:-${GH_TOKEN:-}}"
+  [ -n "$key" ] || { printf 'repo-private'; return 0; }
+  printf 'repo-%s' "$(printf '%s' "$1" | openssl dgst -sha256 -hmac "$key" | awk '{print $NF}' | cut -c1-8)"
 }
 
 # 下面这些函数读 sweep_pr 设的 repo / n / H / alerts / url / who / hs。
@@ -157,11 +167,11 @@ sweep_pr() {
   url="$(jq -r .html_url "$tmp/pr.json")"
   if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
 
-  local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged
+  local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries
   facts="$(jq -rn --slurpfile pr "$tmp/pr.json" --slurpfile cs "$tmp/comments.json" --slurpfile rs "$tmp/reviews.json" \
     --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq")"
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
-    until_active until_passed fix_reason state merged <<<"$facts"
+    until_active until_passed fix_reason state merged total_retries <<<"$facts"
   echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
   # 1. 冲突：只有人能解。
@@ -180,10 +190,12 @@ sweep_pr() {
   # 4. 有意见：重修，不重审。
   if [ "$findings" -gt 0 ]; then
     [ "$idle" -ge 3600 ] || [ "$until_passed" = 1 ] || { echo "  修复可能还在跑"; return 0; }
-    if [ "$retries" -lt "$max_retries" ]; then
+    if [ "$retries" -lt "$max_retries" ] && [ "$total_retries" -lt "$max_total_retries" ]; then
       retry_fix "$target" "$fix_reason"
-    elif [ "$idle" -ge 3600 ]; then
+    elif [ "$idle" -ge 3600 ] && [ "$retries" -ge "$max_retries" ]; then
       alert_once retry-exhausted - "🤖 自动修复重试 2 次还是没完成，已停。你来点 Merge 或关掉；推新提交会重新开始。"
+    elif [ "$idle" -ge 3600 ]; then
+      alert_once retry-exhausted - "🤖 自动修复试了 6 次都卡在 Claude 额度上，已停。你来点 Merge 或关掉；推新提交会重新开始。"
     else
       echo "  最后一次重修可能还在跑"
     fi

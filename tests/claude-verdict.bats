@@ -343,12 +343,12 @@ $(m6_marker "$H" review-quota 1787400000)")")"
   assert_called curl 1
 }
 
-@test "missing PAT with an (H, auth) marker from the watcher: no Pushover" {
+@test "missing PAT with an (H, pat-missing) marker from the watcher: no Pushover" {
   export GH_TOKEN='' READ_TOKEN=actions-token STRUCTURED_OUTPUT="$(verdict clean 'ok')"
   fake_route "$COMMENTS" "$(json_array \
     "$(gh_comment 1 'github-actions[bot]' NONE "缺密钥。
 
-$(m6_marker "$H" auth)")")"
+$(m6_marker "$H" pat-missing)")")"
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   refute_called curl

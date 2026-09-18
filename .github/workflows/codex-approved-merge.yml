@@ -190,7 +190,7 @@ jobs:
             if [ "${HAS_PAT:-}" != true ]; then
               echo fallback=false >>"$GITHUB_OUTPUT"
               echo "::warning::CODEX_TRIGGER_TOKEN is missing; skipping the Claude fallback"
-              alert_once "$expected_head" auth \
+              alert_once "$expected_head" pat-missing \
                 "🤖 这个仓库缺 CODEX_TRIGGER_TOKEN 密钥，Claude 代审没法发结果。重跑 onboard.sh 刷密钥后会自动继续。"
               exit 0
             fi
@@ -819,10 +819,10 @@ jobs:
 
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::warning::CODEX_TRIGGER_TOKEN is missing; the Claude review cannot be posted"
-            # 兜底：watch job 已为这个 head 发过 auth 告警就不再推送。
+            # 兜底：watch job 已为这个 head 发过 pat-missing 告警就不再推送。
             if GH_TOKEN="${READ_TOKEN:-}" gh api --paginate --slurp \
                 "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null |
-              jq -e --arg p "pr-guard: alert head=$HEAD_SHA reason=auth " '
+              jq -e --arg p "pr-guard: alert head=$HEAD_SHA reason=pat-missing " '
                 (add // [])
                 | any(.[];
                     (.user.login == "github-actions[bot]" or
@@ -830,7 +830,7 @@ jobs:
                     ((.body // "") | contains($p)))
               ' >/dev/null 2>&1
             then
-              echo "::notice::Alert auth for $HEAD_SHA was already sent"
+              echo "::notice::Alert pat-missing for $HEAD_SHA was already sent"
               exit 0
             fi
             push_alert "🤖 Codex 召唤令牌缺失" "repo secret CODEX_TRIGGER_TOKEN 为空，$REPO PR #$PR_NUMBER 的 Claude 代审结果发不出去。需在仓库 Settings→Secrets 补上 fine-grained PAT。"

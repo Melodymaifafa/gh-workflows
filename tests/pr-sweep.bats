@@ -8,7 +8,7 @@ OTHER=9b14fe3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 R=Melodymaifafa/private-caller
 SWEEPER=.github/workflows/pr-sweeper.yml
 # private-caller 是私有仓库：公开日志里只能出现这个标签。
-LABEL="repo-$(printf '%s' "$R" | sha256sum | cut -c1-8)"
+LABEL="repo-$(printf '%s' "$R" | openssl dgst -sha256 -hmac owner-pat | awk '{print $NF}' | cut -c1-8)"
 PUB=Melodymaifafa/gh-workflows
 
 setup() {
@@ -320,7 +320,7 @@ refute_writes() {
   first="$(alert_comment 1 fix-quota "$((NOW_EPOCH - 250 * 60))" 300)"
   m5="$(m5_review 5 240)"
   # M5 #1 之后又撞额度：iterate 补了一条不推送的新 until。
-  quiet() { gh_comment 2 'github-actions[bot]' NONE "🤖 额度又用完了，改到 x 后继续（不再重复推送）。"$'\n'"$(m6_marker "$H" fix-quota "$1")" "$(ago 200)"; }
+  quiet() { gh_comment 2 'github-actions[bot]' NONE "🤖 额度又用完了，改到北京时间 09-18 20:00 后继续（不再重复推送）。"$'\n\n'"$(m6_marker "$H" fix-quota "$1")" "$(ago 200)"; }
   reviews "$(codex_findings 4863267293 "$H" 600)" "$m5"
   comments "$first" "$(quiet "$((NOW_EPOCH + 3600))")" "$(alert_comment 3 fix-failed - 245)"
   sweep
@@ -682,4 +682,48 @@ refute_writes() {
   fake_route_fail -X PUT "repos/$REPO/actions/workflows/pr-sweeper.yml/enable" 1
   run run_block "$SWEEPER" "Keep the schedule alive"
   assert_equal "$status" 0
+}
+
+# quota_trail <M5 个数>：每次 M5 之后 10 分钟都撞了额度（不计数），最后一个 until 已过。
+quota_trail() {
+  local k m5s=() alerts=() at
+  for ((k = 1; k <= $1; k++)); do
+    at=$((700 - k * 100))
+    m5s+=("$(m5_review "$((10 + k))" "$at")")
+    alerts+=("$(alert_comment "$((20 + k))" fix-quota "$((NOW_EPOCH - 60))" "$((at - 10))")")
+  done
+  reviews "$(codex_findings 4863267293 "$H" 800)" "${m5s[@]}"
+  comments "${alerts[@]}"
+}
+
+@test "retries that all hit quota still stop at 6 M5s with one retry-exhausted alert" {
+  one_pr clean 70
+  quota_trail 6
+  sweep
+  assert_contains "$output" "retries=0"
+  refute_called "gh api POST repos/$R/pulls/7/reviews"
+  assert_called "reason=retry-exhausted" 1
+  assert_contains "$(fake_last_body "gh api POST")" "试了 6 次都卡在 Claude 额度上"
+}
+
+@test "five quota-ended retries still leave room for one more" {
+  one_pr clean 70
+  quota_trail 5
+  sweep
+  assert_called "gh api POST repos/$R/pulls/7/reviews" 1
+  refute_called "reason=retry-exhausted"
+}
+
+@test "the private label is keyed, so hashing a guessed name does not match it" {
+  one_pr clean 10
+  sweep
+  assert_contains "$output" "$LABEL"
+  refute_contains "$output" "repo-$(printf '%s' "$R" | sha256sum | cut -c1-8)"
+}
+
+@test "without any key the private label carries no hash at all" {
+  one_pr clean 10
+  GH_TOKEN="" LABEL_KEY="" run bash "$REPO_ROOT/scripts/pr-sweep.sh"
+  assert_contains "$output" "repo-private"
+  refute_contains "$output" "private-caller"
 }
