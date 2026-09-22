@@ -16,7 +16,7 @@ setup() {
   export OWNER=Melodymaifafa SWEEP_MODE=live ONLY_REPOS=private-caller GH_TOKEN=owner-pat
   NOW_EPOCH="$(jq -n '"2026-09-18T12:00:00Z" | fromdateiso8601')"
   export NOW_EPOCH
-  unset PUSHOVER_TOKEN PUSHOVER_USER
+  unset PUSHOVER_TOKEN PUSHOVER_USER SWEEP_READ_TOKEN
   fake_route "user/repos?affiliation=owner&per_page=100" sweep/user-repos.json
   stub "$R" "$(stub_yaml develop)"
   comments
@@ -666,6 +666,16 @@ EOF
 
 @test "a main-default repo onboarded with base main: its main PR is swept, its develop PR is unwatched" {
   export ONLY_REPOS=main-default
+@test "SWEEP_READ_TOKEN, when set, reads the caller stub; writes still use GH_TOKEN" {
+  export SWEEP_READ_TOKEN=read-pat
+  one_pr clean 900
+  sweep
+  assert_equal "$status" 0
+  assert_contains "$(fake_calls "contents/$WF/codex-approved-merge.yml")" "[token=read-pat]"
+  assert_contains "$(fake_calls "gh api POST")" "[token=owner-pat]"
+  refute_contains "$(fake_calls "gh api POST")" "read-pat"
+}
+
   local M=Melodymaifafa/main-default into_main into_develop
   stub "$M" "$(stub_yaml main)"
   into_main="$(repo_pr "$M" 1 dirty 900 main)"

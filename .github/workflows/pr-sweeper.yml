@@ -66,6 +66,8 @@ jobs:
         if: steps.mode.outputs.mode != 'off'
         env:
           GH_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
+          # 只读调用桩的令牌，只存在本仓库；CODEX_TRIGGER_TOKEN 分发到每个仓库，不给它 Contents 读权限。
+          SWEEP_READ_TOKEN: ${{ secrets.SWEEP_READ_TOKEN }}
           OWNER: ${{ github.repository_owner }}
           SWEEP_MODE: ${{ steps.mode.outputs.mode }}
         # repos 输入可能是私有仓库名，不放 env:（step 的 env 会原样打进公开日志），从事件文件里读。
