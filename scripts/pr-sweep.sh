@@ -112,8 +112,9 @@ repo_label() {
 # 返回 0 = 读到了；3 = 没接共享自动化（文件不存在，或是没有共享 uses: 行的内联副本）；
 # 4 = 读不了（403 等任何非 404 错误），或 base_branch 不是正常的分支名。
 # 本仓库的同名文件是定义本身，调用桩叫 self-codex-approved-merge.yml，所以两个都看。
+# 首字符不许是 - . /：否则 `-` 会和主循环里「没接入」的占位值撞上。
 integration_base() {
-  local f out line b re='^[A-Za-z0-9._/-]{1,100}$'
+  local f out line b re='^[A-Za-z0-9_][A-Za-z0-9._/-]{0,99}$'
   for f in codex-approved-merge.yml self-codex-approved-merge.yml; do
     if ! out="$(GH_TOKEN="${SWEEP_READ_TOKEN:-${GH_TOKEN:-}}" gh api -H 'Accept: application/vnd.github.raw+json' "repos/$1/contents/.github/workflows/$f")"; then
       [ "$(jq -r '.status // (if .message == "Not Found" then 404 else empty end)' <<<"$out" 2>/dev/null)" = 404 ] && continue
@@ -126,7 +127,7 @@ integration_base() {
     b="$(sed -E 's/^[[:space:]]*base_branch:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//' <<<"$line")"
     case "$b" in \"*\"|\'*\') b="${b:1:${#b}-2}" ;; esac
     [[ "$b" =~ $re ]] || return 4
-    case "$b" in *..*) return 4 ;; esac
+    case "$b" in *..*|*//*|*/.*|*/|*.) return 4 ;; esac
     printf '%s' "$b"
     return 0
   done

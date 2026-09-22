@@ -633,7 +633,9 @@ refute_writes() {
 
   local bad
   # shellcheck disable=SC2016  # 字面量 ${{ }}
-  for bad in '${{ vars.BASE }}' 'feat/../x' 'develop#x' '"a b"' '' "$(printf 'a%.0s' {1..101})"; do
+  # `-` 是主循环里「没接入」的占位值，必须读不进来。
+  for bad in '${{ vars.BASE }}' 'feat/../x' 'develop#x' '"a b"' '' "$(printf 'a%.0s' {1..101})" \
+    - . / -x a//b feat/ x. feat/.x; do
     stub "$R" "$(stub_yaml "$bad")"
     run integration_base "$R"
     assert_equal "$status" 4
