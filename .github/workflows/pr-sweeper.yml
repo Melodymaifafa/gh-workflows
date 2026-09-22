@@ -1,4 +1,5 @@
-# PR 巡检：每 15 分钟扫一遍所有 develop 仓库，给卡住的 PR 补一脚（规则见 scripts/pr-sweep.sh）。
+# PR 巡检：扫 owner 名下所有仓库，集成分支取各仓库调用桩的 base_branch，给卡住的 PR 补一脚（规则见 scripts/pr-sweep.sh）。
+# cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次；急的话手动点 Run workflow（取消勾选 dry_run 才会动手）。
 # 只在 gh-workflows 里跑（公开仓库，分钟免费）。总开关是仓库变量 SWEEP_MODE：off / dry / live，没设 = off。
 name: PR sweeper
 
