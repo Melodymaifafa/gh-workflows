@@ -653,7 +653,7 @@ refute_writes() {
   done <<'EOF'
 develop|develop
 "release/2.0"|release/2.0
-'feat/nightly_x'|feat/nightly_x
+'feat/some_x'|feat/some_x
 main   # 集成分支|main
 "feat/y" # 注释|feat/y
 EOF
@@ -666,8 +666,6 @@ EOF
   assert_equal "$output" main
 }
 
-@test "a main-default repo onboarded with base main: its main PR is swept, its develop PR is unwatched" {
-  export ONLY_REPOS=main-default
 @test "SWEEP_READ_TOKEN, when set, reads the caller stub; writes still use GH_TOKEN" {
   export SWEEP_READ_TOKEN=read-pat
   one_pr clean 900
@@ -678,6 +676,8 @@ EOF
   refute_contains "$(fake_calls "gh api POST")" "read-pat"
 }
 
+@test "a main-default repo onboarded with base main: its main PR is swept, its develop PR is unwatched" {
+  export ONLY_REPOS=main-default
   local M=Melodymaifafa/main-default into_main into_develop
   stub "$M" "$(stub_yaml main)"
   into_main="$(repo_pr "$M" 1 dirty 900 main)"
@@ -788,12 +788,27 @@ EOF
   assert_contains "$(fake_last_body "gh api POST")" "alert head=$OTHER reason=unwatched"
 }
 
+@test "unwatched beats conflict and parked: an unwatched, conflicting, parked PR gets only the unwatched alert" {
+  local how body
+  for how in offbase missing; do
+    : >"$FAKE_LOG"
+    if [ "$how" = missing ]; then no_stub "$R"; one_pr dirty 900; else stub "$R" "$(stub_yaml develop)"; one_pr dirty 900 main; fi
+    comments "$(alert_comment 5 no-fix)"
+    sweep
+    assert_equal "$status" 0
+    assert_called "gh api POST" 1
+    body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+    assert_contains "$body" "reason=unwatched"
+    refute_contains "$body" "冲突"
+  done
+}
+
 # ── 公开日志不出现私有仓库 ──
 
 @test "private repo: logs and summary show only the opaque label, never the name, PR number or SHA" {
   export PUSHOVER_TOKEN=t PUSHOVER_USER=u
   # 私有仓库的集成分支名也不能进日志。
-  local B=feat/secret-nightly conflict kickme bad offbase
+  local B=feat/secret-branch conflict kickme bad offbase
   stub "$R" "$(stub_yaml "$B")"
   conflict="$(pr_json 1 dirty 900 "$H" "$B")"
   kickme="$(pr_json 7 clean 900 "$H" "$B")"
@@ -821,7 +836,7 @@ EOF
     refute_contains "$all" "#3"
     refute_contains "$all" "#4"
     refute_contains "$all" "${H:0:7}"
-    refute_contains "$all" "secret-nightly"
+    refute_contains "$all" "secret-branch"
   done
   # Pushover 和 PR 评论是私人通道，照写真名和分支名。
   assert_contains "$(fake_calls curl)" "$R#1"
@@ -836,7 +851,7 @@ EOF
     sweep
     all="$output$(cat "$GITHUB_STEP_SUMMARY")"
     refute_contains "$all" "private-caller"
-    refute_contains "$all" "secret-nightly"
+    refute_contains "$all" "secret-branch"
     refute_contains "$all" "FAKE"
   done
 
