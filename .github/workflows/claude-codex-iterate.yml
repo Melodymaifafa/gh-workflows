@@ -392,6 +392,7 @@ jobs:
           FIX_OUTCOME: ${{ steps.fix.outcome }}
           STRUCTURED: ${{ steps.fix.outputs.structured_output }}
           EXEC_FILE: ${{ steps.fix.outputs.execution_file }}
+          FALLBACK_ALLOWED: ${{ steps.select.outputs.fallback_allowed }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
         run: |
@@ -460,6 +461,20 @@ jobs:
                 else "fix-failed -" end' "${EXEC_FILE:-/dev/null}" 2>/dev/null || echo "fix-failed -"
           )"
 
+          # review_fixer 允许换人时，结论不在这里下：Decide the takeover 才是这条链
+          # 的裁决点，它用 classify-claude-failure.sh 分清 provider 侧失败还是业务
+          # 失败，该换 Codex 就换、该红就红。这里先把 SDK 认定的原因交出去，也先
+          # 别发「巡检稍后会再修」的告警 —— 这一轮可能马上有人接手。
+          if [ "${FALLBACK_ALLOWED:-}" = true ]; then
+            {
+              echo "failed=true"
+              echo "reason=$reason"
+              echo "until=$until"
+            } >>"$GITHUB_OUTPUT"
+            echo "the fix round did not land (reason=$reason); the takeover step decides"
+            exit 0
+          fi
+
           case "$reason" in
             fix-quota)
               resume="$(date -u -d "@$((until + 28800))" '+%m-%d %H:%M')"
@@ -487,37 +502,59 @@ jobs:
           REVIEW_FIXER: ${{ inputs.review_fixer }}
           FIRST: ${{ steps.select.outputs.first }}
           FALLBACK_ALLOWED: ${{ steps.select.outputs.fallback_allowed }}
-          CLAUDE_OUTCOME: ${{ steps.fix.outcome }}
           EXECUTION_FILE: ${{ steps.fix.outputs.execution_file }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.gate.outputs.head }}
+          OUTCOME_RESULT: ${{ steps.outcome.outcome }}
+          OUTCOME_FAILED: ${{ steps.outcome.outputs.failed }}
+          OUTCOME_REASON: ${{ steps.outcome.outputs.reason }}
+          OUTCOME_UNTIL: ${{ steps.outcome.outputs.until }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
         run: |
           set -euo pipefail
+          # shellcheck source=/dev/null
+          . "$RUNNER_TEMP/pr-guard.sh"
 
           run_codex=false
           fell_back=false
           fatal=''
+          alert=''
+          alert_reason=fix-failed
+          alert_until=-
 
           if [ "$FIRST" = codex ]; then
             fixer=codex
             run_codex=true
             why='caller pinned the Codex fixer; Claude was skipped'
-          elif [ "$CLAUDE_OUTCOME" = success ]; then
+          elif [ "$OUTCOME_RESULT" != success ]; then
+            # Check the fix outcome 没走完（前面某一步先挂了，或它自己红了）。
+            # 沿用那一步的红，别另编一个原因，也别拿别人的失败去换人。
+            fixer=claude
+            why='an earlier step failed before the fix outcome could be judged'
+            fatal="$why"
+          elif [ "${OUTCOME_FAILED:-}" != true ]; then
+            # 推了、或看完觉得都不用改 —— 两种结局都由 Check the fix outcome 处理完了。
             fixer=claude
             why='Claude finished this round'
-          elif [ "$CLAUDE_OUTCOME" = skipped ]; then
-            # 前面某一步先挂了，Claude 根本没跑。沿用那一步的红，别另编一个原因。
-            fixer=claude
-            why='an earlier step failed before Claude could run'
-            fatal="$why"
           else
             # 只把「这次运行的终态字段」喂给分类器，绝不喂整份对话记录：记录里
             # 原样带着 Codex 的 review 正文（外部输入），照抄一句额度报错就能骗
             # 出一次换人，而接手的那个 token 有写权限。
+            # SDK 已经认定的原因单独写一行，让结构化判据压过模型写的自然语言：
+            # 429 / 401 是 runner 从 execution_file 的字段里读出来的，伪造不了。
             diag="$RUNNER_TEMP/claude-failure.txt"
             : >"$diag"
+            case "${OUTCOME_REASON:-}" in
+              fix-quota) echo 'API Error: 429' >>"$diag" ;;
+              auth) echo 'API Error: 401' >>"$diag" ;;
+            esac
             if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
               jq -r '[.. | objects | select(.type? == "result")]
                      | map([.subtype, (.is_error | tostring), .result] | join(" "))
-                     | join("\n")' "$EXECUTION_FILE" >"$diag" 2>/dev/null || : >"$diag"
+                     | join("\n")' "$EXECUTION_FILE" >>"$diag" 2>/dev/null || true
             fi
 
             verdict="$("$RUNNER_TEMP/fixer-scripts/classify-claude-failure.sh" "$diag")"
@@ -528,19 +565,45 @@ jobs:
               fixer=claude
               why="Claude failed on the code, not on the provider ($failure_reason)"
               fatal="$why"
+              alert='Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。'
             elif [ "$FALLBACK_ALLOWED" != true ]; then
               fixer=claude
               why="Claude hit a provider limit ($failure_reason) but review_fixer=$REVIEW_FIXER forbids a fallback"
               fatal="$why"
+              case "${OUTCOME_REASON:-}" in
+                fix-quota)
+                  alert_reason=fix-quota
+                  alert_until="${OUTCOME_UNTIL:--}"
+                  case "$alert_until" in
+                    ''|*[!0-9]*) alert_until="$(($(date +%s) + 21600))" ;;
+                  esac
+                  resume="$(date -u -d "@$((alert_until + 28800))" '+%m-%d %H:%M')"
+                  alert="Claude 自动修复额度用完了，北京时间 $resume 后巡检会自动再修，不用管。"
+                  ;;
+                auth)
+                  alert_reason=auth
+                  alert='Claude 令牌失效，自动修复停了；请重新生成 CLAUDE_CODE_OAUTH_TOKEN 并更新仓库 secret。'
+                  ;;
+                *)
+                  alert='Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。'
+                  ;;
+              esac
             elif [ "$(git rev-parse HEAD)" != "${BASE_SHA:-}" ]; then
               fixer=claude
               why="Claude already committed before failing ($failure_reason); a second fixer must not write the same round"
               fatal="$why"
+              alert='Claude 修到一半断了，改动可能只推上去一半；请看一眼 PR 再决定。'
             else
               fixer=codex
               run_codex=true
               fell_back=true
               why="Claude hit a provider limit ($failure_reason); handing this round to Codex"
+              # 额度会自己恢复，令牌不会：换人成功也得说一声，否则 Codex 一直
+              # 替它兜着，没人知道该去换 token。
+              if [ "${OUTCOME_REASON:-}" = auth ]; then
+                alert_reason=auth
+                alert='Claude 令牌失效，这一轮改由 Codex 接手；请重新生成 CLAUDE_CODE_OAUTH_TOKEN 并更新仓库 secret。'
+              fi
             fi
           fi
 
@@ -559,6 +622,13 @@ jobs:
             echo "- why: $why"
           } >>"$GITHUB_STEP_SUMMARY"
 
+          # 告警发给主人，退出码留给看板，两者都要有。允许换人时 Check the fix
+          # outcome 把告警让给了本步骤，这里不补就没人补，PR 会无声停住。
+          # 同一个 head、同一个原因只发一次。
+          if [ -n "$alert" ] && [ -n "${HEAD_SHA:-}" ]; then
+            alert_once "$HEAD_SHA" "$alert_reason" "$alert_until" "$alert"
+          fi
+
           if [ -n "$fatal" ]; then
             echo '- result: **this round failed**' >>"$GITHUB_STEP_SUMMARY"
             echo "::error::$fatal"
@@ -568,43 +638,26 @@ jobs:
       # 以下四步是 Codex 接管路径。Codex 的沙箱既没有网络也不让写 .git
       # （MEL-197 实测），所以它只负责「读 review → 改文件 → 写中文总结」；
       # 取评论、装依赖、验证、commit/push、发评论全部由外层步骤做。
-      - name: Collect the review context for Codex
+      - name: Point Codex at the prefetched review
         id: context
         if: steps.decide.outputs.run_codex == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REVIEW_ID: ${{ github.event.review.id }}
-          REVIEWED_SHA: ${{ github.event.review.commit_id }}
-          # review 正文是外部输入：只经 env 落进文件，不进 run 块的字面量，
-          # 也不拼进 prompt。
-          REVIEW_BODY: ${{ github.event.review.body }}
         run: |
           set -euo pipefail
 
-          # 别在工作区根目录写死文件名：这条工作流跑在别人的仓库里，撞上同名的
-          # 已跟踪文件会先被覆盖、再被清理掉，然后当成 Codex 的改动提交出去。
-          # mktemp 保证不重名；文件仍留在工作区内，Codex 的沙箱才读得到。
-          context_file="$(mktemp "$GITHUB_WORKSPACE/codex-review-context.XXXXXXXX")"
-          printf 'file=%s\n' "$context_file" >>"$GITHUB_OUTPUT"
-
-          {
-            printf '# Codex review of PR #%s (%s), reviewed commit %s\n\n' \
-              "$PR_NUMBER" "$REPO" "$REVIEWED_SHA"
-            printf '## Review body\n\n%s\n\n## Inline comments\n\n' "$REVIEW_BODY"
-          } >"$context_file"
-
-          # 行内评论才是 review 的实质内容（正文常常只是模板），拉不到必须停下。
-          # 吞掉这里的错误 = Codex 拿到一份空 review、不改任何文件、job 打绿勾
-          # 收工，正是「不许把失败伪装成成功」要挡的东西。本轮真没有行内评论时
-          # gh api --jq 对空数组本来就返回 0，不需要 `|| true` 兜底。
-          if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments" --paginate \
-            --jq '.[] | "- \(.path):\(.line // .original_line // 0) — \(.body)"' \
-            >>"$context_file"; then
-            echo "::error::could not read the inline comments of review $REVIEW_ID; refusing to hand Codex an incomplete review"
+          # 不再自己拉一遍 review：Gate 那步已经把目标 review（正文 + 行内评论，
+          # HTML 注释已剥掉）预取进 .review/findings.md，并把 .review/ 写进
+          # .git/info/exclude，所以它既不会被 git add 进 PR，也不会撞上调用方
+          # 仓库里已跟踪的文件名。重复拉还会用错 review —— 巡检的重修请求指向
+          # 的是另一条 review，事件里的 id 不是要修的那条。
+          #
+          # 拿不到这份文件就红着停下。给 Codex 一份空 review 的后果是：它不改
+          # 任何文件、job 打绿勾收工、链条静默停住，正是「不许把失败伪装成成功」
+          # 要挡的东西。
+          if [ ! -s .review/findings.md ]; then
+            echo "::error::.review/findings.md is missing or empty; refusing to hand Codex an incomplete review"
             exit 1
           fi
+          printf 'file=%s\n' .review/findings.md >>"$GITHUB_OUTPUT"
 
       - name: Codex fixes the PR
         id: codex
@@ -652,12 +705,14 @@ jobs:
           VERIFY: ${{ env.VERIFY_CMD }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          CONTEXT_FILE: ${{ steps.context.outputs.file }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ROUND: ${{ steps.gate.outputs.round }}
         run: |
           set -euo pipefail
 
-          # 喂给 Codex 的临时上下文，不能跟着 PR 提交出去。
-          rm -f -- "$CONTEXT_FILE"
+          # 喂给 Codex 的 .review/findings.md 已经在 .git/info/exclude 里，
+          # git add 看不见它，不需要在这里清理。
 
           if [ -z "$(git status --porcelain)" ]; then
             echo 'pushed=false' >>"$GITHUB_OUTPUT"
@@ -686,8 +741,16 @@ jobs:
 
           git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
           git push -q origin "HEAD:$HEAD_REF"
+          new_head="$(git rev-parse HEAD)"
           echo 'pushed=true' >>"$GITHUB_OUTPUT"
           echo '- verification: passed, the fix was pushed' >>"$GITHUB_STEP_SUMMARY"
+
+          # M7 轮数标记：跟 Claude 推完那条一模一样。少了它，Codex 接手推的这一轮
+          # 不计数，下一轮 Gate 会从头数，max_fix_rounds 的上限就永远拦不住。
+          printf -v m7 '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fix-round head=%s round=%s -->' \
+            "$ROUND" "$new_head" "$ROUND"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" >/dev/null ||
+            echo "::warning::fix-round marker for $new_head not posted"
 
       - name: Post the Codex summary comment
         if: steps.decide.outputs.run_codex == 'true'
@@ -710,8 +773,9 @@ jobs:
             fi
           } | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
 
+      # Codex 接管推的那一轮同样要召唤复审 —— 否则换人成功，链条却停在这里。
       - name: Request Codex re-review after a new commit
-        if: steps.outcome.outputs.summon == 'true'
+        if: steps.outcome.outputs.summon == 'true' || steps.codex_push.outputs.pushed == 'true'
         env:
           # 必须属于已连接 Codex 的真人账号；GITHUB_TOKEN 的 bot 评论会被 Codex 拒绝。
           GH_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
