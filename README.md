@@ -143,7 +143,7 @@ git tag -f v1 && git push -f origin v1
 - **顶层 `concurrency` 只能声明一次**：调用桩和被调用的可复用工作流若都在顶层声明同名 group，GitHub 判定「top level workflow」与该 job 死锁，run 立刻失败、零 job、无日志，只有一句 "This run likely failed because of a workflow file issue"。排队逻辑写在被调用方的 **job 层**，调用桩不要写 `concurrency`。`claude-codex-iterate` 踩了这个坑，2026-07-29 起 9 个仓库共 11 次触发全部空跑，直到 2026-08-20 才发现 —— 整条 Codex→Claude 迭代链从来没运行过。
 - **不要放宽 `--allowedTools`**：Codex 的 review 正文是外部输入，直接进 Claude 的 prompt，而那个 token 有写权限。只放行具体命令，别用 `Bash(git:*)`。
 - **`--allowedTools` 是全量清单**：`Edit,MultiEdit,Write` 不列出来 Claude 就改不了任何文件，只会干烧轮数。
-- **绿勾 ≠ 有产出**：确认 Claude 真干了活要看 PR 时间线有没有评论和 commit。
+- **绿勾 ≠ 有产出**：确认 Claude 真干了活要看 PR 时间线有没有评论和 commit。`claude-codex-iterate` 现在只在「推了新提交」和「看完觉得不用改」两种结局下报绿，缺凭证、额度耗尽、令牌失效、说推了却没推一律报红 —— 之前这些全被咽成 success，douyin-grabber 的自动修复因此一次都没跑起来还天天绿（MEL-236）。红的是 iterate 这条 run，`codex-approved-merge` 按名字把它排除在合并门槛外，不会因此卡住合并。
 - **`@codex review` 会被限流静默**：连发几次后连 👀 都不回，约 10 分钟恢复。现在 iterate 只召唤一次，沉默由 watcher 的 5 分钟兜底接手。
 - **Codex 额度用完时它照样回一条评论**：旧版超时告警把它当成「Codex 有反应」，于是既不告警也不合并，PR 就这么卡住（2026-09-17，3 个 PR）。现在认出这句话就当场换 Claude。
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
