@@ -9,6 +9,7 @@
 #   3. 只有服务商侧失败才换人；业务失败红着停下，而且一定有人发告警。
 
 load test_helper/common
+load test_helper/step_gate
 
 WF=.github/workflows/claude-codex-iterate.yml
 H=1a7e81f6b5f27f0a1dbc33c6fafda1bb86f1483d
@@ -202,4 +203,109 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text]
   run run_block "$WF" "Decide the takeover"
   assert_equal "$status" 1
   assert_equal "$(step_output run_codex)" false
+}
+
+# ---------------------------------------------------------------------------
+# step 门禁（MEL-250 F1）
+#
+# 上面那条 "review_fixer=codex runs Codex without ever consulting Claude's
+# outcome" 抽的是 Decide the takeover 一格 shell，断言 run_codex=true —— 它绿
+# 着，可 Codex 接管那四步一次都没跑过。差的不在那一格里，在 GitHub 的门禁：
+# step 的 if 不写状态函数时会被隐式补上 success()，前面一红，后面全跳。
+# 下面这组按门禁语义重放整条 step 链（if 表达式从 workflow 原文读），补上那条
+# 单块测试看不见的链路。
+# ---------------------------------------------------------------------------
+
+# codex 模式下 workflow 各处 if 引用到的值。
+codex_mode_context() {
+  gate_reset
+  gate_set inputs.runtime shell
+  gate_set inputs.review_fixer codex
+  gate_set steps.gate.outputs.run true
+  gate_set steps.select.outputs.first codex
+  gate_set steps.select.outputs.fallback_allowed false
+  # Decide the takeover 在 FIRST=codex 时输出 run_codex=true，由上面那条单块
+  # 测试保证；跳过时这些 outputs 会被自动作废，不会假装还在。
+  gate_set steps.decide.outputs.run_codex true
+  gate_set steps.codex_push.outputs.pushed true
+  # 上一条测试实测过：这一步真跑起来必然 exit 1（读到空结果 → 冤枉 Claude →
+  # 打红）。所以只要它没被挡住，隐式 success() 就塌了。
+  gate_fails 'Check the fix outcome'
+}
+
+@test "gating: the outcome step would fail and blame a Claude that never ran" {
+  # 这条不判 if，只判「万一它真跑起来会怎样」—— 下面两条的前提。
+  export HEAD_SHA="$H" ROUND=3 FIX_OUTCOME=skipped STRUCTURED='' EXEC_FILE=''
+  export FALLBACK_ALLOWED=false
+  fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$H\"}}"
+
+  run run_block "$WF" "Check the fix outcome"
+
+  [ "$status" -ne 0 ]
+  assert_contains "$(fake_last_body "gh pr comment")" 'Claude 自动修复没跑成'
+}
+
+@test "gating: review_fixer=codex actually reaches all four Codex steps" {
+  codex_mode_context
+  gate_trace "$WF"
+
+  gate_skipped 'uses: anthropics/claude-code-action@v1'
+  gate_skipped 'Check the fix outcome'
+  gate_ran 'Decide the takeover'
+  gate_ran 'Hand the round over to Codex'
+  gate_ran 'Codex fixes the PR'
+  gate_ran 'Verify, commit and push the Codex fix'
+  gate_ran 'Post the Codex summary comment'
+  gate_ran 'Request Codex re-review after a new commit'
+}
+
+@test "gating: without the first=='claude' half, the whole takeover is skipped" {
+  # 把 Check the fix outcome 的 if 换回只看 gate 的旧写法，并按上面那条测出来的
+  # 结果让它失败 —— 隐式 success() 随即为假，Codex 四步全被跳过。模型抓不到这个
+  # 回归，上面那条「四步都跑到」就是假绿。
+  codex_mode_context
+  gate_if 'Check the fix outcome' "steps.gate.outputs.run == 'true'"
+  gate_fails 'Check the fix outcome'
+  gate_trace "$WF"
+
+  gate_ran 'Check the fix outcome'
+  gate_ran 'Decide the takeover'
+  gate_skipped 'Hand the round over to Codex'
+  gate_skipped 'Codex fixes the PR'
+  gate_skipped 'Verify, commit and push the Codex fix'
+  gate_skipped 'Post the Codex summary comment'
+  gate_skipped 'Request Codex re-review after a new commit'
+}
+
+@test "gating: auto and claude modes still run Claude and judge its outcome" {
+  # 新加的那半个条件只能挡住 codex 模式；挡到 Claude 自己那两条路上，
+  # 失败就再也没人分类、没人告警了。
+  for mode in auto claude; do
+    gate_reset
+    gate_set inputs.runtime shell
+    gate_set inputs.review_fixer "$mode"
+    gate_set steps.gate.outputs.run true
+    gate_set steps.select.outputs.first claude
+    # Claude 那一步带 continue-on-error，撞额度也不许把后面的判定一起拖红
+    gate_fails 'uses: anthropics/claude-code-action@v1'
+    gate_trace "$WF"
+
+    gate_ran 'uses: anthropics/claude-code-action@v1'
+    gate_ran 'Check the fix outcome'
+    gate_ran 'Decide the takeover'
+  done
+}
+
+@test "gating: a round the gate turned off runs neither fixer" {
+  gate_reset
+  gate_set inputs.runtime shell
+  gate_set inputs.review_fixer auto
+  gate_set steps.gate.outputs.run false
+  gate_trace "$WF"
+
+  gate_skipped 'Select the review fixer'
+  gate_skipped 'uses: anthropics/claude-code-action@v1'
+  gate_skipped 'Check the fix outcome'
+  gate_skipped 'Decide the takeover'
+  gate_skipped 'Codex fixes the PR'
 }

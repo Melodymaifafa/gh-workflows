@@ -389,7 +389,12 @@ jobs:
       # 只有「head 变了」和「看完觉得都不用改」算这一轮成功；其余结局告警之后本步骤非零退出，把 run 判红。
       - name: Check the fix outcome
         id: outcome
-        if: steps.gate.outputs.run == 'true'
+        # 这一步判的是「Claude 这一轮跑成了没有」，所以 Claude 没上就不能跑：
+        # review_fixer=codex 时它会把空的结果读成「没修成」，推一条冤枉 Claude
+        # 的告警再 exit 1；而 step 的 if 不写状态函数时 GitHub 会隐式补 success()，
+        # 它这一红，后面 Codex 接管那四步和召唤复审全被跳过 —— job 红着收工，
+        # summary 却写着这轮是 Codex 干的。门跟着 Claude 那一步走，两个病一起治。
+        if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

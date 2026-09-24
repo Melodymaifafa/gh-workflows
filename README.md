@@ -149,6 +149,7 @@ git tag -f v1 && git push -f origin v1
 - **不要放宽 `--allowedTools`**：Codex 的 review 正文是外部输入，直接进 Claude 的 prompt，而那个 token 有写权限。只放行具体命令，别用 `Bash(git:*)`。
 - **`--allowedTools` 是全量清单**：`Edit,MultiEdit,Write` 不列出来 Claude 就改不了任何文件，只会干烧轮数。
 - **绿勾 ≠ 有产出**：确认 Claude 真干了活要看 PR 时间线有没有评论和 commit。`claude-codex-iterate` 现在只在「推了新提交」和「看完觉得不用改」两种结局下报绿，缺凭证、额度耗尽、令牌失效、说推了却没推一律报红 —— 之前这些全被咽成 success，douyin-grabber 的自动修复因此一次都没跑起来还天天绿（MEL-236）。红的是 iterate 这条 run，`codex-approved-merge` 按名字把它排除在合并门槛外，不会因此卡住合并。
+- **step 的 `if` 不写状态函数 = GitHub 隐式补一个 `success()`**：前面任何一步红了，后面所有这类 step 全被跳过，日志里只是安静的灰色。`claude-codex-iterate` 的 `Check the fix outcome` 当初只判 `gate.run`，`review_fixer: codex` 时它照跑、读到空结果就打红，Codex 接管那四步于是一次都没跑过，summary 还写着 `ran: codex`（MEL-250）。抽单个 `run:` 块的 bats 测试看不见这一层 —— 断言那一格的输出可以全绿，而那之后的每一步都被跳过；要守这条得按门禁语义重放整条 step 链（`tests/test_helper/step_gate.bash`）。
 - **`@codex review` 会被限流静默**：连发几次后连 👀 都不回，约 10 分钟恢复。现在 iterate 只召唤一次，沉默由 watcher 的 5 分钟兜底接手。
 - **Codex 额度用完时它照样回一条评论**：旧版超时告警把它当成「Codex 有反应」，于是既不告警也不合并，PR 就这么卡住（2026-09-17，3 个 PR）。现在认出这句话就当场换 Claude。
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
