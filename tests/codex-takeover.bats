@@ -41,28 +41,59 @@ setup() {
   refute_contains "$(cat "$GITHUB_OUTPUT")" 'run=true'
 }
 
+# Gate 之后的工作区：调用方仓库已经 checkout 好，意见预取在 .review/ 里，
+# 而 .review/ 已写进本地 exclude（Gate 那步干的，iterate-gate.bats 盯着）。
+handover_workspace() {
+  git init -q .
+  git config user.email t@e
+  git config user.name t
+  printf 'a file the caller repo already tracks\n' >codex-review-context.md
+  git add codex-review-context.md
+  git commit -q -m base
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  mkdir -p .git/info .review
+  echo '.review/' >>.git/info/exclude
+  printf '## 行内评论\n\n- scripts/x.sh:12 — this swallows the error\n' >.review/findings.md
+}
+
 @test "takeover: Codex is never handed a missing or empty review" {
-  run run_block "$WF" "Point Codex at the prefetched review"
+  handover_workspace
+  mv .review/findings.md .review/gone.md
+  run run_block "$WF" "Hand the round over to Codex"
   assert_equal "$status" 1
   assert_contains "$output" '::error::'
   assert_contains "$output" 'incomplete review'
 
-  mkdir -p .review
+  mv .review/gone.md .review/findings.md
   : >.review/findings.md
-  run run_block "$WF" "Point Codex at the prefetched review"
+  run run_block "$WF" "Hand the round over to Codex"
   assert_equal "$status" 1
 }
 
 @test "takeover: the handoff names the excluded prefetch, not a file in the caller's checkout" {
-  printf 'a file the caller repo already tracks\n' >codex-review-context.md
-  mkdir -p .review
-  printf '## 行内评论\n\n- scripts/x.sh:12 — this swallows the error\n' >.review/findings.md
+  handover_workspace
 
-  run run_block "$WF" "Point Codex at the prefetched review"
+  run run_block "$WF" "Hand the round over to Codex"
 
   assert_equal "$status" 0
   assert_equal "$(step_output file)" .review/findings.md
   assert_contains "$(cat codex-review-context.md)" 'already tracks'
+  assert_contains "$(cat .review/findings.md)" 'this swallows the error'
+}
+
+@test "takeover: Claude's uncommitted leftovers never ship as a Codex fix" {
+  handover_workspace
+  # Claude 改了工作区又没提交就撞了额度
+  printf 'half-finished edit\n' >>codex-review-context.md
+  printf 'a stray new file\n' >claude-wip.txt
+
+  run run_block "$WF" "Hand the round over to Codex"
+
+  assert_equal "$status" 0
+  assert_contains "$(cat codex-review-context.md)" 'already tracks'
+  refute_contains "$(cat codex-review-context.md)" 'half-finished'
+  [ ! -e claude-wip.txt ]
+  [ -s .review/findings.md ]
 }
 
 # ---------- 谁来下结论 ----------
