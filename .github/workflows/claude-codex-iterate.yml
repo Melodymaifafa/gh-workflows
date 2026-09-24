@@ -287,7 +287,7 @@ jobs:
             echo "EXTRA_TOOLS=$tools"
           } >>"$GITHUB_ENV"
 
-      # 失败不让 job 变红：下一步按 SDK 字段分类后告警
+      # 失败不立刻中断 job：下一步要先按 SDK 字段分类、发告警，再决定打红
       - uses: anthropics/claude-code-action@v1
         id: fix
         if: steps.gate.outputs.run == 'true'
@@ -340,6 +340,7 @@ jobs:
 
       # 结果分流：head 变了 → 发轮数标记 M7 并去召唤复审；否则按原因告警一次（同 head 同原因只发一次）。
       # 失败原因只看 execution_file 里的 SDK 字段，不看模型写的文字；没有结构化结果绝不当成功。
+      # 只有「head 变了」和「看完觉得都不用改」算这一轮成功；其余结局告警之后本步骤非零退出，把 run 判红。
       - name: Check the fix outcome
         id: outcome
         if: steps.gate.outputs.run == 'true'
@@ -389,13 +390,22 @@ jobs:
           fi
           echo "summon=false" >>"$GITHUB_OUTPUT"
 
+          # 告警是发给主人看的，退出码是留给看板的，两者都要有。以前这里一律
+          # exit 0，于是「连凭证都没拿到、一行都没改」和「看了一遍觉得不用改」
+          # 在 Actions 列表里长得一模一样，谁也不会去点开（MEL-236：douyin-grabber
+          # 的自动修复从没成功过，每次 run 却都报 success）。
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
           if [ "$pushed" = false ]; then
             alert_once "$H" no-fix - "Claude 看完审查意见觉得都不用改，PR 已停下、不会自动合并；请看一眼，点 Merge 或关掉。"
             exit 0
           fi
           if [ "$pushed" = true ]; then
             alert_once "$H" fix-failed - "Claude 说修好推上去了，但 PR 没有新提交；请看 Actions 日志，巡检稍后会再修一次。"
-            exit 0
+            fail "Claude reported a push but the PR head is still $H"
           fi
 
           # 没跑成：429 / rate_limit rejected → 额度用完（until = resetsAt，缺了就 6 小时后）；401 → 令牌失效
@@ -423,6 +433,10 @@ jobs:
               alert_once "$H" fix-failed - "Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。"
               ;;
           esac
+
+          # 额度耗尽、令牌失效、没跑成，三种都算这一轮没修成。告警发没发过（同
+          # head 同原因只发一次）不影响这里：这一条给的是本次 run 的结论。
+          fail "the fix round did not land (reason=${reason:-fix-failed})"
 
       - name: Request Codex re-review after a new commit
         if: steps.outcome.outputs.summon == 'true'

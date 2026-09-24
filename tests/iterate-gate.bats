@@ -342,7 +342,7 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   outcome_env failure '' exec-429-weekly-limit.json
   live_head "$H"
   outcome
-  assert_equal "$status" 0
+  assert_equal "$status" 1
   assert_equal "$(step_output summon)" false
   # 1787569200 = 2026-08-24 11:00 UTC = 北京时间 08-24 19:00
   assert_equal "$(fake_last_body "gh pr comment")" "Claude 自动修复额度用完了，北京时间 08-24 19:00 后巡检会自动再修，不用管。
@@ -364,6 +364,7 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   outcome_env failure '' exec-401-auth.json
   live_head "$H"
   outcome
+  assert_equal "$status" 1
   assert_equal "$(fake_last_body "gh pr comment")" "Claude 令牌失效，自动修复停了；请重新生成 CLAUDE_CODE_OAUTH_TOKEN 并更新仓库 secret。
 
 <!-- pr-guard: alert head=$H reason=auth until=- -->"
@@ -381,7 +382,7 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   : >"$FAKE_LOG"
   outcome_env failure ''
   outcome
-  assert_equal "$status" 0
+  assert_equal "$status" 1
   assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
 }
 
@@ -407,7 +408,7 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
     "$(gh_comment 2 'github-actions[bot]' NONE "y $(m6_marker "$H" fix-quota 1787500000)")" \
     "$(gh_comment 3 'github-actions[bot]' NONE "z $(m6_marker "$H2" fix-quota 1799999999)")")"
   outcome
-  assert_equal "$status" 0
+  assert_equal "$status" 1
   refute_called "curl "
   assert_called "gh pr comment" 1
   assert_equal "$(fake_last_body "gh pr comment")" "🤖 额度又用完了，改到北京时间 08-24 19:00 后继续（不再重复推送）。
@@ -424,7 +425,7 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
       "$(gh_comment 1 'github-actions[bot]' NONE "x $(m6_marker "$H" fix-quota 1787000000)")" \
       "$(gh_comment 2 melody OWNER "y $(m6_marker "$H" fix-quota "$u")")")"
     outcome
-    assert_equal "$status" 0
+    assert_equal "$status" 1
     refute_called "gh pr comment"
     refute_called "curl "
   done
@@ -443,6 +444,7 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   outcome_env success '{"pushed":false,"fixed":0,"skipped":3}'
   live_head "$H"
   outcome
+  assert_equal "$status" 0
   assert_equal "$(step_output summon)" false
   assert_equal "$(fake_last_body "gh pr comment")" "Claude 看完审查意见觉得都不用改，PR 已停下、不会自动合并；请看一眼，点 Merge 或关掉。
 
@@ -468,10 +470,34 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   outcome_env success '{"pushed":true,"fixed":2,"skipped":0}'
   live_head "$H"
   outcome
+  assert_equal "$status" 1
   assert_equal "$(step_output summon)" false
   assert_called "sleep 10" 6
   assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
   assert_contains "$(fake_last_body "gh pr comment")" "PR 没有新提交"
+}
+
+# MEL-236：douyin-grabber 的 run 35915952473，第 9 步 claude-code-action 报
+# "Environment variable validation failed: Either ANTHROPIC_API_KEY,
+# CLAUDE_CODE_OAUTH_TOKEN, or workload identity federation ... is required"
+# 就退了 —— 凭证校验发生在它写出 execution_file 之前，所以这一步什么都读不到。
+# 这个结局必须红：它和下面那条「看完觉得不用改」的绿必须能分辨。
+@test "outcome: the fixer died before writing anything (missing credentials) -> job red" {
+  outcome_env failure ''
+  live_head "$H"
+  outcome
+  assert_equal "$status" 1
+  assert_equal "$(step_output summon)" false
+  assert_contains "$output" "::error::"
+  assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
+}
+
+@test "outcome: a deliberate no-change verdict is the only green no-change outcome" {
+  outcome_env success '{"pushed":false,"fixed":0,"skipped":2}'
+  live_head "$H"
+  outcome
+  assert_equal "$status" 0
+  refute_contains "$output" "::error::"
 }
 
 @test "outcome: pushed=true and the head shows up late -> summon" {
