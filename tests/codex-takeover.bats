@@ -167,11 +167,12 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text]
   assert_equal "$(step_output run_codex)" false
 }
 
+# 正常路径上 Check the fix outcome 会先打红，走不到这一步；这里守的是兜底本身。
 @test "takeover: review_fixer=claude never hands over, even on a real provider limit" {
   decide claude false fix-quota 'API Error: 429 rate_limit_error'
   assert_equal "$status" 1
   assert_equal "$(step_output run_codex)" false
-  assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-quota'
+  assert_contains "$output" 'forbids a fallback'
 }
 
 @test "takeover: review_fixer=codex runs Codex without ever consulting Claude's outcome" {

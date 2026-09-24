@@ -574,27 +574,13 @@ jobs:
               fatal="$why"
               alert='Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。'
             elif [ "$FALLBACK_ALLOWED" != true ]; then
+              # 正常路径到不了这里：Check the fix outcome 只在允许换人时才把结论
+              # 让过来，不允许时它自己告警并打红。留着是兜底 —— 「review_fixer=
+              # claude 永不换人」这条不能指望上游某一步的条件一直写对。
               fixer=claude
               why="Claude hit a provider limit ($failure_reason) but review_fixer=$REVIEW_FIXER forbids a fallback"
               fatal="$why"
-              case "${OUTCOME_REASON:-}" in
-                fix-quota)
-                  alert_reason=fix-quota
-                  alert_until="${OUTCOME_UNTIL:--}"
-                  case "$alert_until" in
-                    ''|*[!0-9]*) alert_until="$(($(date +%s) + 21600))" ;;
-                  esac
-                  resume="$(date -u -d "@$((alert_until + 28800))" '+%m-%d %H:%M')"
-                  alert="Claude 自动修复额度用完了，北京时间 $resume 后巡检会自动再修，不用管。"
-                  ;;
-                auth)
-                  alert_reason=auth
-                  alert='Claude 令牌失效，自动修复停了；请重新生成 CLAUDE_CODE_OAUTH_TOKEN 并更新仓库 secret。'
-                  ;;
-                *)
-                  alert='Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。'
-                  ;;
-              esac
+              alert='Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。'
             elif [ "$(git rev-parse HEAD)" != "${BASE_SHA:-}" ]; then
               fixer=claude
               why="Claude already committed before failing ($failure_reason); a second fixer must not write the same round"
