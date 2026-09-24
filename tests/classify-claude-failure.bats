@@ -40,7 +40,9 @@ why() {
 }
 
 @test "matching is case-insensitive" {
-  out="$(classify 'FATAL: INSUFFICIENT_QUOTA on this key')"
+  # 大小写不敏感，但位置照样要求在行首：provider 的报错自己占一行，散文里
+  # 出现同样的词不算（见文件末尾那组「散文不能买到一次换人」）。
+  out="$(classify 'INSUFFICIENT_QUOTA: this key has no credit left')"
   assert_equal "$(verdict "$out")" quota
 }
 
@@ -146,4 +148,55 @@ why() {
 @test "a provider marker on any line of a multi-line verdict still counts" {
   out="$(printf 'error_during_execution true I started on the failing test\nerror_during_execution true Claude AI usage limit reached|1756089600\n' | "$SCRIPTS/classify-claude-failure.sh")"
   assert_equal "$(verdict "$out")" quota
+}
+
+# ---------------------------------------------------------------------------
+# 散文不能买到一次换人（MEL-250 F2）。
+#
+# 旧正则的前缀 `(^|[^a-zA-Z])` 只要求这些字样前面不是字母 —— 一个空格就满足，
+# 于是 `API Error: 429` / `overloaded_error` 出现在句子中间照样命中。Claude 把
+# 一次业务失败总结成下面任何一句，auto 模式就会换 Codex 接手，而票面要求业务
+# 失败不回退、job 必须红。下面六条是审核记录第四节实测过的原话，不是造的。
+# ---------------------------------------------------------------------------
+
+@test "prose quoting API Error: 429 while describing a failing test is business" {
+  out="$(classify 'the failing test expects API Error: 429 from the stub and I could not make it pass')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "prose quoting authentication_error while describing a fixture is business" {
+  out="$(classify 'the fixture asserts error.type authentication_error; assertion still fails')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "prose quoting overloaded_error while describing a unit test is business" {
+  out="$(classify 'unit test test_rate_limit_error failed: expected overloaded_error handling')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "a downstream 503 in an integration test report is business" {
+  out="$(classify 'downstream returned 503 Service Unavailable in the integration test, could not fix')"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "a bare provider error line on its own is still quota" {
+  out="$(classify 'API Error: 429')"
+  assert_equal "$(verdict "$out")" quota
+}
+
+@test "the usage-limit sentinel on its own is still quota" {
+  out="$(classify 'Claude AI usage limit reached|1756089600')"
+  assert_equal "$(verdict "$out")" quota
+}
+
+@test "the same three sentences stay business after the caller prefixes the terminal fields" {
+  # 调用方把终态字段拼成 `<subtype> <is_error> <result>` 一行再喂进来；前缀被
+  # 允许，但前缀后面还是散文，判定不能因此翻面。
+  for sentence in \
+    'the failing test expects API Error: 429 from the stub and I could not make it pass' \
+    'the fixture asserts error.type authentication_error; assertion still fails' \
+    'unit test test_rate_limit_error failed: expected overloaded_error handling'; do
+    out="$(classify "error_during_execution true $sentence")"
+    assert_equal "$(verdict "$out")" business
+  done
 }

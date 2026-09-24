@@ -18,27 +18,36 @@
 # 换人。调用方负责裁剪，见 claude-codex-iterate.yml 的 Decide the takeover。
 set -euo pipefail
 
-# 只认 provider 真吐出来的报错结构，逐行按锚定的正则匹配，不做裸子串匹配。
-# 终态字段里的 `.result` 是 Claude 自己写的一段自然语言总结，「集成测试打下游
-# 返回 503 service unavailable，我修不好」这种句子里的字样必须判成 business：
-# 散文里出现同样的词不算数，得是整行的额度哨兵、`API Error: <状态码>` 这样的
-# 前缀、snake_case 的机器错误码，或 provider 的原话。
+# 只认 provider 真吐出来的报错结构，而且必须是一整行的开头 —— 散文里出现同样的
+# 字样一律不算。
 #
+# 为什么是「行首」：真正可信的额度证据是 runner 自己从 execution_file 的结构化
+# 字段（api_error_status、被拒的 rate_limit_event）里读出来、单独写成一行的
+# `API Error: <状态码>`，见 claude-codex-iterate.yml 的 Decide the takeover。
+# 模型写的 `.result` 是一段自然语言总结，「那条挂掉的测试期望 API Error: 429」
+# 这种句子里出现状态码、`overloaded_error` 这类错误码，都只是它在描述自己修的
+# 代码，不是 provider 在报错。以前的正则只要求这些字样前面不是字母，一个空格
+# 就满足，于是整句散文照样命中 —— 一次本该打红的业务失败被判成额度耗尽，换个
+# 模型再改一轮，真问题埋进绿勾里。
+#
+# 调用方把终态字段拼成 `<subtype> <is_error> <result>` 一行，所以行首之后只多
+# 允许这一段前缀；`.result` 整个就是 provider 的报错时仍然命中，夹在句子中间就
+# 不命中。匹配走 nocasematch，所以字符类一律写全大小写，别依赖折叠。
+LINE_HEAD='^[[:space:]]*([a-zA-Z_]+[[:space:]]+(true|false)[[:space:]]+)?'
+
 # 每项写成 `标签::正则`，取第一个 `::` 拆分（正则里不会出现 `::`）。
-# 匹配走 nocasematch，所以字符类一律写全大小写，别依赖折叠。
 QUOTA_PATTERNS=(
   # Claude Code 用完订阅额度时，整个 result 字段就是这一句（可带 |<重置时间戳>）。
-  # 前面允许 `<subtype> <is_error> ` 这段调用方拼进来的前缀。
-  'usage limit reached::^[[:space:]]*([a-zA-Z_]+[[:space:]]+(true|false)[[:space:]]+)?claude ai usage limit reached(\|[0-9]+)?[[:space:]]*$'
+  "usage limit reached::${LINE_HEAD}claude ai usage limit reached(\|[0-9]+)?[[:space:]]*\$"
   # Anthropic API 的 HTTP 错误行，形如 `API Error: 429 {...}`。必须带 `API Error`
   # 前缀 —— 光有状态码不算，业务日志里到处是 503。
-  'API Error with a provider status code::(^|[^a-zA-Z])API Error:?[[:space:]]+(401|429|503|529)([^0-9]|$)'
-  # 错误体里的机器错误码：snake_case，两侧要词边界，`test_rate_limit_error`
-  # 这种自己的测试名不算。
-  'structured provider error code::(^|[^a-zA-Z_])(rate_limit_error|authentication_error|overloaded_error|insufficient_quota|invalid_api_key)([^a-zA-Z_]|$)'
+  "API Error with a provider status code::${LINE_HEAD}API Error:?[[:space:]]+(401|429|503|529)([^0-9]|\$)"
+  # 错误体里的机器错误码：snake_case，后面要词边界，`test_rate_limit_error`
+  # 这种自己的测试名不算（它不在行首）。
+  "structured provider error code::${LINE_HEAD}(rate_limit_error|authentication_error|overloaded_error|insufficient_quota|invalid_api_key)([^a-zA-Z_]|\$)"
   # 余额不足和令牌过期，用 provider 的原话，不拆成 `credit` / `expired` 这种词。
-  'credit balance is too low::(^|[^a-zA-Z])your credit balance is too low'
-  'OAuth token has expired::(^|[^a-zA-Z])OAuth token has expired'
+  "credit balance is too low::${LINE_HEAD}your credit balance is too low"
+  "OAuth token has expired::${LINE_HEAD}OAuth token has expired"
 )
 
 source_file="${1:--}"
