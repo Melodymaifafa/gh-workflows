@@ -203,8 +203,9 @@ git config --local --get http.https://github.com/.extraheader >>"$probe" ||
   probe="$(cat "$BATS_TEST_TMPDIR/probe.txt")"
   assert_contains "$probe" 'GH_TOKEN=[]'
   assert_contains "$probe" 'git-credential=[]'
-  # push 还要用，验证跑完必须原样还回来
-  assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
+  # 摘掉之后不再还回去：凭据整个收进下一步内部，两步之间 .git/config 里一个字都
+  # 没有，逃过收尾的进程盯着这个文件也等不到东西（MEL-255）。
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
   assert_equal "$(step_output changed)" true
 }
 
@@ -290,8 +291,8 @@ printf "cached\n" >stray.pyc'
   assert_equal "$status" 1
   assert_contains "$output" 'verification failed'
   refute_called "gh pr comment"
-  # 凭据照样还回来，不能因为验证失败就永久摘掉
-  assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
+  # 验证失败也一样不还：下一步自己用手上的令牌现造一份，这里没人需要它（MEL-255）
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
 }
 
 # ---------- 验证改写了哪些被跟踪的文件 ----------
@@ -648,6 +649,121 @@ leftover_state() {
   assert_equal "$(leftover_state)" gone
   assert_equal "$status" 0
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
+# ---------- 逃出自己进程组的那一个，按组号收不到 ----------
+#
+# 上面两条按「组号 = 验证命令的 pid」整组收掉。可验证命令起后台任务时加一句 setsid
+# （或者自己来一次双重 fork），后代就换到了新的会话、新的进程组 —— 按组号去 ps 的
+# 收尾压根看不见它。它活到「凭据塞回 .git/config」那一刻就把钥匙抄走，也可以等指纹
+# 和白名单判完之后再改一个源文件、入索引，让下一步替它提交推送，判定全部作废。
+# 两道各守一半：
+#   1. 凭据摘掉之后不再还回 .git/config —— 盯着那个文件的进程永远等不到东西；
+#   2. 「那一棵进程树死透了」要有正面证据：验证命令继承一条管道的写端，读端读到
+#      EOF 才算持有者一个不剩。逃出进程组不会丢掉打开的描述符，所以逃了就读不到
+#      EOF，整条链在指纹 / 树 / 提交之前就红着停下。
+
+# 逃逸探针：验证命令起一个新会话 + 双重 fork 的后台进程，然后自己正常退出。
+# CI 的 ubuntu 上走 Codex 点名的那条 setsid；macOS 没有 setsid，用 perl 的
+# POSIX::setsid 走同一条路。它盯着 .git/config，一看到凭据回来就抄走（再执行
+# ESCAPE_AFTER），没等到就在约 10 秒后自己退出 —— 测试不会被挂住。
+# 探针要的变量得在测试自己这个 shell 里 export，所以这个函数直接改环境、把验证
+# 命令留在 $ESCAPE_VERIFY —— 写成 "$(escaped_probe)" 的话 export 全丢在子 shell 里。
+escaped_probe() { # escaped_probe [抄到凭据之后再干什么]
+  cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
+#!/bin/sh
+echo "$$" >"$ESCAPE_PID"
+i=0
+while [ "$i" -lt 200 ]; do
+  if grep -q extraheader "$ESCAPE_CFG" 2>/dev/null; then
+    cp "$ESCAPE_CFG" "$ESCAPE_LOOT"
+    [ -z "$ESCAPE_AFTER" ] || sh -c "$ESCAPE_AFTER"
+    exit 0
+  fi
+  sleep 0.05
+  i=$((i + 1))
+done
+EOS
+  cat >"$BATS_TEST_TMPDIR/escape.sh" <<'EOS'
+#!/bin/sh
+if command -v setsid >/dev/null 2>&1; then
+  setsid sh "$ESCAPEE" >/dev/null 2>&1 &
+else
+  perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec("/bin/sh", $ENV{ESCAPEE});' >/dev/null 2>&1 &
+fi
+EOS
+  export ESCAPEE="$BATS_TEST_TMPDIR/escapee.sh"
+  export ESCAPE_CFG="$BATS_TEST_TMPDIR/work/.git/config"
+  export ESCAPE_LOOT="$BATS_TEST_TMPDIR/payload-loot.txt"
+  export ESCAPE_PID="$BATS_TEST_TMPDIR/escaped.pid"
+  export ESCAPE_AFTER="${1:-}"
+  ESCAPE_VERIFY="sh $BATS_TEST_TMPDIR/escape.sh"
+}
+
+# 它真的起来过吗：pid 文件在 = 逃逸进程确实跑了，否则下面的 refute 只是空转。
+escaped_ran() {
+  [ -s "$BATS_TEST_TMPDIR/escaped.pid" ] || { echo 'the escaped probe never started' >&2; return 1; }
+}
+
+# 测试收尾把它收掉，别让它活到 bats 清理临时目录的时候。
+reap_escaped() {
+  local pid
+  pid="$(cat "$BATS_TEST_TMPDIR/escaped.pid" 2>/dev/null || true)"
+  [ -z "$pid" ] || kill -9 "$pid" 2>/dev/null || true
+}
+
+@test "takeover: a descendant that escaped its process group stops the chain and never sees the credentials" {
+  escaped_probe
+  push_workspace "$ESCAPE_VERIFY"
+
+  run verify_and_push
+  reap_escaped
+
+  # 战利品先断：防线撤掉时，失败信息里直接就是被它抄走的那把钥匙
+  assert_equal "$(payload_loot)" ''
+  escaped_ran
+  assert_equal "$status" 1
+  assert_contains "$output" 'outside its own process group'
+  # 停在指纹 / 树 / 提交之前：本地没有新提交，origin 还停在 base，也没人发评论
+  assert_equal "$(git show -s --format=%s HEAD)" 'base'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  refute_called "gh pr comment"
+}
+
+# 同一个洞的另一半战利品：它不需要读到凭据，等判定做完之后改一个源文件、自己入
+# 索引，下一步就替它提交推送 —— MEL-258 那道白名单是在它动手之前跑完的。
+@test "takeover: an escaped descendant cannot smuggle a source file past the tree check" {
+  escaped_probe 'printf "v2 fixed by codex\nbackdoor\n" >app.txt; git add app.txt'
+  push_workspace "$ESCAPE_VERIFY"
+
+  run verify_and_push
+  reap_escaped
+
+  refute_contains "$(git show origin/topic:app.txt)" 'backdoor'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  escaped_ran
+  assert_equal "$status" 1
+  assert_contains "$output" 'outside its own process group'
+}
+
+# 结构那一半单独立得住：正常一轮跑完，写权限凭据也不回 .git/config —— 带凭据那一步
+# 自己用手上的令牌现造一份，只递给那一条 push。于是凭据在两步之间压根不存在，
+# 任何活着的进程盯着那个文件都等不到东西。
+@test "takeover: the write credential never lands in .git/config again after verification" {
+  push_workspace 'true'
+
+  run verify_and_push
+
+  assert_equal "$status" 0
+  assert_equal "$(git config --local --get-all http.https://github.com/.extraheader || echo none)" 'none'
+  # 推送照旧走到真 origin：这一道不能靠「凭据丢了所以什么都没发生」通过
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by codex'
+  # 结构上也锁住：凭据只走环境变量递给那一条 push，不许有任何一句把它写回配置文件
+  # —— 写回去了，盯着文件的进程就又有得可等（也别写到命令行上，argv 在 /proc 里公开）。
+  push_block="$(extract_run_block "$REPO_ROOT/$WF" 'Commit and push the Codex fix')"
+  assert_contains "$push_block" 'GIT_CONFIG_VALUE_0'
+  refute_contains "$push_block" 'config --local http'
 }
 
 # ---------- 谁来下结论 ----------
