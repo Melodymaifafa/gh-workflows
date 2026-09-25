@@ -423,8 +423,8 @@ payload_loot() {
   # 战利品先断：撤掉防线时，失败信息里直接就是被捞走的那两把钥匙
   assert_equal "$(payload_loot)" ''
   assert_equal "$status" 0
-  # 指纹这一关它本来就过得去：仓库自己那份 .git 一个字没动
-  assert_equal "$(git status --porcelain .git 2>/dev/null)" ''
+  # 它本来就绕过了指纹：动的是机器上的全局配置，仓库自己那份 .git 一个字没改
+  refute_contains "$output" 'the verify command modified .git'
   # 提交推送照旧走到真 origin，这一道不能靠「什么都没发生」通过
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
   assert_equal "$(git show HEAD:app.txt)" 'v2 fixed by codex'
