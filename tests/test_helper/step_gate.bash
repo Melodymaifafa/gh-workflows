@@ -156,7 +156,7 @@ gate_eval() {
 # `- uses:` 开头的步骤也算一步，名字记成 `uses: <action>`。
 gate_steps() {
   awk '
-    function flush() { if (have) printf "%s\t%s\t%s\t%s\n", name, id, cond, coe }
+    function flush() { if (have) printf "%s\037%s\037%s\037%s\n", name, id, cond, coe }
     /^      - name: / { flush(); have = 1; name = substr($0, 15); id = ""; cond = ""; coe = ""; next }
     /^      - uses: / { flush(); have = 1; name = "uses: " substr($0, 15); id = ""; cond = ""; coe = ""; next }
     have && /^        id: /                { id   = substr($0, 13); next }
@@ -180,7 +180,10 @@ gate_trace() {
   GATE_JOB_FAILED=false
   GATE_TRACE=''
 
-  while IFS="$(printf '\t')" read -r name id cond coe; do
+  # 字段分隔符不能用 tab：tab 属于 IFS 空白，连着两个会被 read 当成一个，于是
+  # 没写 id 的步骤（tab tab）把 if 读进了 id，cond 变成空 —— 整条模型把它当成
+  # 「没有条件，永远跑」。gate_skipped 对这类步骤于是永远测不出回归。
+  while IFS="$(printf '\037')" read -r name id cond coe; do
     [ -n "$name" ] || continue
     eff="$cond"
     if over="$(gate_override_for "$name")"; then eff="$over"; fi
