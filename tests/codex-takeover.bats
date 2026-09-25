@@ -375,6 +375,142 @@ chmod +x .git/hooks/pre-commit'
   refute_called "gh pr comment"
 }
 
+# ---------- 机器上的全局 git 配置：不在指纹里，照样能让带凭据那一步替它跑命令 ----------
+#
+# 上面那份指纹只拍仓库自己那份 .git。验证命令还能写 $HOME/.gitconfig（全局）——
+# 不在指纹里，所以指纹照样通过；而全局配置里 url.<base>.insteadOf 配 ext:: 传输、
+# gpg.program、credential.helper、core.fsmonitor、filter.*.clean 每一个都会让 git
+# 去跑一条外部命令，于是带凭据那一步替它跑，两把钥匙一把不少。逐条列键名堵没有
+# 尽头，所以守的是「带凭据那几条 git 命令不读机器上任何一份配置文件」：
+# GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM 指到空文件，真正需要的 safe.directory 在
+# 命令行上显式给回去。
+
+# 把 $HOME 换成测试自己的，全局配置写这里，不碰跑测试这台机器上的真配置。
+isolate_global_gitconfig() {
+  export HOME="$BATS_TEST_TMPDIR/home"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export GLOBAL_GITCONFIG="$HOME/.gitconfig"
+  mkdir -p "$XDG_CONFIG_HOME/git"
+  : >"$GLOBAL_GITCONFIG"
+}
+
+# 被执行 = 当场把两把钥匙写进战利品文件。文件存在 = 它真跑了。
+plant_payload() {
+  export PAYLOAD="$BATS_TEST_TMPDIR/payload.sh"
+  {
+    echo '#!/bin/sh'
+    printf 'loot=%s/payload-loot.txt\n' "$BATS_TEST_TMPDIR"
+    echo 'git config --local --get http.https://github.com/.extraheader >"$loot" 2>/dev/null || echo no-cred >"$loot"'
+    echo 'echo "GH_TOKEN=$GH_TOKEN" >>"$loot"'
+  } >"$PAYLOAD"
+  chmod +x "$PAYLOAD"
+}
+
+payload_loot() {
+  cat "$BATS_TEST_TMPDIR/payload-loot.txt" 2>/dev/null || true
+}
+
+# url.<origin>.insteadOf 把 origin 重写到 ext:: 上，ext 传输会去跑那条外部命令 ——
+# 直接打在带凭据的 push 上，是这一类里最好用的一条。
+@test "takeover: a global git config the verify command writes runs nothing in the credentialed step" {
+  isolate_global_gitconfig
+  plant_payload
+  export ORIGIN_URL="$BATS_TEST_TMPDIR/origin.git"
+  push_workspace 'printf "[protocol \"ext\"]\n\tallow = always\n[url \"ext::%s\"]\n\tinsteadOf = %s\n" "$PAYLOAD" "$ORIGIN_URL" >"$GLOBAL_GITCONFIG"'
+
+  run verify_and_push
+
+  # 战利品先断：撤掉防线时，失败信息里直接就是被捞走的那两把钥匙
+  assert_equal "$(payload_loot)" ''
+  assert_equal "$status" 0
+  # 指纹这一关它本来就过得去：仓库自己那份 .git 一个字没动
+  assert_equal "$(git status --porcelain .git 2>/dev/null)" ''
+  # 提交推送照旧走到真 origin，这一道不能靠「什么都没发生」通过
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  assert_equal "$(git show HEAD:app.txt)" 'v2 fixed by codex'
+}
+
+# 换一个键，证明堵的是整个作用域而不是 url.insteadOf 这一条：commit.gpgsign +
+# gpg.program 让 git commit 去跑指定的程序。
+@test "takeover: a global gpg.program the verify command writes never runs either" {
+  isolate_global_gitconfig
+  plant_payload
+  push_workspace 'printf "[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = %s\n" "$PAYLOAD" >"$GLOBAL_GITCONFIG"'
+
+  run verify_and_push
+
+  assert_equal "$(payload_loot)" ''
+  assert_equal "$status" 0
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  assert_equal "$(git show HEAD:app.txt)" 'v2 fixed by codex'
+}
+
+# ext:: 在仓库自己那份配置里也堵着。指纹只在「验证期间被改过」时才红，所以这一道
+# 同样要单独立得住 —— 跟种钩子那两条一样，只跑带凭据那一步。
+@test "takeover: the credentialed step refuses the ext transport from the repo's own config too" {
+  plant_payload
+  push_workspace 'true'
+  printf '[protocol "ext"]\n\tallow = always\n[url "ext::%s"]\n\tinsteadOf = %s\n' \
+    "$PAYLOAD" "$BATS_TEST_TMPDIR/origin.git" >>.git/config
+
+  commit_with_planted_hook
+
+  assert_equal "$(payload_loot)" ''
+  # 红着停下，不是偷偷推到别处：origin 还停在 base
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  [ "$status" -ne 0 ] || { echo 'expected the credentialed step to fail loudly' >&2; return 1; }
+}
+
+# ---------- 验证留下的活进程，不许活到凭据回来 ----------
+#
+# 验证命令可以 fork 一个进程再让自己退出。指纹和废纸篓文件都不杀进程，那个进程
+# 活到「凭据塞回 .git/config」和下一步导出 GH_TOKEN 的时候还在，同一个用户，轮询
+# 就能把钥匙捞走。守的是：验证跑完连整个进程组一起收掉，收干净之前不许把凭据塞
+# 回去。探针盯着 .git/config，一看到凭据回来就抄走 —— 战利品不存在 = 它在凭据回
+# 来之前就被收掉了。循环有上限，万一收不掉也不会把测试挂死。
+leftover_probe() { # leftover_probe [收到 TERM 不退的写法]
+  printf 'cfg="$PWD/.git/config"
+loot=%s/payload-loot.txt
+( %s
+  i=0
+  while [ "$i" -lt 20000 ]; do
+    if grep -q extraheader "$cfg" 2>/dev/null; then cp "$cfg" "$loot"; exit 0; fi
+    i=$((i + 1))
+  done ) >/dev/null 2>&1 &
+echo "$!" >%s/leftover.pid
+' "$BATS_TEST_TMPDIR" "${1:-}" "$BATS_TEST_TMPDIR"
+}
+
+leftover_state() {
+  local pid
+  pid="$(cat "$BATS_TEST_TMPDIR/leftover.pid")"
+  if kill -0 "$pid" 2>/dev/null; then echo alive; else echo gone; fi
+}
+
+@test "takeover: a process the verify command leaves behind never sees the credentials return" {
+  push_workspace "$(leftover_probe)"
+
+  run verify_and_push
+
+  assert_equal "$(payload_loot)" ''
+  assert_equal "$(leftover_state)" gone
+  assert_equal "$status" 0
+  # 链条本身照旧，这一道不能靠「整条链红了」通过
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
+# TERM 扛得住就升级到 KILL：一个 trap '' TERM 的进程不该把这一道糊弄过去。
+@test "takeover: a leftover that ignores SIGTERM is gone before the credentials return as well" {
+  push_workspace "$(leftover_probe "trap '' TERM")"
+
+  run verify_and_push
+
+  assert_equal "$(payload_loot)" ''
+  assert_equal "$(leftover_state)" gone
+  assert_equal "$status" 0
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
 # ---------- 谁来下结论 ----------
 
 # 这一步在 review_fixer 允许换人时把结论让给 Decide the takeover。

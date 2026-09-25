@@ -745,10 +745,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 这一步跑完被审 PR 自己的命令之后还要接着用 git，所以它跟下一步同一个
+          # 规矩：只认我们在命令行上给的那几项，机器上任何一份 git 配置文件都不
+          # 作数（为什么是整个作用域关掉而不是逐条堵键名，见下一步同名的 sealed_git）。
+          # 两步各定义一份、不抽成共享文件：$RUNNER_TEMP 验证命令写得动，把 helper
+          # 放那儿等于请它改写我们自己的防线。空目录 / 空文件都用 mktemp 现开 ——
+          # 名字带 $$ 的固定套路，验证命令可以照着一段 pid 提前把钩子种进去等我们。
+          empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
+          empty_config="$(mktemp "$RUNNER_TEMP/no-gitconfig-XXXXXX")"
+          sealed_git() {
+            GIT_CONFIG_GLOBAL="$empty_config" GIT_CONFIG_SYSTEM="$empty_config" GIT_CONFIG_NOSYSTEM=1 \
+              git -c "core.hooksPath=$empty_hooks" \
+                  -c protocol.ext.allow=never \
+                  -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
+          }
+
           # 喂给 Codex 的那份意见带 run id、又在 .git/info/exclude 里，
           # git status 和 git add 都看不见它，不需要在这里清理。
 
-          if [ -z "$(git status --porcelain)" ]; then
+          if [ -z "$(sealed_git status --porcelain)" ]; then
             echo 'changed=false' >>"$GITHUB_OUTPUT"
             echo '- Codex changed no files' >>"$GITHUB_STEP_SUMMARY"
             exit 0
@@ -762,13 +777,13 @@ jobs:
           # 先入暂存区再验证：验证会造出 .venv / node_modules / __pycache__，
           # 验证后才 add 就可能把它们一起提交（仓库没写 .gitignore 时必然发生）。
           # 暂存区在验证前就定死 = 提交的正好是 Codex 改出来的那些文件。
-          git add -A
+          sealed_git add -A
 
           # actions/checkout 把写权限凭据持久化在 .git/config 里，它跟令牌一样能
           # 换来仓库写权限，所以验证前摘掉、跑完还回来，只留给下一步 push 用。
           cred_header=''
-          if cred_header="$(git config --local --get http.https://github.com/.extraheader)"; then
-            git config --local --unset-all http.https://github.com/.extraheader
+          if cred_header="$(sealed_git config --local --get http.https://github.com/.extraheader)"; then
+            sealed_git config --local --unset-all http.https://github.com/.extraheader
           fi
 
           # runner 的文件命令通道同样不能交给它：往 $GITHUB_PATH 追一个自带假 gh
@@ -790,10 +805,13 @@ jobs:
           # 就变成两个值 —— 那也是一处差异，照样红。
           # 指纹不经过 git 算：要比对的正是 git 的配置，拿 git 去读它，被种下的配置
           # 就有机会插手。sha256sum 在 runner 上，shasum 在 macOS 上（本机跑测试）。
+          # 指纹只管仓库自己那份 .git —— 机器上的全局 / 系统配置不进指纹（那会让
+          # 「测试套件顺手动了全局 git 配置」的调用方仓库整轮变红），改由 sealed_git
+          # 把那两个作用域整个关掉。
           sha256() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
           }
-          git_dir="$(git rev-parse --git-dir)"
+          git_dir="$(sealed_git rev-parse --git-dir)"
           git_state_digest() {
             {
               sha256 <"$git_dir/config"
@@ -812,14 +830,57 @@ jobs:
           }
           git_state_before="$(git_state_digest)"
 
-          verify_status=0
+          # 验证命令跑在它自己的进程组里：set -m 让后台任务另起一组（组号 = 该任务
+          # 的 pid），跑完才能 kill -- -组号 连整组一起收掉。它可以 fork 一个进程再让
+          # 自己退出 —— 指纹和废纸篓文件都不杀进程，那个进程活到「凭据塞回 .git/config」
+          # 和下一步导出 GH_TOKEN 的时候，同一个用户，轮询就能把钥匙捞走。
+          # stdin 接 /dev/null：后台进程组读终端会吃 SIGTTIN 停住。
+          set -m
           env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
               GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
-              bash -euo pipefail -c "$VERIFY" || verify_status=$?
+              bash -euo pipefail -c "$VERIFY" </dev/null &
+          verify_pgid=$!
+          set +m
+          verify_status=0
+          wait "$verify_pgid" || verify_status=$?
 
           : >"$GITHUB_ENV"
           : >"$GITHUB_OUTPUT"
           [ -z "${GITHUB_PATH:-}" ] || : >"$GITHUB_PATH"
+
+          # 组里还活着的进程。僵尸不算：它已经死了，只是还没被收尸。
+          verify_survivors() {
+            ps -e -o pgid=,pid=,stat= 2>/dev/null |
+              awk -v g="$verify_pgid" '$1 == g && $3 !~ /^Z/ { print $2 }'
+          }
+
+          # 先礼后兵：TERM 收不掉的（trap '' TERM 就能扛住）再 KILL。收干净之前
+          # 不许往下走 —— 下面第一件事就是把凭据塞回 .git/config。
+          reap_verify_group() {
+            local sig waited
+            for sig in TERM KILL; do
+              [ -n "$(verify_survivors)" ] || return 0
+              kill -"$sig" -- "-$verify_pgid" 2>/dev/null || true
+              waited=0
+              while [ "$waited" -lt 20 ] && [ -n "$(verify_survivors)" ]; do
+                sleep 0.1
+                waited=$((waited + 1))
+              done
+            done
+            [ -z "$(verify_survivors)" ]
+          }
+
+          # ps 用不了就等于这一道什么都没做 —— 静默的 no-op 比没有更糟，所以红着停下。
+          if ! ps -p "$$" >/dev/null 2>&1; then
+            echo '::error::ps is unavailable; cannot prove the verify command left no live process behind'
+            exit 1
+          fi
+
+          if ! reap_verify_group; then
+            echo '- verification: **rejected**, it left a process running' >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::the verify command left live processes behind ($(verify_survivors | tr '\n' ' ')); refusing to restore the credentials"
+            exit 1
+          fi
 
           # 这一比对必须排在「把凭据塞回去」之前：凭据一回到 .git/config，下一步就
           # 有了两把写权限钥匙，种下去的东西也就有人替它跑了。
@@ -829,7 +890,7 @@ jobs:
             exit 1
           fi
 
-          [ -z "$cred_header" ] || git config --local http.https://github.com/.extraheader "$cred_header"
+          [ -z "$cred_header" ] || sealed_git config --local http.https://github.com/.extraheader "$cred_header"
 
           if [ "$verify_status" -ne 0 ]; then
             echo '- verification: **failed**, nothing was pushed' >>"$GITHUB_STEP_SUMMARY"
@@ -842,7 +903,7 @@ jobs:
           # 而上面那次 add 发生在验证之前，这些差异会被 commit 静默丢掉，推出去的
           # 是一棵从没被测过的树。`-u` 只更新已经在索引里的路径，所以验证顺手造出来
           # 的 .venv / node_modules / __pycache__ 仍然进不来：它们从没进过索引。
-          git add -u
+          sealed_git add -u
 
           echo 'changed=true' >>"$GITHUB_OUTPUT"
 
@@ -859,21 +920,34 @@ jobs:
         run: |
           set -euo pipefail
 
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # 这一步手上同时有 GH_TOKEN 和 checkout 留在 .git/config 里的凭据，所以它
+          # 只信我们在命令行上给的那几项配置：上一步跑的是被审 PR 自己的代码，它能往
+          # .git/hooks 种钩子、往 .git/config 写 core.hooksPath 把钩子指到别处，也能写
+          # 机器上的全局配置（$HOME/.gitconfig 不在上一步的指纹里 —— 指纹只拍仓库自己
+          # 那份 .git）。全局配置里 url.<base>.insteadOf 配 ext:: 传输、credential.helper
+          # （! 开头就是 shell）、gpg.program、core.fsmonitor、filter.*.clean，每一个都
+          # 会让 git 去跑一条外部命令。逐条列键名堵就是把「跟着复审意见一条条追」换个
+          # 地方重演，所以按作用域整个关掉：GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM 指到
+          # 空文件 = 全局 + 系统两份一起作废，命令行 -c 压得过仓库那份里的同名键。
+          # 代价是 actions/checkout 写在全局配置里的 safe.directory 也一起丢掉（自托管 /
+          # 容器 runner 上会炸），所以真正需要的那一项在命令行上显式补回来 —— 我们自己
+          # 给，别的一律不继承。protocol.ext.allow=never 是兜底，挡住仓库那份里的 ext::。
+          # --no-verify 挡不住 post-commit，所以不靠它。
+          empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
+          empty_config="$(mktemp "$RUNNER_TEMP/no-gitconfig-XXXXXX")"
+          sealed_git() {
+            GIT_CONFIG_GLOBAL="$empty_config" GIT_CONFIG_SYSTEM="$empty_config" GIT_CONFIG_NOSYSTEM=1 \
+              git -c "core.hooksPath=$empty_hooks" \
+                  -c protocol.ext.allow=never \
+                  -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
+          }
 
-          # 这两条命令手上同时有 GH_TOKEN 和 checkout 留在 .git/config 里的凭据，
-          # 所以它们必须免疫仓库本地配置：上一步跑的是被审 PR 自己的代码，它能往
-          # .git/hooks 种钩子，也能往 .git/config 写 core.hooksPath 把钩子指到别处。
-          # 命令行 -c 压得过任何配置文件里的同名键，指到一个空目录 = 两种种法一起
-          # 失效。--no-verify 挡不住 post-commit 这类，所以不靠它。上一步的快照比对
-          # 是同一件事的另一半：它覆盖整类，这一道只覆盖钩子。
-          empty_hooks="$RUNNER_TEMP/no-hooks-$$"
-          mkdir -p "$empty_hooks"
+          sealed_git config user.name 'github-actions[bot]'
+          sealed_git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          git -c "core.hooksPath=$empty_hooks" commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
-          git -c "core.hooksPath=$empty_hooks" push -q origin "HEAD:$HEAD_REF"
-          new_head="$(git rev-parse HEAD)"
+          sealed_git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
+          sealed_git push -q origin "HEAD:$HEAD_REF"
+          new_head="$(sealed_git rev-parse HEAD)"
           echo 'pushed=true' >>"$GITHUB_OUTPUT"
           echo '- verification: passed, the fix was pushed' >>"$GITHUB_STEP_SUMMARY"
 
