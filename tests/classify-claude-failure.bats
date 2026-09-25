@@ -129,23 +129,36 @@ why() {
   assert_equal "$(verdict "$out")" business
 }
 
+# 下面这几段文字原来挂在 `<subtype> <is_error> ` 前缀后面断言 quota —— 那个位置
+# 放的是模型写的 `.result`，留着等于认可「散文可以买到一次换人」，跟本轮要堵的洞
+# 是同一件事（MEL-250 第 2 轮）。证据因此搬到 runner 写的裸行上：runner 从
+# execution_file 的 api_error_status 把状态码单独写成一行（Decide the takeover），
+# 真的 provider 失败照样认得出来，只是来源换成了模型伪造不了的那个。
+
 @test "a structured API error body still counts as a provider failure" {
-  out="$(classify 'error_during_execution true API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"too many requests"}}')"
+  out="$(classify 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"too many requests"}}')"
   assert_equal "$(verdict "$out")" quota
 }
 
+@test "the same API error body inside the model's summary is not evidence" {
+  out="$(classify 'error_during_execution true API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}')"
+  assert_equal "$(verdict "$out")" business
+}
+
 @test "the provider being overloaded still counts as a provider failure" {
-  out="$(classify 'error_during_execution true API Error: 503 upstream connect error')"
+  out="$(classify 'API Error: 503 upstream connect error')"
   assert_equal "$(verdict "$out")" quota
 }
 
 @test "an exhausted credit balance counts as a provider failure" {
-  out="$(classify 'error_during_execution true Your credit balance is too low to access the Anthropic API')"
+  out="$(classify 'Your credit balance is too low to access the Anthropic API')"
   assert_equal "$(verdict "$out")" quota
   assert_contains "$(why "$out")" 'credit balance is too low'
 }
 
-@test "a provider marker on any line of a multi-line verdict still counts" {
+@test "the usage-limit sentinel counts on a later line too" {
+  # 这一种是例外：固定的一整句、独占一行才算 —— 有多个终态对象时它不一定排在
+  # 第一行，所以不能只看前导裸行。
   out="$(printf 'error_during_execution true I started on the failing test\nerror_during_execution true Claude AI usage limit reached|1756089600\n' | "$SCRIPTS/classify-claude-failure.sh")"
   assert_equal "$(verdict "$out")" quota
 }
@@ -199,4 +212,48 @@ why() {
     out="$(classify "error_during_execution true $sentence")"
     assert_equal "$(verdict "$out")" business
   done
+}
+
+# ---------------------------------------------------------------------------
+# 模型写的总结跨多行时，散文照样不能买到一次换人（MEL-250 第 2 轮）。
+#
+# 调用方把每个终态对象拼成 `<subtype> <is_error> <result 的第一行>` 一行，
+# `.result` 的第 2 行起原样跟在后面、不带任何前缀 —— markdown 小结、分条列举
+# 都是常态。所以「锚到行首」还不够：新起的那一行只要正好以额度报错的字样开头
+# 就照样命中，一次本该打红的业务失败又被判成额度耗尽、换人再改一轮。
+# 可信的额度证据只有 runner 自己从结构化字段读出来写的裸行。
+# ---------------------------------------------------------------------------
+
+@test "a later line of a multi-line summary starting with API Error is business" {
+  out="$(printf '%s\n' \
+    'error_during_execution true I could not fix the failing test.' \
+    'API Error: 429 is what the mock is supposed to raise, and the assertion still fails.' \
+    'Giving up after 3 attempts.' | "$SCRIPTS/classify-claude-failure.sh")"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "a later line of a multi-line summary starting with overloaded_error is business" {
+  out="$(printf '%s\n' \
+    'error_during_execution true Could not get the suite green.' \
+    'overloaded_error is the case the new test covers; my handler still returns 500.' \
+    | "$SCRIPTS/classify-claude-failure.sh")"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "a multi-line summary whose own first line starts with a marker is business" {
+  # 第一行也是模型写的散文，只是被拼上了调用方的前缀 —— 同样不算证据。
+  out="$(printf '%s\n' \
+    'error_during_execution true API Error: 429 is what the mock raises on purpose' \
+    'and the assertion still fails.' | "$SCRIPTS/classify-claude-failure.sh")"
+  assert_equal "$(verdict "$out")" business
+}
+
+@test "the runner's own structured line outranks the prose that follows it" {
+  # runner 把 SDK 判定的状态码写成裸行放在最前面（Decide the takeover 干的），
+  # 那一行是唯一伪造不了的额度证据，后面跟着多行散文也不影响。
+  out="$(printf '%s\n' \
+    'API Error: 429' \
+    'error_during_execution true I could not fix the failing test.' \
+    'the mock raises it on purpose.' | "$SCRIPTS/classify-claude-failure.sh")"
+  assert_equal "$(verdict "$out")" quota
 }

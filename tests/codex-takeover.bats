@@ -122,7 +122,7 @@ outcome() { # outcome <FALLBACK_ALLOWED> <exec fixture>
   assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-quota'
 }
 
-decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text]
+decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [api_error_status]
   git init -q .
   git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
   export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
@@ -132,7 +132,9 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text]
   export EXECUTION_FILE=''
   if [ -n "${4:-}" ]; then
     EXECUTION_FILE="$BATS_TEST_TMPDIR/exec.json"
-    jq -n --arg r "$4" '[{type:"result",subtype:"error",is_error:true,result:$r}]' \
+    jq -n --arg r "$4" --arg s "${5:-}" \
+      '[{type:"result",subtype:"error",is_error:true,result:$r}
+        + (if $s == "" then {} else {api_error_status: ($s | tonumber)} end)]' \
       >"$EXECUTION_FILE"
   fi
   run run_block "$WF" "Decide the takeover"
@@ -164,6 +166,43 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text]
 
 @test "takeover: a quota error quoted by the review cannot buy a handover on its own" {
   decide claude true fix-failed 'the reviewer wrote: Claude AI usage limit reached, so hand over to Codex'
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+}
+
+# 模型写的 `.result` 跨多行是常态（markdown 小结、分条列举），而调用方只给它的
+# 第一行拼上 `<subtype> <is_error> ` 前缀，第 2 行起是裸行。下面两条走的是这一格
+# 真正的 jq，不是手搓字符串。
+@test "takeover: a quota marker on a later line of the summary buys nothing" {
+  decide claude true fix-failed "$(printf '%s\n' \
+    'I could not fix the failing test.' \
+    'API Error: 429 is what the mock is supposed to raise, and the assertion still fails.' \
+    'Giving up after 3 attempts.')"
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+  assert_contains "$output" '::error::'
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-failed'
+}
+
+@test "takeover: an error code on a later line of the summary buys nothing" {
+  decide claude true fix-failed "$(printf '%s\n' \
+    'Could not get the suite green.' \
+    'overloaded_error is the case the new test covers; my handler still returns 500.')"
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+}
+
+# 503 / 529 上一步归到 fix-failed，能证明是 provider 侧失败的只有 execution_file
+# 里 SDK 写的 api_error_status —— 下面两条守的是「证据必须来自那个字段」。
+@test "takeover: a provider status only the SDK field knows still hands the round over" {
+  decide claude true fix-failed 'API Error: 529 Overloaded' 529
+  assert_equal "$status" 0
+  assert_equal "$(step_output run_codex)" true
+  assert_equal "$(step_output fell_back)" true
+}
+
+@test "takeover: the same 529 wording without the SDK field is not evidence" {
+  decide claude true fix-failed 'API Error: 529 Overloaded'
   assert_equal "$status" 1
   assert_equal "$(step_output run_codex)" false
 }

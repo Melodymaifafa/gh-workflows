@@ -555,8 +555,11 @@ jobs:
             # 只把「这次运行的终态字段」喂给分类器，绝不喂整份对话记录：记录里
             # 原样带着 Codex 的 review 正文（外部输入），照抄一句额度报错就能骗
             # 出一次换人，而接手的那个 token 有写权限。
-            # SDK 已经认定的原因单独写一行，让结构化判据压过模型写的自然语言：
-            # 429 / 401 是 runner 从 execution_file 的字段里读出来的，伪造不了。
+            # SDK 已经认定的原因先写成裸行，让结构化判据压过模型写的自然语言：
+            # 状态码是 runner 从 execution_file 的字段里读出来的，伪造不了。分类器
+            # 只信这一段前导裸行，从下面那条带 `<subtype> <is_error> ` 前缀的行起
+            # 全按散文看 —— 模型的总结跨多行是常态，第 2 行起没有前缀，谁都能以
+            # 一句额度报错开头。
             diag="$RUNNER_TEMP/claude-failure.txt"
             : >"$diag"
             case "${OUTCOME_REASON:-}" in
@@ -564,6 +567,11 @@ jobs:
               auth) echo 'API Error: 401' >>"$diag" ;;
             esac
             if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+              # 503 / 529 上一步归到 fix-failed，只有 api_error_status 能证明它是
+              # provider 侧失败；不补这一行，它就只能靠模型散文被认出来。
+              jq -r '[.. | objects | select(.type? == "result") | .api_error_status | numbers]
+                     | last // empty | "API Error: \(.)"' \
+                 "$EXECUTION_FILE" >>"$diag" 2>/dev/null || true
               jq -r '[.. | objects | select(.type? == "result")]
                      | map([.subtype, (.is_error | tostring), .result] | join(" "))
                      | join("\n")' "$EXECUTION_FILE" >>"$diag" 2>/dev/null || true
