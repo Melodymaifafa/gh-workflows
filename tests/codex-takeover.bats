@@ -164,6 +164,26 @@ git config --local --get http.https://github.com/.extraheader >>"$BATS_TEST_TMPD
   assert_equal "$(step_output pushed)" true
 }
 
+# 提交的必须是验过的那棵树：验证自己会改被跟踪的文件（uv sync --dev 重写
+# uv.lock），同时造出不该提交的垃圾目录。两个性质得同时成立。
+@test "takeover: the commit carries the tree the verification actually ran on" {
+  push_workspace 'printf "lock v2\n" >deps.lock
+mkdir -p .venv && printf "junk\n" >.venv/pyvenv.cfg
+printf "cached\n" >stray.pyc'
+
+  run run_block "$WF" "Verify, commit and push the Codex fix"
+
+  assert_equal "$status" 0
+  assert_equal "$(git show HEAD:deps.lock)" 'lock v2'
+  assert_equal "$(git show HEAD:app.txt)" 'v2 fixed by codex'
+  tree="$(git ls-tree -r --name-only HEAD)"
+  refute_contains "$tree" '.venv'
+  refute_contains "$tree" 'stray.pyc'
+  refute_contains "$tree" '.review'
+  # 推出去的和本地提交的是同一棵
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
 @test "takeover: a failing verification pushes nothing" {
   push_workspace 'exit 3'
 

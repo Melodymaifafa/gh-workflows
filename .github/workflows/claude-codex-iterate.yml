@@ -786,6 +786,13 @@ jobs:
             exit 1
           fi
 
+          # 提交的必须是验过的那棵树。验证本身会改被跟踪的文件 —— `uv sync --dev`
+          # 默认就重写 uv.lock（`--frozen` 才不写），npm ci 重写 package-lock.json ——
+          # 而上面那次 add 发生在验证之前，这些差异会被 commit 静默丢掉，推出去的
+          # 是一棵从没被测过的树。`-u` 只更新已经在索引里的路径，所以验证顺手造出来
+          # 的 .venv / node_modules / __pycache__ 仍然进不来：它们从没进过索引。
+          git add -u
+
           git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
           git push -q origin "HEAD:$HEAD_REF"
           new_head="$(git rev-parse HEAD)"
