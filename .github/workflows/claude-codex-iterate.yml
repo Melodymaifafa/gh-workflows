@@ -749,12 +749,18 @@ jobs:
           # 规矩：只认我们在命令行上给的那几项，机器上任何一份 git 配置文件都不
           # 作数（为什么是整个作用域关掉而不是逐条堵键名，见下一步同名的 sealed_git）。
           # 两步各定义一份、不抽成共享文件：$RUNNER_TEMP 验证命令写得动，把 helper
-          # 放那儿等于请它改写我们自己的防线。空目录 / 空文件都用 mktemp 现开 ——
-          # 名字带 $$ 的固定套路，验证命令可以照着一段 pid 提前把钩子种进去等我们。
+          # 放那儿等于请它改写我们自己的防线。
+          # 同理，那份「空配置」不能是文件：文件写在哪儿验证命令都写得动，放
+          # $RUNNER_TEMP 更是名字前缀固定、一个 glob 就找得到，它往里写一行
+          # core.fsmonitor（或 filter.*.clean），下面凭据塞回去之后那次 add -u 就
+          # 替它跑了 —— 而 .git 一个字没动，指纹照样通过。/dev/null 永远读得到、
+          # 永远是空的，也不是它改得动的东西。
+          # 空钩子目录只能是真目录（core.hooksPath 得指到一个存在的目录），所以
+          # 仍然 mktemp 现开；但验证命令跑完之后会换一个它从没见过的新目录，见
+          # 下面收完进程组那一段。
           empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
-          empty_config="$(mktemp "$RUNNER_TEMP/no-gitconfig-XXXXXX")"
           sealed_git() {
-            GIT_CONFIG_GLOBAL="$empty_config" GIT_CONFIG_SYSTEM="$empty_config" GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
               git -c "core.hooksPath=$empty_hooks" \
                   -c protocol.ext.allow=never \
                   -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
@@ -882,6 +888,11 @@ jobs:
             exit 1
           fi
 
+          # 收干净了才换钩子目录：验证命令看得见开头那个（$RUNNER_TEMP 下、名字前缀
+          # 固定），往里丢一个 post-index-change 就能让下面那次 add -u 替它跑。这个新
+          # 目录在它死透之后才存在，它没机会往里写东西。
+          empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
+
           # 这一比对必须排在「把凭据塞回去」之前：凭据一回到 .git/config，下一步就
           # 有了两把写权限钥匙，种下去的东西也就有人替它跑了。
           if [ "$(git_state_digest)" != "$git_state_before" ]; then
@@ -928,15 +939,16 @@ jobs:
           # （! 开头就是 shell）、gpg.program、core.fsmonitor、filter.*.clean，每一个都
           # 会让 git 去跑一条外部命令。逐条列键名堵就是把「跟着复审意见一条条追」换个
           # 地方重演，所以按作用域整个关掉：GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM 指到
-          # 空文件 = 全局 + 系统两份一起作废，命令行 -c 压得过仓库那份里的同名键。
+          # /dev/null = 全局 + 系统两份一起作废，命令行 -c 压得过仓库那份里的同名键。
+          # 指到 /dev/null 而不是 mktemp 出来的空文件：文件放哪儿上一步那条验证命令
+          # 都写得动，$RUNNER_TEMP 下更是一个 glob 就找得到；/dev/null 它改不了。
           # 代价是 actions/checkout 写在全局配置里的 safe.directory 也一起丢掉（自托管 /
           # 容器 runner 上会炸），所以真正需要的那一项在命令行上显式补回来 —— 我们自己
           # 给，别的一律不继承。protocol.ext.allow=never 是兜底，挡住仓库那份里的 ext::。
           # --no-verify 挡不住 post-commit，所以不靠它。
           empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
-          empty_config="$(mktemp "$RUNNER_TEMP/no-gitconfig-XXXXXX")"
           sealed_git() {
-            GIT_CONFIG_GLOBAL="$empty_config" GIT_CONFIG_SYSTEM="$empty_config" GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
               git -c "core.hooksPath=$empty_hooks" \
                   -c protocol.ext.allow=never \
                   -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"

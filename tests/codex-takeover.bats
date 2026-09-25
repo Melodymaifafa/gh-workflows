@@ -461,6 +461,65 @@ payload_loot() {
   [ "$status" -ne 0 ] || { echo 'expected the credentialed step to fail loudly' >&2; return 1; }
 }
 
+# ---------- 我们自己给 git 备的那份「空设置」，不许被验证命令改写 ----------
+#
+# 上一条守的是「机器上的配置文件一律不读」。可我们自己塞给 git 的那份「空的」要是
+# 落成了文件，就轮到它被改写：文件写在哪儿验证命令都够得着，$RUNNER_TEMP 下名字
+# 前缀还固定，一个 for 循环就找得到。改写进去的 core.fsmonitor 会被「凭据塞回
+# .git/config 之后」那次 add -u 执行，而 .git 一个字没动，指纹照样通过。钩子目录
+# 同理：验证命令往里丢一个 post-index-change，同一次 add -u 就替它跑了。
+# 守的是：配置是 /dev/null（改不了），钩子目录等验证命令死透之后才换成新的。
+
+@test "takeover: the verify command cannot rewrite the blank git config the credentialed commands run with" {
+  plant_payload
+  push_workspace 'for f in "$RUNNER_TEMP"/no-gitconfig-*; do
+  [ -f "$f" ] || continue
+  printf "[core]\n\tfsmonitor = %s\n" "$PAYLOAD" >"$f"
+done
+for d in "$RUNNER_TEMP"/no-hooks-*; do
+  [ -d "$d" ] || continue
+  cp "$PAYLOAD" "$d/post-index-change"
+done'
+
+  run verify_and_push
+
+  # 战利品先断：防线撤掉时，失败信息里直接就是被捞走的那把钥匙
+  assert_equal "$(payload_loot)" ''
+  assert_equal "$status" 0
+  # 它本来就绕过了指纹：动的是我们自己那份空设置，仓库 .git 一个字没改
+  refute_contains "$output" 'the verify command modified .git'
+  # 提交推送照旧，这一道不能靠「整条链红了」通过
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  assert_equal "$(git show HEAD:app.txt)" 'v2 fixed by codex'
+}
+
+# 承上：改写空设置换来的是「指纹已经过去之后」的任意命令执行。那一刻往仓库自己
+# 那份 .git/config 写 core.fsmonitor，下一步带凭据的 commit 就替它跑 —— sealed_git
+# 封的是全局/系统两个作用域，仓库本地那份封不了，-c 也没盖 core.fsmonitor。所以
+# 第二段拿到的是 GH_TOKEN（只有带凭据那一步的 env: 里有它），两把钥匙一把不少。
+# 第一段跑不起来，第二段就无从谈起。
+@test "takeover: the two-stage route into the credentialed step is dead once the blank config is out of reach" {
+  plant_payload
+  export STAGE1="$BATS_TEST_TMPDIR/stage1.sh"
+  {
+    echo '#!/bin/sh'
+    printf 'git config --local core.fsmonitor "%s"\n' "$PAYLOAD"
+  } >"$STAGE1"
+  chmod +x "$STAGE1"
+  push_workspace 'for f in "$RUNNER_TEMP"/no-gitconfig-*; do
+  [ -f "$f" ] || continue
+  printf "[core]\n\tfsmonitor = %s\n" "$STAGE1" >"$f"
+done'
+
+  run verify_and_push
+
+  assert_equal "$(payload_loot)" ''
+  assert_equal "$status" 0
+  # 第一段没跑 = 仓库自己那份配置压根没被写过
+  assert_equal "$(git config --local --get core.fsmonitor || echo none)" 'none'
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
 # ---------- 验证留下的活进程，不许活到凭据回来 ----------
 #
 # 验证命令可以 fork 一个进程再让自己退出。指纹和废纸篓文件都不杀进程，那个进程
