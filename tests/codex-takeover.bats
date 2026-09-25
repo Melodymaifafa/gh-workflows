@@ -820,6 +820,33 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   assert_equal "$(step_output run_codex)" true
 }
 
+# 上一条的放行范围只该盖住 Gate 每轮自己写的那一份 findings.md。放行整个
+# .review/ 时，调用方在同一个目录下跟踪的别的文件就跟着一起被放过去 ——
+# Claude 撞额度前改过它，这道闸门看不见，换人后交接那步的 reset --hard 把它
+# 静默丢掉，这一轮还以 Codex 的名义报成功。正是本条闸门要堵的失败形态。
+@test "takeover: a caller's other tracked file under .review still blocks the handover" {
+  decide claude true fix-quota 'API Error: 429 rate_limit_error'
+  assert_equal "$status" 0
+
+  mkdir -p .review
+  printf 'the prefetch target the caller also tracks\n' >.review/findings.md
+  printf 'a policy file the caller keeps next to it\n' >.review/policy.yml
+  git add .review/findings.md .review/policy.yml
+  git -c user.email=t@e -c user.name=t commit -q -m 'the caller tracks two files under .review'
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  # Gate 的预取盖在 findings.md 上（不算 Claude 写的），
+  # 而 policy.yml 是 Claude 断掉前改的（算）
+  printf '## 行内评论\n' >.review/findings.md
+  printf 'edited by Claude before it ran out of quota\n' >>.review/policy.yml
+
+  run run_block "$WF" "Decide the takeover"
+
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+  assert_contains "$output" 'left uncommitted edits'
+  assert_contains "$(fake_last_body "gh pr comment")" '没提交'
+}
+
 # ---------------------------------------------------------------------------
 # step 门禁（MEL-250 F1）
 #

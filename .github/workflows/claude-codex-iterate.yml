@@ -604,14 +604,18 @@ jobs:
               why="Claude already committed before failing ($failure_reason); a second fixer must not write the same round"
               fatal="$why"
               alert='Claude 修到一半断了，改动可能只推上去一半；请看一眼 PR 再决定。'
-            elif [ -n "$(git status --porcelain -- ':!.review')" ]; then
+            elif [ -n "$(git status --porcelain -- ':!.review/findings.md')" ]; then
               # 「Claude 已经写过这一轮」的另一种长相：改动还留在工作区、没提交。
               # 只看 HEAD 会把它放过去 —— 换人后 Hand the round over to Codex 的
               # reset --hard 把那些改动整个丢掉，Claude 改到哪一步没人知道，而
               # 这一轮还会以 Codex 的名义报成功。处置跟提交过那条一样：不换人、
               # 打红、发告警。
-              # .review/ 排掉：Gate 把这一轮的意见预取到那里，调用方仓库自己
-              # 跟踪了同名文件时它会显示成「被改过」，那不是 Claude 写的。
+              # 只排掉 .review/findings.md 这一个：Gate 每轮把意见预取到它，
+              # 调用方仓库自己跟踪了同名文件时它会显示成「被改过」，那不是
+              # Claude 写的。排掉整个 .review/ 不行 —— 调用方在同一个目录下
+              # 跟踪的别的文件会跟着被放过去，那些确实是 Claude 改的。未跟踪
+              # 的 .review/ 内容不需要排：Gate 已经把 .review/ 写进
+              # .git/info/exclude，porcelain 本来就不列它们。
               # 被 .gitignore 挡住的产物（.venv 之类）本来就不在 porcelain 里，
               # 也不该算 —— 它们是验证命令留下的，交接前的 clean -x 管着。
               fixer=claude
