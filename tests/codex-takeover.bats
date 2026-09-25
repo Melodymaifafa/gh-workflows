@@ -4,8 +4,8 @@
 # 「Claude 这轮没跑成」之后谁来下结论。守三件事：
 #   1. 拿不到 review 就红着停下 —— 空 review 会让 Codex 不改任何文件、job 打
 #      绿勾收工，链条静默停住。
-#   2. 交出去的是 Gate 预取的 .review/findings.md（已进 .git/info/exclude），
-#      不是调用方仓库根目录里一个写死的文件名。
+#   2. 交出去的是 Gate 预取的那份意见，不是调用方仓库里同名的文件 —— 交接前
+#      的 git reset --hard 恢复被跟踪文件，.git/info/exclude 挡不住它。
 #   3. 只有服务商侧失败才换人；业务失败红着停下，而且一定有人发告警。
 
 load test_helper/common
@@ -45,6 +45,7 @@ setup() {
 # Gate 之后的工作区：调用方仓库已经 checkout 好，意见预取在 .review/ 里，
 # 而 .review/ 已写进本地 exclude（Gate 那步干的，iterate-gate.bats 盯着）。
 handover_workspace() {
+  export RUN_SLUG=99-1
   git init -q .
   git config user.email t@e
   git config user.name t
@@ -77,9 +78,32 @@ handover_workspace() {
   run run_block "$WF" "Hand the round over to Codex"
 
   assert_equal "$status" 0
-  assert_equal "$(step_output file)" .review/findings.md
+  assert_equal "$(step_output file)" .review/findings-99-1.md
   assert_contains "$(cat codex-review-context.md)" 'already tracks'
-  assert_contains "$(cat .review/findings.md)" 'this swallows the error'
+  assert_contains "$(cat .review/findings-99-1.md)" 'this swallows the error'
+}
+
+# 预取的正文躺在调用方的工作副本里，而交接前要 git reset --hard 回起点。
+# .git/info/exclude 只挡 git add 和 git clean，挡不住 reset 恢复被跟踪文件：
+# 调用方仓库自己跟踪了一个 .review/findings.md 时，reset 会拿他们那份盖掉预取
+# 的那份，非空检查照样通过，Codex 对着一份跟本 PR 无关的内容改代码。
+@test "takeover: the caller's own tracked .review/findings.md cannot displace the prefetch" {
+  handover_workspace
+  printf 'a file the caller repo tracks under .review\n' >.review/findings.md
+  git add -f .review/findings.md
+  git commit -q -m 'the caller tracks .review/findings.md too'
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  # Gate 把本轮的意见预取进去，盖在被跟踪的那份上面
+  printf '## 行内评论\n\n- scripts/x.sh:12 — this swallows the error\n' >.review/findings.md
+
+  run run_block "$WF" "Hand the round over to Codex"
+
+  assert_equal "$status" 0
+  handed="$(step_output file)"
+  assert_contains "$(cat "$handed")" 'this swallows the error'
+  refute_contains "$(cat "$handed")" 'the caller repo tracks'
+  # 交出去的那份还必须是 git 看不见的，否则下一步 git add -A 会把它提交进 PR
+  assert_equal "$(git status --porcelain)" ''
 }
 
 @test "takeover: Claude's uncommitted leftovers never ship as a Codex fix" {
@@ -94,7 +118,7 @@ handover_workspace() {
   assert_contains "$(cat codex-review-context.md)" 'already tracks'
   refute_contains "$(cat codex-review-context.md)" 'half-finished'
   [ ! -e claude-wip.txt ]
-  [ -s .review/findings.md ]
+  [ -s .review/findings-99-1.md ]
 }
 
 # ---------- 谁来下结论 ----------

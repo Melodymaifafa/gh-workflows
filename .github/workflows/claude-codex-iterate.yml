@@ -652,21 +652,14 @@ jobs:
       - name: Hand the round over to Codex
         id: context
         if: steps.decide.outputs.run_codex == 'true'
+        env:
+          RUN_SLUG: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
-          # 一轮只允许一个 fixer 写 PR。Claude 可能在撞额度前已经改了工作区却
-          # 没提交（提交过的那种在上一步就拒绝换人了）。不清掉的话，下面的
-          # git add -A 会把它没验证完的半成品和 Codex 的改动一起当成「Codex 修
-          # 好了」推出去。.review/ 在 .git/info/exclude 里，git clean 不碰它。
-          git reset --quiet --hard "$BASE_SHA"
-          git clean -qfd
-
           # 不再自己拉一遍 review：Gate 那步已经把目标 review（正文 + 行内评论，
-          # HTML 注释已剥掉）预取进 .review/findings.md，并把 .review/ 写进
-          # .git/info/exclude，所以它既不会被 git add 进 PR，也不会撞上调用方
-          # 仓库里已跟踪的文件名。重复拉还会用错 review —— 巡检的重修请求指向
-          # 的是另一条 review，事件里的 id 不是要修的那条。
+          # HTML 注释已剥掉）预取进 .review/findings.md。重复拉还会用错 review ——
+          # 巡检的重修请求指向的是另一条 review，事件里的 id 不是要修的那条。
           #
           # 拿不到这份文件就红着停下。给 Codex 一份空 review 的后果是：它不改
           # 任何文件、job 打绿勾收工、链条静默停住，正是「不许把失败伪装成成功」
@@ -675,7 +668,29 @@ jobs:
             echo "::error::.review/findings.md is missing or empty; refusing to hand Codex an incomplete review"
             exit 1
           fi
-          printf 'file=%s\n' .review/findings.md >>"$GITHUB_OUTPUT"
+
+          # 预取的正文先挪出工作区。.git/info/exclude 只挡 git add 和 git clean，
+          # 挡不住 git reset --hard 恢复被跟踪文件：调用方仓库自己跟踪了一个
+          # .review/findings.md 时，下面这一下 reset 会拿他们那份盖掉预取的那份，
+          # 非空检查照样通过，Codex 拿到的是跟本 PR 无关的内容。
+          saved="$RUNNER_TEMP/codex-findings.md"
+          cp .review/findings.md "$saved"
+
+          # 一轮只允许一个 fixer 写 PR。Claude 可能在撞额度前已经改了工作区却
+          # 没提交（提交过的那种在上一步就拒绝换人了）。不清掉的话，下面的
+          # git add -A 会把它没验证完的半成品和 Codex 的改动一起当成「Codex 修
+          # 好了」推出去。
+          git reset --quiet --hard "$BASE_SHA"
+          git clean -qfd
+
+          # 交给 Codex 的那份换成带 run id 的名字再放回去，理由同「取脚本的落点
+          # 必须带 run id」：这个路径不可能是调用方已跟踪的文件，所以 reset 恢复
+          # 不了它、也没有同名文件被它顶掉；`.review/` 在 .git/info/exclude 里，
+          # 它照样进不了 git add、也不会被 git clean 扫走。
+          mkdir -p .review
+          findings=".review/findings-$RUN_SLUG.md"
+          cp "$saved" "$findings"
+          printf 'file=%s\n' "$findings" >>"$GITHUB_OUTPUT"
 
       - name: Codex fixes the PR
         id: codex
@@ -729,8 +744,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 喂给 Codex 的 .review/findings.md 已经在 .git/info/exclude 里，
-          # git add 看不见它，不需要在这里清理。
+          # 喂给 Codex 的那份意见带 run id、又在 .git/info/exclude 里，
+          # git status 和 git add 都看不见它，不需要在这里清理。
 
           if [ -z "$(git status --porcelain)" ]; then
             echo 'pushed=false' >>"$GITHUB_OUTPUT"
