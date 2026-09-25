@@ -819,8 +819,8 @@ reap_escaped() {
   # 验证命令先放一个假 ps，再把自己藏起来
   cat >"$BATS_TEST_TMPDIR/fake-ps.sh" <<'EOS'
 #!/bin/sh
-hide="$(cat "$ESCAPE_PID" 2>/dev/null || echo 0)"
-/bin/ps "$@" | awk -v h="$hide" '$1 != h'
+# 把自己那一窝从清点里抹掉，别的照原样输出 —— 清点于是「证明」了它不存在。
+/bin/ps "$@" | { grep -v escapee.sh || true; }
 EOS
   push_workspace "cp $BATS_TEST_TMPDIR/fake-ps.sh $plantable/ps && chmod +x $plantable/ps && $ESCAPE_VERIFY"
 
