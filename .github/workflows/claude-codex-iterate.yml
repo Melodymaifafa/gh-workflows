@@ -731,16 +731,16 @@ jobs:
                  非提不可就放句尾括号，去掉括号后句子仍要通顺。
             4. 如果没有任何可采纳的建议，不要改文件，只输出一两句话说明原因。
 
-      - name: Verify, commit and push the Codex fix
-        id: codex_push
+      # 验证跑的是被审 PR 自己带的命令，所以它自成一步，而且这一步不挂任何令牌。
+      # 把令牌挂在 step 级 env 再用 `env -u` 在子进程里抹掉是不够的：父 shell 那份
+      # 环境还在，验证命令跟它同一个用户，/proc/$PPID/environ 原样读得回来。令牌
+      # 只出现在下一步（commit / push / 发评论）。验证只能在沙箱外跑：装依赖要联网，
+      # 放进 Codex 那边必挂。
+      - name: Verify the Codex fix
+        id: codex_verify
         if: steps.decide.outputs.run_codex == 'true'
         env:
           VERIFY: ${{ env.VERIFY_CMD }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          ROUND: ${{ steps.gate.outputs.round }}
         run: |
           set -euo pipefail
 
@@ -748,7 +748,7 @@ jobs:
           # git status 和 git add 都看不见它，不需要在这里清理。
 
           if [ -z "$(git status --porcelain)" ]; then
-            echo 'pushed=false' >>"$GITHUB_OUTPUT"
+            echo 'changed=false' >>"$GITHUB_OUTPUT"
             echo '- Codex changed no files' >>"$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -758,25 +758,34 @@ jobs:
             exit 1
           fi
 
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           # 先入暂存区再验证：验证会造出 .venv / node_modules / __pycache__，
           # 验证后才 add 就可能把它们一起提交（仓库没写 .gitignore 时必然发生）。
           # 暂存区在验证前就定死 = 提交的正好是 Codex 改出来的那些文件。
           git add -A
 
-          # 验证跑的是被审 PR 自己带的命令：npm ci 的生命周期钩子、pytest 插件、
-          # bats 脚本里的任意一行都能执行代码。所以跑它的时候环境里不留写权限 ——
-          # 带 contents:write 的 GH_TOKEN 不进这个子进程，actions/checkout 持久化
-          # 在 .git/config 里的凭证也先摘掉；两样都等验证跑完才回来，只给下面的
-          # push 和发评论用。验证只能在沙箱外跑：装依赖要联网，放进 Codex 那边必挂。
+          # actions/checkout 把写权限凭据持久化在 .git/config 里，它跟令牌一样能
+          # 换来仓库写权限，所以验证前摘掉、跑完还回来，只留给下一步 push 用。
           cred_header=''
           if cred_header="$(git config --local --get http.https://github.com/.extraheader)"; then
             git config --local --unset-all http.https://github.com/.extraheader
           fi
 
+          # runner 的文件命令通道同样不能交给它：往 $GITHUB_PATH 追一个自带假 gh
+          # 的目录，后面「召唤复审」那步就会跑那个假 gh —— 而那步带的是
+          # CODEX_TRIGGER_TOKEN。两道：子进程先拿到一组废纸篓文件；跑完再把真文件
+          # 清空，这样就算它从 /proc/$PPID/environ 摸回真路径写了东西，runner 在
+          # step 收尾时读到的也是空文件（最后写的是我们）。
+          decoy="$RUNNER_TEMP/verify-decoy-$$"
+          mkdir -p "$decoy"
+
           verify_status=0
-          env -u GH_TOKEN -u GITHUB_TOKEN bash -euo pipefail -c "$VERIFY" || verify_status=$?
+          env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
+              GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
+              bash -euo pipefail -c "$VERIFY" || verify_status=$?
+
+          : >"$GITHUB_ENV"
+          : >"$GITHUB_OUTPUT"
+          [ -z "${GITHUB_PATH:-}" ] || : >"$GITHUB_PATH"
 
           [ -z "$cred_header" ] || git config --local http.https://github.com/.extraheader "$cred_header"
 
@@ -792,6 +801,24 @@ jobs:
           # 是一棵从没被测过的树。`-u` 只更新已经在索引里的路径，所以验证顺手造出来
           # 的 .venv / node_modules / __pycache__ 仍然进不来：它们从没进过索引。
           git add -u
+
+          echo 'changed=true' >>"$GITHUB_OUTPUT"
+
+      # 令牌只在这一步出现。验证命令上一步就跑完了，碰不到这里的环境。
+      - name: Commit and push the Codex fix
+        id: codex_push
+        if: steps.codex_verify.outputs.changed == 'true'
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ROUND: ${{ steps.gate.outputs.round }}
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
           git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
           git push -q origin "HEAD:$HEAD_REF"

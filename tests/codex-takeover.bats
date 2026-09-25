@@ -123,7 +123,7 @@ handover_workspace() {
 
 # ---------- 验证、提交、推送 ----------
 
-# Verify, commit and push 那一步的工作区：一个带 origin 的真仓库，加上 Codex 刚
+# 验证那一步和随后 commit/push 那一步共用的工作区：一个带 origin 的真仓库，加上 Codex 刚
 # 改过的文件。VERIFY 是被审 PR 自己带的命令，这里换成探针，用来看它看得见什么。
 push_workspace() { # push_workspace <verify script>
   git init -q -b topic .
@@ -146,22 +146,97 @@ push_workspace() { # push_workspace <verify script>
   export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
 }
 
+# 验证跑完接着提交推送，两步连起来跑。
+verify_and_push() {
+  run_step "$WF" "Verify the Codex fix" &&
+    run_step "$WF" "Commit and push the Codex fix"
+}
+
+# 令牌只在子进程里被 env -u 抹掉是不够的：父 shell 那份环境还在，验证命令跟它
+# 同一个用户，/proc/$PPID/environ 原样读得回来。所以真正要守的性质是「跑验证的
+# 那一步，自己的 env: 里根本没有令牌」—— 把令牌挪回去再 env -u 抹掉，这条就红。
+@test "takeover: the step that runs the PR's verify command declares no token at all" {
+  keys="$(step_env_keys "$WF" 'Verify the Codex fix')"
+  refute_contains "$keys" 'GH_TOKEN'
+  refute_contains "$keys" 'GITHUB_TOKEN'
+  # 跑验证的确实是这一步，否则改个步骤名这条就空转
+  assert_contains "$(extract_run_block "$REPO_ROOT/$WF" 'Verify the Codex fix')" 'bash -euo pipefail -c "$VERIFY"'
+  # 带令牌的那一步反过来不许碰验证命令
+  assert_contains "$(step_env_keys "$WF" 'Commit and push the Codex fix')" 'GH_TOKEN'
+  refute_contains "$(extract_run_block "$REPO_ROOT/$WF" 'Commit and push the Codex fix')" 'VERIFY'
+}
+
 # 验证命令来自被审的那个 PR：npm ci 的生命周期钩子、pytest 插件、bats 里的任意
-# 一行都能执行代码。它跑的时候环境里不能有 contents:write 的令牌，也不能有
+# 一行都能执行代码。它跑的时候，环境里不能有 contents:write 的令牌，也不能有
 # checkout 留在 .git/config 里的凭据 —— 拿到任何一样就等于拿到仓库写权限。
 @test "takeover: the PR's own verify command runs without any write credential" {
-  push_workspace 'printf "GH_TOKEN=[%s]\n" "${GH_TOKEN:-}" >"$BATS_TEST_TMPDIR/probe.txt"
-git config --local --get http.https://github.com/.extraheader >>"$BATS_TEST_TMPDIR/probe.txt" ||
-  echo "git-credential=[]" >>"$BATS_TEST_TMPDIR/probe.txt"'
+  push_workspace 'probe="$BATS_TEST_TMPDIR/probe.txt"
+printf "GH_TOKEN=[%s]\n" "${GH_TOKEN:-}" >"$probe"
+git config --local --get http.https://github.com/.extraheader >>"$probe" ||
+  echo "git-credential=[]" >>"$probe"'
 
-  run run_block "$WF" "Verify, commit and push the Codex fix"
+  run run_step "$WF" "Verify the Codex fix"
 
   assert_equal "$status" 0
-  assert_contains "$(cat "$BATS_TEST_TMPDIR/probe.txt")" 'GH_TOKEN=[]'
-  assert_contains "$(cat "$BATS_TEST_TMPDIR/probe.txt")" 'git-credential=[]'
-  # push 和发评论还要用，验证跑完必须原样还回来
+  probe="$(cat "$BATS_TEST_TMPDIR/probe.txt")"
+  assert_contains "$probe" 'GH_TOKEN=[]'
+  assert_contains "$probe" 'git-credential=[]'
+  # push 还要用，验证跑完必须原样还回来
   assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
-  assert_equal "$(step_output pushed)" true
+  assert_equal "$(step_output changed)" true
+}
+
+# 上一条只看子进程自己那份环境，看不出令牌是不是还挂在父 shell 上 —— 这正是
+# 「env -u 假修」当初骗过测试的地方。这一条把父进程的环境整个读出来。
+# 只有 /proc 在的平台能读（CI 的 ubuntu-latest 就是），macOS 的 ps 不吐环境，
+# 那边由上面那条「step 的 env: 里根本没有令牌」结构断言兜底。
+@test "takeover: the verification's parent shell holds no write credential either" {
+  [ -r /proc/self/environ ] || skip 'no /proc here; the env:-declaration test covers this platform'
+  push_workspace 'tr "\0" "\n" <"/proc/$PPID/environ" >"$BATS_TEST_TMPDIR/parent-env.txt"'
+
+  run run_step "$WF" "Verify the Codex fix"
+
+  assert_equal "$status" 0
+  parent="$(cat "$BATS_TEST_TMPDIR/parent-env.txt")"
+  # 探针真读到那份环境了（HEAD_REF 是 push 那步声明的变量，验证这步继承得到
+  # 是因为测试喂的），否则下面那条 refute 只是在空字符串上空转
+  assert_contains "$parent" 'HEAD_REF=topic'
+  refute_contains "$parent" 'GH_TOKEN='
+  refute_contains "$parent" 'write-token'
+}
+
+# runner 的文件命令通道也是外部 PR 够得着的写权限：往 $GITHUB_PATH 追一个自带
+# 假 gh 的目录，后面「召唤复审」那步就会跑那个假 gh —— 而那步带的是
+# CODEX_TRIGGER_TOKEN。验证子进程拿到的必须是废纸篓文件。
+@test "takeover: the PR's own verify command cannot poison the next steps' PATH or env" {
+  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
+  : >"$GITHUB_PATH"
+  push_workspace 'printf "%s\n" "$PWD/evil-bin" >>"$GITHUB_PATH"
+printf "SNEAK=yes\n" >>"$GITHUB_ENV"'
+
+  run run_step "$WF" "Verify the Codex fix"
+
+  assert_equal "$status" 0
+  assert_equal "$(cat "$GITHUB_PATH")" ''
+  refute_contains "$(cat "$GITHUB_ENV")" 'SNEAK'
+}
+
+# 上一条只挡住「照着自己环境里的变量写」。验证命令还能从 /proc/$PPID/environ
+# 把真路径捞回来，绕开废纸篓直接写真文件。这里用两个别名变量把真路径直接递给它
+# （效果等同捞回来，但不依赖 /proc 在不在），要守的是：验证跑完那两个文件被清空，
+# runner 在 step 收尾时读到的是空的。
+@test "takeover: a verify command that recovers the real runner file paths still cannot poison them" {
+  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
+  : >"$GITHUB_PATH"
+  export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV"
+  push_workspace 'printf "%s\n" "$PWD/evil-bin" >>"$REAL_PATH_FILE"
+printf "SNEAK=yes\n" >>"$REAL_ENV_FILE"'
+
+  run run_step "$WF" "Verify the Codex fix"
+
+  assert_equal "$status" 0
+  assert_equal "$(cat "$GITHUB_PATH")" ''
+  refute_contains "$(cat "$GITHUB_ENV")" 'SNEAK'
 }
 
 # 提交的必须是验过的那棵树：验证自己会改被跟踪的文件（uv sync --dev 重写
@@ -171,7 +246,7 @@ git config --local --get http.https://github.com/.extraheader >>"$BATS_TEST_TMPD
 mkdir -p .venv && printf "junk\n" >.venv/pyvenv.cfg
 printf "cached\n" >stray.pyc'
 
-  run run_block "$WF" "Verify, commit and push the Codex fix"
+  run verify_and_push
 
   assert_equal "$status" 0
   assert_equal "$(git show HEAD:deps.lock)" 'lock v2'
@@ -187,7 +262,7 @@ printf "cached\n" >stray.pyc'
 @test "takeover: a failing verification pushes nothing" {
   push_workspace 'exit 3'
 
-  run run_block "$WF" "Verify, commit and push the Codex fix"
+  run verify_and_push
 
   assert_equal "$status" 1
   assert_contains "$output" 'verification failed'
@@ -409,6 +484,7 @@ codex_mode_context() {
   # Decide the takeover 在 FIRST=codex 时输出 run_codex=true，由上面那条单块
   # 测试保证；跳过时这些 outputs 会被自动作废，不会假装还在。
   gate_set steps.decide.outputs.run_codex true
+  gate_set steps.codex_verify.outputs.changed true
   gate_set steps.codex_push.outputs.pushed true
   # 上一条测试实测过：这一步真跑起来必然 exit 1（读到空结果 → 冤枉 Claude →
   # 打红）。所以只要它没被挡住，隐式 success() 就塌了。
@@ -436,7 +512,8 @@ codex_mode_context() {
   gate_ran 'Decide the takeover'
   gate_ran 'Hand the round over to Codex'
   gate_ran 'Codex fixes the PR'
-  gate_ran 'Verify, commit and push the Codex fix'
+  gate_ran 'Verify the Codex fix'
+  gate_ran 'Commit and push the Codex fix'
   gate_ran 'Post the Codex summary comment'
   gate_ran 'Request Codex re-review after a new commit'
 }
@@ -449,7 +526,8 @@ codex_mode_context() {
   gate_fails 'Post the Codex summary comment'
   gate_trace "$WF"
 
-  gate_ran 'Verify, commit and push the Codex fix'
+  gate_ran 'Verify the Codex fix'
+  gate_ran 'Commit and push the Codex fix'
   gate_ran 'Request Codex re-review after a new commit'
 }
 
@@ -466,7 +544,8 @@ codex_mode_context() {
   gate_ran 'Decide the takeover'
   gate_skipped 'Hand the round over to Codex'
   gate_skipped 'Codex fixes the PR'
-  gate_skipped 'Verify, commit and push the Codex fix'
+  gate_skipped 'Verify the Codex fix'
+  gate_skipped 'Commit and push the Codex fix'
   gate_skipped 'Post the Codex summary comment'
   gate_skipped 'Request Codex re-review after a new commit'
 }
