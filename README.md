@@ -153,6 +153,7 @@ git tag -f v1 && git push -f origin v1
 - **`git add -A` 放在验证之前，验证改的被跟踪文件会被静默丢掉**：先 add 是对的（验证会造出 `.venv` / `node_modules` / `__pycache__`，后 add 就一起提交了），但 `uv sync --dev` 默认重写 `uv.lock`、`npm ci` 重写 `package-lock.json`，这些差异不在暂存区里，commit 推出去的是一棵从没被测过的树。验证通过后补一次 `git add -u`：它只更新已经在索引里的路径，垃圾目录从没进过索引，照样进不来（MEL-252）。
 - **跑被审 PR 自带的验证命令时，环境里不能有写权限凭据**：`npm ci` 的生命周期钩子、pytest 插件、bats 脚本都能执行任意命令，外部 PR 借此就能读走 `GH_TOKEN` 和 `actions/checkout` 持久化在 `.git/config` 里的凭证，拿到仓库写权限。验证前把两样都摘掉，验证通过后再还回来给 push 和发评论用（MEL-252）。
 - **`.git/info/exclude` 挡不住 `git reset --hard`**：exclude 只管 `git add` 和 `git clean` 不去碰**未跟踪**的文件；调用方仓库自己跟踪了同名文件时，`reset --hard` 照样把它恢复回来，把写在那儿的预取内容盖掉。工作区里放「只给这一轮用」的文件，要么放到工作区外，要么带上 run id（同「取脚本的落点必须带 run id」那条），别指望 exclude（MEL-252）。
+- **关键那一步要排在前面，别排在发评论后面**：同上一条的门禁语义，`gh pr comment` 偶发失败一次，排在它后面的步骤就整个被跳过。`claude-codex-iterate` 里「召唤复审」一度排在「发总结评论」之后 —— 总结那步一抖，Codex 刚推的提交就没人复看，链条静默停住。链条上必须发生的事排前面，给人看的排后面（MEL-252）。
 - **`@codex review` 会被限流静默**：连发几次后连 👀 都不回，约 10 分钟恢复。现在 iterate 只召唤一次，沉默由 watcher 的 5 分钟兜底接手。
 - **Codex 额度用完时它照样回一条评论**：旧版超时告警把它当成「Codex 有反应」，于是既不告警也不合并，PR 就这么卡住（2026-09-17，3 个 PR）。现在认出这句话就当场换 Claude。
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。

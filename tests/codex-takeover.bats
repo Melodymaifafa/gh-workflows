@@ -441,6 +441,18 @@ codex_mode_context() {
   gate_ran 'Request Codex re-review after a new commit'
 }
 
+# 发总结那一步偶发挂一次（gh pr comment 限流、网络抖动），不能把召唤复审一起
+# 带走：召唤发不出去 = Codex 刚推的那笔提交没人复看，链条静默停在这里。所以
+# 召唤排在发总结之前。
+@test "gating: a flaky summary comment cannot stop the re-review summon" {
+  codex_mode_context
+  gate_fails 'Post the Codex summary comment'
+  gate_trace "$WF"
+
+  gate_ran 'Verify, commit and push the Codex fix'
+  gate_ran 'Request Codex re-review after a new commit'
+}
+
 @test "gating: without the first=='claude' half, the whole takeover is skipped" {
   # 把 Check the fix outcome 的 if 换回只看 gate 的旧写法，并按上面那条测出来的
   # 结果让它失败 —— 隐式 success() 随即为假，Codex 四步全被跳过。模型抓不到这个

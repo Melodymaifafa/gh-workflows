@@ -806,28 +806,11 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" >/dev/null ||
             echo "::warning::fix-round marker for $new_head not posted"
 
-      - name: Post the Codex summary comment
-        if: steps.decide.outputs.run_codex == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          SUMMARY: ${{ steps.codex.outputs['final-message'] }}
-          PUSHED: ${{ steps.codex_push.outputs.pushed }}
-        run: |
-          set -euo pipefail
-          if [ -z "${SUMMARY//[[:space:]]/}" ]; then
-            echo '::warning::Codex returned no summary; skipping the PR comment'
-            exit 0
-          fi
-          {
-            printf '%s\n' "$SUMMARY"
-            if [ "$PUSHED" = true ]; then
-              printf '\n验证：本仓库的 lint 与测试已在沙箱外跑过，全绿后才推送。\n'
-            fi
-          } | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
-
       # Codex 接管推的那一轮同样要召唤复审 —— 否则换人成功，链条却停在这里。
+      # 这一步排在发总结之前，因为它才是链条的关键一环：step 的 if 不写状态
+      # 函数时 GitHub 会隐式补 success()，排在发总结之后的话，`gh pr comment`
+      # 一次偶发失败就会让它整个被跳过 —— Codex 刚推上去的那笔提交没人复看，
+      # 链条静默停在这里。总结是给人看的，晚一步发没关系。
       - name: Request Codex re-review after a new commit
         if: steps.outcome.outputs.summon == 'true' || steps.codex_push.outputs.pushed == 'true'
         env:
@@ -898,3 +881,24 @@ jobs:
             "$head_sha" "$FIX_ROUND"
           comment_url="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$request_body")"
           echo "summoned round $FIX_ROUND ($comment_url)"
+
+      - name: Post the Codex summary comment
+        if: steps.decide.outputs.run_codex == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SUMMARY: ${{ steps.codex.outputs['final-message'] }}
+          PUSHED: ${{ steps.codex_push.outputs.pushed }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUMMARY//[[:space:]]/}" ]; then
+            echo '::warning::Codex returned no summary; skipping the PR comment'
+            exit 0
+          fi
+          {
+            printf '%s\n' "$SUMMARY"
+            if [ "$PUSHED" = true ]; then
+              printf '\n验证：本仓库的 lint 与测试已在沙箱外跑过，全绿后才推送。\n'
+            fi
+          } | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
