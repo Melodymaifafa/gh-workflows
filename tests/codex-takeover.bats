@@ -121,6 +121,61 @@ handover_workspace() {
   [ -s .review/findings-99-1.md ]
 }
 
+# ---------- 验证、提交、推送 ----------
+
+# Verify, commit and push 那一步的工作区：一个带 origin 的真仓库，加上 Codex 刚
+# 改过的文件。VERIFY 是被审 PR 自己带的命令，这里换成探针，用来看它看得见什么。
+push_workspace() { # push_workspace <verify script>
+  git init -q -b topic .
+  git config user.email t@e
+  git config user.name t
+  printf 'v1\n' >app.txt
+  printf 'lock v1\n' >deps.lock
+  git add app.txt deps.lock
+  git commit -q -m base
+  git init -q --bare "$BATS_TEST_TMPDIR/origin.git"
+  git remote add origin "$BATS_TEST_TMPDIR/origin.git"
+  git push -q origin HEAD:topic
+  # actions/checkout 把写权限凭据持久化成这一条 config
+  git config --local http.https://github.com/.extraheader 'AUTHORIZATION: basic c2VjcmV0'
+  mkdir -p .git/info .review
+  echo '.review/' >>.git/info/exclude
+  printf 'prefetched review\n' >.review/findings-99-1.md
+  printf 'v2 fixed by codex\n' >app.txt
+  export VERIFY="$1"
+  export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
+}
+
+# 验证命令来自被审的那个 PR：npm ci 的生命周期钩子、pytest 插件、bats 里的任意
+# 一行都能执行代码。它跑的时候环境里不能有 contents:write 的令牌，也不能有
+# checkout 留在 .git/config 里的凭据 —— 拿到任何一样就等于拿到仓库写权限。
+@test "takeover: the PR's own verify command runs without any write credential" {
+  push_workspace 'printf "GH_TOKEN=[%s]\n" "${GH_TOKEN:-}" >"$BATS_TEST_TMPDIR/probe.txt"
+git config --local --get http.https://github.com/.extraheader >>"$BATS_TEST_TMPDIR/probe.txt" ||
+  echo "git-credential=[]" >>"$BATS_TEST_TMPDIR/probe.txt"'
+
+  run run_block "$WF" "Verify, commit and push the Codex fix"
+
+  assert_equal "$status" 0
+  assert_contains "$(cat "$BATS_TEST_TMPDIR/probe.txt")" 'GH_TOKEN=[]'
+  assert_contains "$(cat "$BATS_TEST_TMPDIR/probe.txt")" 'git-credential=[]'
+  # push 和发评论还要用，验证跑完必须原样还回来
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
+  assert_equal "$(step_output pushed)" true
+}
+
+@test "takeover: a failing verification pushes nothing" {
+  push_workspace 'exit 3'
+
+  run run_block "$WF" "Verify, commit and push the Codex fix"
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'verification failed'
+  refute_called "gh pr comment"
+  # 凭据照样还回来，不能因为验证失败就永久摘掉
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
+}
+
 # ---------- 谁来下结论 ----------
 
 # 这一步在 review_fixer 允许换人时把结论让给 Decide the takeover。

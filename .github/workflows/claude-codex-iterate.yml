@@ -765,8 +765,22 @@ jobs:
           # 暂存区在验证前就定死 = 提交的正好是 Codex 改出来的那些文件。
           git add -A
 
-          # 验证只能在沙箱外跑：装依赖要联网，放进 Codex 那边必挂。
-          if ! bash -euo pipefail -c "$VERIFY"; then
+          # 验证跑的是被审 PR 自己带的命令：npm ci 的生命周期钩子、pytest 插件、
+          # bats 脚本里的任意一行都能执行代码。所以跑它的时候环境里不留写权限 ——
+          # 带 contents:write 的 GH_TOKEN 不进这个子进程，actions/checkout 持久化
+          # 在 .git/config 里的凭证也先摘掉；两样都等验证跑完才回来，只给下面的
+          # push 和发评论用。验证只能在沙箱外跑：装依赖要联网，放进 Codex 那边必挂。
+          cred_header=''
+          if cred_header="$(git config --local --get http.https://github.com/.extraheader)"; then
+            git config --local --unset-all http.https://github.com/.extraheader
+          fi
+
+          verify_status=0
+          env -u GH_TOKEN -u GITHUB_TOKEN bash -euo pipefail -c "$VERIFY" || verify_status=$?
+
+          [ -z "$cred_header" ] || git config --local http.https://github.com/.extraheader "$cred_header"
+
+          if [ "$verify_status" -ne 0 ]; then
             echo '- verification: **failed**, nothing was pushed' >>"$GITHUB_STEP_SUMMARY"
             echo '::error::verification failed after the Codex fix; the change was not pushed'
             exit 1
