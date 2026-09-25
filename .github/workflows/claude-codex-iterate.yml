@@ -12,6 +12,14 @@ on:
         description: python | node | shell — picks the toolchain, verify commands and tool allowlist.
         type: string
         default: python
+      review_fixer:
+        description: auto | claude | codex — who fixes the PR this round. auto runs Claude first and hands over to Codex only when the provider itself fails.
+        type: string
+        default: auto
+      codex_model:
+        description: Model id for the Codex fixer. Empty keeps the action's own default; pin one to freeze the cost.
+        type: string
+        default: ''
       verify_cmd:
         description: Override the verify commands Claude must run before pushing (one per line).
         type: string
@@ -219,6 +227,34 @@ jobs:
             echo "reviewer=$reviewer"
           } >>"$GITHUB_OUTPUT"
           echo "fix round $round for review $target ($reviewer) on $H"
+      # 可复用工作流只把「调用方的 PR 分支」checkout 进工作区，本仓库的
+      # scripts/ 不在里面。job_workflow_sha 就是本次实际运行的这份 workflow
+      # 文件所在的 commit，按它取脚本，脚本和 workflow 永远同一个版本。
+      #
+      # 落点必须带 run id：actions/checkout 只能写进工作区，而工作区是调用方的
+      # 仓库。用固定名字的话，调用方只要自己跟踪了一个同名目录，就会先被这次
+      # checkout 盖掉、再被下面清理掉，然后这次删除被 fixer 的 git add -A 当成
+      # 修复推走。带 run id 的名字不可能和任何人已跟踪的路径撞上。
+      - name: Fetch the shared fixer scripts
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Melodymaifafa/gh-workflows
+          ref: ${{ github.job_workflow_sha }}
+          path: .gh-workflows-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Move the fixer scripts out of the workspace
+        if: steps.gate.outputs.run == 'true'
+        env:
+          CHECKOUT_DIR: .gh-workflows-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          # 留在工作区里，fixer 会把它当成本 PR 的改动一并 commit 出去。
+          mv "$CHECKOUT_DIR/scripts" "$RUNNER_TEMP/fixer-scripts"
+          rm -rf -- "$CHECKOUT_DIR"
+          # 起点 commit。Claude 若在失败前已经提交过，这一轮就不能再让 Codex
+          # 接手写第二笔（一轮只允许一个 fixer 写 PR）。
+          echo "BASE_SHA=$(git rev-parse HEAD)" >>"$GITHUB_ENV"
 
       # prompt 要求跑构建/测试命令，runner 不预装这些工具链；
       # 缺了它 Claude 会耗几轮尝试自装（pip 不在白名单）直到轮数耗尽
@@ -240,6 +276,13 @@ jobs:
           sudo install /tmp/actionlint /usr/local/bin/actionlint
           curl -sSfL https://github.com/bats-core/bats-core/archive/refs/tags/v1.14.0.tar.gz | tar xz -C /tmp
           sudo /tmp/bats-core-1.14.0/install.sh /usr/local
+      - name: Select the review fixer
+        id: select
+        if: steps.gate.outputs.run == 'true'
+        env:
+          REVIEW_FIXER: ${{ inputs.review_fixer }}
+        run: |
+          "$RUNNER_TEMP/fixer-scripts/select-review-fixer.sh" "$REVIEW_FIXER"
 
       # 把 runtime 展开成「验证命令」和「工具白名单」两个值，供下一步引用。
       # 放在 step 里而不是内联三元表达式，是为了让默认值可读、可扩展。
@@ -290,7 +333,10 @@ jobs:
       # 失败不立刻中断 job：下一步要先按 SDK 字段分类、发告警，再决定打红
       - uses: anthropics/claude-code-action@v1
         id: fix
-        if: steps.gate.outputs.run == 'true'
+        # gate 说这轮不修，或 review_fixer=codex 指定跳过 Claude，都不跑。
+        if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude'
+        # 失败不立刻终止 job：Check the fix outcome 会先分清是 provider 侧
+        # 失败还是业务失败，再决定换 Codex 上还是把 job 打红。
         continue-on-error: true
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -343,7 +389,12 @@ jobs:
       # 只有「head 变了」和「看完觉得都不用改」算这一轮成功；其余结局告警之后本步骤非零退出，把 run 判红。
       - name: Check the fix outcome
         id: outcome
-        if: steps.gate.outputs.run == 'true'
+        # 这一步判的是「Claude 这一轮跑成了没有」，所以 Claude 没上就不能跑：
+        # review_fixer=codex 时它会把空的结果读成「没修成」，推一条冤枉 Claude
+        # 的告警再 exit 1；而 step 的 if 不写状态函数时 GitHub 会隐式补 success()，
+        # 它这一红，后面 Codex 接管那四步和召唤复审全被跳过 —— job 红着收工，
+        # summary 却写着这轮是 Codex 干的。门跟着 Claude 那一步走，两个病一起治。
+        if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -353,6 +404,7 @@ jobs:
           FIX_OUTCOME: ${{ steps.fix.outcome }}
           STRUCTURED: ${{ steps.fix.outputs.structured_output }}
           EXEC_FILE: ${{ steps.fix.outputs.execution_file }}
+          FALLBACK_ALLOWED: ${{ steps.select.outputs.fallback_allowed }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
         run: |
@@ -421,6 +473,20 @@ jobs:
                 else "fix-failed -" end' "${EXEC_FILE:-/dev/null}" 2>/dev/null || echo "fix-failed -"
           )"
 
+          # review_fixer 允许换人时，结论不在这里下：Decide the takeover 才是这条链
+          # 的裁决点，它用 classify-claude-failure.sh 分清 provider 侧失败还是业务
+          # 失败，该换 Codex 就换、该红就红。这里先把 SDK 认定的原因交出去，也先
+          # 别发「巡检稍后会再修」的告警 —— 这一轮可能马上有人接手。
+          if [ "${FALLBACK_ALLOWED:-}" = true ]; then
+            {
+              echo "failed=true"
+              echo "reason=$reason"
+              echo "until=$until"
+            } >>"$GITHUB_OUTPUT"
+            echo "the fix round did not land (reason=$reason); the takeover step decides"
+            exit 0
+          fi
+
           case "$reason" in
             fix-quota)
               resume="$(date -u -d "@$((until + 28800))" '+%m-%d %H:%M')"
@@ -438,8 +504,522 @@ jobs:
           # head 同原因只发一次）不影响这里：这一条给的是本次 run 的结论。
           fail "the fix round did not land (reason=${reason:-fix-failed})"
 
+      # 整条链的裁决点：谁上、有没有换人、为什么，三件事都写进 job summary。
+      # 业务失败在这里把 job 打红，后面的步骤（含召唤复审）全部跳过 —— 额度耗尽
+      # 也好、代码没修好也好，都不许留下一个绿勾。
+      - name: Decide the takeover
+        id: decide
+        if: ${{ !cancelled() && steps.gate.outputs.run == 'true' && steps.select.outcome == 'success' }}
+        env:
+          REVIEW_FIXER: ${{ inputs.review_fixer }}
+          FIRST: ${{ steps.select.outputs.first }}
+          FALLBACK_ALLOWED: ${{ steps.select.outputs.fallback_allowed }}
+          EXECUTION_FILE: ${{ steps.fix.outputs.execution_file }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.gate.outputs.head }}
+          OUTCOME_RESULT: ${{ steps.outcome.outcome }}
+          OUTCOME_FAILED: ${{ steps.outcome.outputs.failed }}
+          OUTCOME_REASON: ${{ steps.outcome.outputs.reason }}
+          OUTCOME_UNTIL: ${{ steps.outcome.outputs.until }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . "$RUNNER_TEMP/pr-guard.sh"
+
+          run_codex=false
+          fell_back=false
+          fatal=''
+          alert=''
+          alert_reason=fix-failed
+          alert_until=-
+
+          if [ "$FIRST" = codex ]; then
+            fixer=codex
+            run_codex=true
+            why='caller pinned the Codex fixer; Claude was skipped'
+          elif [ "$OUTCOME_RESULT" != success ]; then
+            # Check the fix outcome 没走完（前面某一步先挂了，或它自己红了）。
+            # 沿用那一步的红，别另编一个原因，也别拿别人的失败去换人。
+            fixer=claude
+            why='an earlier step failed before the fix outcome could be judged'
+            fatal="$why"
+          elif [ "${OUTCOME_FAILED:-}" != true ]; then
+            # 推了、或看完觉得都不用改 —— 两种结局都由 Check the fix outcome 处理完了。
+            fixer=claude
+            why='Claude finished this round'
+          else
+            # 只把「这次运行的终态字段」喂给分类器，绝不喂整份对话记录：记录里
+            # 原样带着 Codex 的 review 正文（外部输入），照抄一句额度报错就能骗
+            # 出一次换人，而接手的那个 token 有写权限。
+            # SDK 已经认定的原因先写成裸行，让结构化判据压过模型写的自然语言：
+            # 状态码是 runner 从 execution_file 的字段里读出来的，伪造不了。分类器
+            # 只信这一段前导裸行，从下面那条带 `<subtype> <is_error> ` 前缀的行起
+            # 全按散文看 —— 模型的总结跨多行是常态，第 2 行起没有前缀，谁都能以
+            # 一句额度报错开头。
+            diag="$RUNNER_TEMP/claude-failure.txt"
+            : >"$diag"
+            case "${OUTCOME_REASON:-}" in
+              fix-quota) echo 'API Error: 429' >>"$diag" ;;
+              auth) echo 'API Error: 401' >>"$diag" ;;
+            esac
+            if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+              # 503 / 529 上一步归到 fix-failed，只有 api_error_status 能证明它是
+              # provider 侧失败；不补这一行，它就只能靠模型散文被认出来。
+              # 状态码只认终态那一条 result：先把 result 挑出来取 last，再读它的
+              # api_error_status。反过来「把所有 result 的状态码收成数组取 last」
+              # 会把中途那条 429 捡起来当结论 —— 终态其实是「代码没修好、没有状态
+              # 码」，业务失败就这么被买成一次额度换人。写法跟同文件
+              # Check the fix outcome 保持一致。
+              jq -r '[(if type == "array" then .[] else empty end) | select(.type? == "result")]
+                     | last | .api_error_status | numbers | "API Error: \(.)"' \
+                 "$EXECUTION_FILE" >>"$diag" 2>/dev/null || true
+              jq -r '[.. | objects | select(.type? == "result")]
+                     | map([.subtype, (.is_error | tostring), .result] | join(" "))
+                     | join("\n")' "$EXECUTION_FILE" >>"$diag" 2>/dev/null || true
+            fi
+
+            verdict="$("$RUNNER_TEMP/fixer-scripts/classify-claude-failure.sh" "$diag")"
+            failure_class="$(printf '%s\n' "$verdict" | sed -n 's/^class=//p')"
+            failure_reason="$(printf '%s\n' "$verdict" | sed -n 's/^reason=//p')"
+
+            if [ "$failure_class" != quota ]; then
+              fixer=claude
+              why="Claude failed on the code, not on the provider ($failure_reason)"
+              fatal="$why"
+              alert='Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。'
+            elif [ "$FALLBACK_ALLOWED" != true ]; then
+              # 正常路径到不了这里：Check the fix outcome 只在允许换人时才把结论
+              # 让过来，不允许时它自己告警并打红。留着是兜底 —— 「review_fixer=
+              # claude 永不换人」这条不能指望上游某一步的条件一直写对。
+              fixer=claude
+              why="Claude hit a provider limit ($failure_reason) but review_fixer=$REVIEW_FIXER forbids a fallback"
+              fatal="$why"
+              alert='Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。'
+            elif [ "$(git rev-parse HEAD)" != "${BASE_SHA:-}" ]; then
+              fixer=claude
+              why="Claude already committed before failing ($failure_reason); a second fixer must not write the same round"
+              fatal="$why"
+              alert='Claude 修到一半断了，改动可能只推上去一半；请看一眼 PR 再决定。'
+            elif [ -n "$(git status --porcelain -- ':!.review/findings.md')" ]; then
+              # 「Claude 已经写过这一轮」的另一种长相：改动还留在工作区、没提交。
+              # 只看 HEAD 会把它放过去 —— 换人后 Hand the round over to Codex 的
+              # reset --hard 把那些改动整个丢掉，Claude 改到哪一步没人知道，而
+              # 这一轮还会以 Codex 的名义报成功。处置跟提交过那条一样：不换人、
+              # 打红、发告警。
+              # 只排掉 .review/findings.md 这一个：Gate 每轮把意见预取到它，
+              # 调用方仓库自己跟踪了同名文件时它会显示成「被改过」，那不是
+              # Claude 写的。排掉整个 .review/ 不行 —— 调用方在同一个目录下
+              # 跟踪的别的文件会跟着被放过去，那些确实是 Claude 改的。未跟踪
+              # 的 .review/ 内容不需要排：Gate 已经把 .review/ 写进
+              # .git/info/exclude，porcelain 本来就不列它们。
+              # 被 .gitignore 挡住的产物（.venv 之类）本来就不在 porcelain 里，
+              # 也不该算 —— 它们是验证命令留下的，交接前的 clean -x 管着。
+              fixer=claude
+              why="Claude left uncommitted edits before failing ($failure_reason); a second fixer must not write the same round"
+              fatal="$why"
+              alert='Claude 改了几个文件就断了、没提交；这一轮没让 Codex 接手，巡检稍后会再修一次。'
+            else
+              fixer=codex
+              run_codex=true
+              fell_back=true
+              why="Claude hit a provider limit ($failure_reason); handing this round to Codex"
+              # 额度会自己恢复，令牌不会：换人成功也得说一声，否则 Codex 一直
+              # 替它兜着，没人知道该去换 token。
+              if [ "${OUTCOME_REASON:-}" = auth ]; then
+                alert_reason=auth
+                alert='Claude 令牌失效，这一轮改由 Codex 接手；请重新生成 CLAUDE_CODE_OAUTH_TOKEN 并更新仓库 secret。'
+              fi
+            fi
+          fi
+
+          {
+            printf 'fixer=%s\n' "$fixer"
+            printf 'run_codex=%s\n' "$run_codex"
+            printf 'fell_back=%s\n' "$fell_back"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo '### Review fixer'
+            echo ''
+            echo "- requested: \`$REVIEW_FIXER\`"
+            echo "- ran: \`$fixer\`"
+            echo "- fell back to Codex: $fell_back"
+            echo "- why: $why"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # 告警发给主人，退出码留给看板，两者都要有。允许换人时 Check the fix
+          # outcome 把告警让给了本步骤，这里不补就没人补，PR 会无声停住。
+          # 同一个 head、同一个原因只发一次。
+          if [ -n "$alert" ] && [ -n "${HEAD_SHA:-}" ]; then
+            alert_once "$HEAD_SHA" "$alert_reason" "$alert_until" "$alert"
+          fi
+
+          if [ -n "$fatal" ]; then
+            echo '- result: **this round failed**' >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::$fatal"
+            exit 1
+          fi
+
+      # 以下四步是 Codex 接管路径。Codex 的沙箱既没有网络也不让写 .git
+      # （MEL-197 实测），所以它只负责「读 review → 改文件 → 写中文总结」；
+      # 取评论、装依赖、验证、commit/push、发评论全部由外层步骤做。
+      - name: Hand the round over to Codex
+        id: context
+        if: steps.decide.outputs.run_codex == 'true'
+        env:
+          RUN_SLUG: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          # 不再自己拉一遍 review：Gate 那步已经把目标 review（正文 + 行内评论，
+          # HTML 注释已剥掉）预取进 .review/findings.md。重复拉还会用错 review ——
+          # 巡检的重修请求指向的是另一条 review，事件里的 id 不是要修的那条。
+          #
+          # 拿不到这份文件就红着停下。给 Codex 一份空 review 的后果是：它不改
+          # 任何文件、job 打绿勾收工、链条静默停住，正是「不许把失败伪装成成功」
+          # 要挡的东西。
+          if [ ! -s .review/findings.md ]; then
+            echo "::error::.review/findings.md is missing or empty; refusing to hand Codex an incomplete review"
+            exit 1
+          fi
+
+          # 预取的正文先挪出工作区。.git/info/exclude 只挡 git add 和 git clean，
+          # 挡不住 git reset --hard 恢复被跟踪文件：调用方仓库自己跟踪了一个
+          # .review/findings.md 时，下面这一下 reset 会拿他们那份盖掉预取的那份，
+          # 非空检查照样通过，Codex 拿到的是跟本 PR 无关的内容。
+          saved="$RUNNER_TEMP/codex-findings.md"
+          cp .review/findings.md "$saved"
+
+          # 一轮只允许一个 fixer 写 PR。Claude 可能在撞额度前已经改了工作区却
+          # 没提交（提交过的那种在上一步就拒绝换人了）。不清掉的话，下面的
+          # git add -A 会把它没验证完的半成品和 Codex 的改动一起当成「Codex 修
+          # 好了」推出去。`-x` 不能省：被 .gitignore 挡住的半成品（.venv、
+          # node_modules、build 产物）没有 -x 就留在原地，跟着进 Codex 这一轮。
+          git reset --quiet --hard "$BASE_SHA"
+          git clean -qfdx
+
+          # 交给 Codex 的那份换成带 run id 的名字再放回去，理由同「取脚本的落点
+          # 必须带 run id」：这个路径不可能是调用方已跟踪的文件，所以 reset 恢复
+          # 不了它、也没有同名文件被它顶掉。它落在 clean 之后，所以 -x 也扫不到它；
+          # `.review/` 在 .git/info/exclude 里，后面的 git add 同样看不见它。
+          mkdir -p .review
+          findings=".review/findings-$RUN_SLUG.md"
+          cp "$saved" "$findings"
+          printf 'file=%s\n' "$findings" >>"$GITHUB_OUTPUT"
+
+      - name: Codex fixes the PR
+        id: codex
+        if: steps.decide.outputs.run_codex == 'true'
+        uses: openai/codex-action@v1
+        with:
+          # 左边是 action 的参数名（不能改），右边是仓库 secret 名。CLI 真正读
+          # 的环境变量也叫 CODEX_API_KEY，OPENAI_API_KEY 读不到（MEL-197 实测）。
+          # 别设成 job 层 env：本 job 会 checkout PR 分支并执行其中的验证命令，
+          # 那等于把密钥和外部可控代码放进同一个环境。
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          # CLI 版本钉死，同 ci.yml 钉 actionlint / bats 的理由。
+          codex-version: '0.149.1'
+          model: ${{ inputs.codex_model }}
+          # 最小沙箱：工作区可写、无网络、.git 只读。review 正文是外部输入，
+          # 不给更大权限（同「别放宽 --allowedTools」那条规矩）。
+          permission-profile: ':workspace'
+          # action 默认拦 bot 发起的触发；本工作流的触发者恰恰是 Codex bot。
+          allow-bot-users: 'chatgpt-codex-connector[bot]'
+          # safety-strategy 保持默认 drop-sudo：本 job 后续步骤都不需要 sudo。
+          prompt: |
+            ${{ steps.context.outputs.file }} 是别人对本 PR 提的 review：
+            正文加行内评论。请据它迭代当前分支的代码。
+
+            1. 逐条判断建议：真 bug 或明确改进 → 改文件；纯风格偏好、误报、
+               或之前轮次已经处理过的 → 跳过并记录理由。
+            2. 只改文件。不要跑 git 命令、不要装依赖、不要联网 —— 沙箱里这些
+               都做不到（.git 只读、无网络）。验证、commit、push、发评论由外层
+               步骤负责。
+            3. 最后输出一段简体中文总结。读者是非程序员的仓库主人，手机上扫一眼
+               用，必须短、大白话：
+               - 第一行就是结论：「修了 N 条，跳过 M 条」。
+               - 之后每条建议单独一个 Markdown 列表项（必须 `- ` 开头——相邻
+                 裸行会被 GitHub 渲染合并成一段，用列表才能一条占一行）：
+                 - ✅ 修：<一句话：原来会出什么问题 → 改后行为怎么变>
+                 - ⏭️ 跳过：<一句话理由（如：纯风格偏好 / 上轮已处理过）>
+               - 不写实现细节、不贴代码、不复述 diff；函数名/变量名尽量不出现，
+                 非提不可就放句尾括号，去掉括号后句子仍要通顺。
+            4. 如果没有任何可采纳的建议，不要改文件，只输出一两句话说明原因。
+
+      # 验证跑的是被审 PR 自己带的命令，所以它自成一步，而且这一步不挂任何令牌。
+      # 把令牌挂在 step 级 env 再用 `env -u` 在子进程里抹掉是不够的：父 shell 那份
+      # 环境还在，验证命令跟它同一个用户，/proc/$PPID/environ 原样读得回来。令牌
+      # 只出现在下一步（commit / push / 发评论）。验证只能在沙箱外跑：装依赖要联网，
+      # 放进 Codex 那边必挂。
+      - name: Verify the Codex fix
+        id: codex_verify
+        if: steps.decide.outputs.run_codex == 'true'
+        env:
+          VERIFY: ${{ env.VERIFY_CMD }}
+        run: |
+          set -euo pipefail
+
+          # 这一步跑完被审 PR 自己的命令之后还要接着用 git，所以它跟下一步同一个
+          # 规矩：只认我们在命令行上给的那几项，机器上任何一份 git 配置文件都不
+          # 作数（为什么是整个作用域关掉而不是逐条堵键名，见下一步同名的 sealed_git）。
+          # 两步各定义一份、不抽成共享文件：$RUNNER_TEMP 验证命令写得动，把 helper
+          # 放那儿等于请它改写我们自己的防线。
+          # 同理，那份「空配置」不能是文件：文件写在哪儿验证命令都写得动，放
+          # $RUNNER_TEMP 更是名字前缀固定、一个 glob 就找得到，它往里写一行
+          # core.fsmonitor（或 filter.*.clean），下面凭据塞回去之后那次 add -u 就
+          # 替它跑了 —— 而 .git 一个字没动，指纹照样通过。/dev/null 永远读得到、
+          # 永远是空的，也不是它改得动的东西。
+          # 空钩子目录只能是真目录（core.hooksPath 得指到一个存在的目录），所以
+          # 仍然 mktemp 现开；但验证命令跑完之后会换一个它从没见过的新目录，见
+          # 下面收完进程组那一段。
+          empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
+          sealed_git() {
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              git -c "core.hooksPath=$empty_hooks" \
+                  -c protocol.ext.allow=never \
+                  -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
+          }
+
+          # 喂给 Codex 的那份意见带 run id、又在 .git/info/exclude 里，
+          # git status 和 git add 都看不见它，不需要在这里清理。
+
+          if [ -z "$(sealed_git status --porcelain)" ]; then
+            echo 'changed=false' >>"$GITHUB_OUTPUT"
+            echo '- Codex changed no files' >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -z "${VERIFY//[[:space:]]/}" ]; then
+            echo '::error::no verify command resolved; refusing to push an unverified fix'
+            exit 1
+          fi
+
+          # 先入暂存区再验证：验证会造出 .venv / node_modules / __pycache__，
+          # 验证后才 add 就可能把它们一起提交（仓库没写 .gitignore 时必然发生）。
+          # 暂存区在验证前就定死 = 提交的正好是 Codex 改出来的那些文件。
+          sealed_git add -A
+
+          # actions/checkout 把写权限凭据持久化在 .git/config 里，它跟令牌一样能
+          # 换来仓库写权限，所以验证前摘掉、跑完还回来，只留给下一步 push 用。
+          cred_header=''
+          if cred_header="$(sealed_git config --local --get http.https://github.com/.extraheader)"; then
+            sealed_git config --local --unset-all http.https://github.com/.extraheader
+          fi
+
+          # runner 的文件命令通道同样不能交给它：往 $GITHUB_PATH 追一个自带假 gh
+          # 的目录，后面「召唤复审」那步就会跑那个假 gh —— 而那步带的是
+          # CODEX_TRIGGER_TOKEN。两道：子进程先拿到一组废纸篓文件；跑完再把真文件
+          # 清空，这样就算它从 /proc/$PPID/environ 摸回真路径写了东西，runner 在
+          # step 收尾时读到的也是空文件（最后写的是我们）。
+          decoy="$RUNNER_TEMP/verify-decoy-$$"
+          mkdir -p "$decoy"
+
+          # 验证命令对工作副本有写权限，所以它能往 .git 里种「后面某一步会去跑」的
+          # 东西：.git/hooks/ 下的钩子，或者 .git/config 里任意一个「会去跑命令」的键
+          # （core.hooksPath、credential.helper（! 开头就是 shell）、core.pager、
+          # gpg.program、filter.*.clean / .smudge、core.fsmonitor）。把这些键一条条
+          # 列出来堵，就是把「跟着复审意见逐条追」换个地方重演，所以这里按整体指纹
+          # 验收：验证前后 .git/config 和 .git/hooks 有任何差异就红着停下，停在下一
+          # 步之前（下一步手上同时有 GH_TOKEN 和 checkout 的凭据）。一律不静默恢复。
+          # 边角一起覆盖掉：验证命令自己写一个 extraheader 的话，下面那次「塞回去」
+          # 就变成两个值 —— 那也是一处差异，照样红。
+          # 指纹不经过 git 算：要比对的正是 git 的配置，拿 git 去读它，被种下的配置
+          # 就有机会插手。sha256sum 在 runner 上，shasum 在 macOS 上（本机跑测试）。
+          # 指纹只管仓库自己那份 .git —— 机器上的全局 / 系统配置不进指纹（那会让
+          # 「测试套件顺手动了全局 git 配置」的调用方仓库整轮变红），改由 sealed_git
+          # 把那两个作用域整个关掉。
+          sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
+          }
+          git_dir="$(sealed_git rev-parse --git-dir)"
+          # 「还是不是原来那个文件」也要认，光比内容不够：sha256 <file 跟着快捷方式
+          # 走，验证命令把 .git/config 复制到仓库里一个被跟踪的文件、再把 .git/config
+          # 换成指向它的 symlink，内容一字不差、指纹照过 —— 凭据塞回去就顺着写进了
+          # 那个被跟踪的文件，紧接着的 add -u 把它入索引，下一步提交推送，凭据明文
+          # 进了 PR。硬链接同理（inode 没变、链接数从 1 变 2）。所以 inode / 权限位 /
+          # 链接数一起进指纹。ls -ldi 的前三列在 GNU 和 BSD 上是一样的，比 stat 好使。
+          file_ident() {
+            # shellcheck disable=SC2012  # 路径是写死的 .git/config，没有文件名解析问题；
+            # find 拿 inode 要 GNU 的 -printf，runner 有、本机跑测试的 macOS 没有。
+            ls -ldi "$1" | awk '{ print $1, $2, $3 }'
+          }
+          git_state_digest() {
+            {
+              if [ -L "$git_dir/config" ]; then
+                printf 'config symlink %s\n' "$(readlink "$git_dir/config")"
+              elif [ -f "$git_dir/config" ]; then
+                printf 'config file %s %s\n' "$(sha256 <"$git_dir/config")" "$(file_ident "$git_dir/config")"
+              else
+                printf 'config other\n'
+              fi
+              for entry in "$git_dir/hooks"/* "$git_dir/hooks"/.[!.]*; do
+                if [ -L "$entry" ]; then
+                  printf '%s symlink %s\n' "${entry##*/}" "$(readlink "$entry")"
+                elif [ -f "$entry" ]; then
+                  mode='not-executable'
+                  if [ -x "$entry" ]; then mode='executable'; fi
+                  printf '%s file %s %s\n' "${entry##*/}" "$(sha256 <"$entry")" "$mode"
+                elif [ -e "$entry" ]; then
+                  printf '%s other\n' "${entry##*/}"
+                fi
+              done | LC_ALL=C sort
+            } | sha256
+          }
+          git_state_before="$(git_state_digest)"
+
+          # 验证命令跑在它自己的进程组里：set -m 让后台任务另起一组（组号 = 该任务
+          # 的 pid），跑完才能 kill -- -组号 连整组一起收掉。它可以 fork 一个进程再让
+          # 自己退出 —— 指纹和废纸篓文件都不杀进程，那个进程活到「凭据塞回 .git/config」
+          # 和下一步导出 GH_TOKEN 的时候，同一个用户，轮询就能把钥匙捞走。
+          # stdin 接 /dev/null：后台进程组读终端会吃 SIGTTIN 停住。
+          set -m
+          env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
+              GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
+              bash -euo pipefail -c "$VERIFY" </dev/null &
+          verify_pgid=$!
+          set +m
+          verify_status=0
+          wait "$verify_pgid" || verify_status=$?
+
+          : >"$GITHUB_ENV"
+          : >"$GITHUB_OUTPUT"
+          [ -z "${GITHUB_PATH:-}" ] || : >"$GITHUB_PATH"
+
+          # 组里还活着的进程。僵尸不算：它已经死了，只是还没被收尸。
+          verify_survivors() {
+            ps -e -o pgid=,pid=,stat= 2>/dev/null |
+              awk -v g="$verify_pgid" '$1 == g && $3 !~ /^Z/ { print $2 }'
+          }
+
+          # 先礼后兵：TERM 收不掉的（trap '' TERM 就能扛住）再 KILL。收干净之前
+          # 不许往下走 —— 下面第一件事就是把凭据塞回 .git/config。
+          reap_verify_group() {
+            local sig waited
+            for sig in TERM KILL; do
+              [ -n "$(verify_survivors)" ] || return 0
+              kill -"$sig" -- "-$verify_pgid" 2>/dev/null || true
+              waited=0
+              while [ "$waited" -lt 20 ] && [ -n "$(verify_survivors)" ]; do
+                sleep 0.1
+                waited=$((waited + 1))
+              done
+            done
+            [ -z "$(verify_survivors)" ]
+          }
+
+          # ps 用不了就等于这一道什么都没做 —— 静默的 no-op 比没有更糟，所以红着停下。
+          if ! ps -p "$$" >/dev/null 2>&1; then
+            echo '::error::ps is unavailable; cannot prove the verify command left no live process behind'
+            exit 1
+          fi
+
+          if ! reap_verify_group; then
+            echo '- verification: **rejected**, it left a process running' >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::the verify command left live processes behind ($(verify_survivors | tr '\n' ' ')); refusing to restore the credentials"
+            exit 1
+          fi
+
+          # 收干净了才换钩子目录：验证命令看得见开头那个（$RUNNER_TEMP 下、名字前缀
+          # 固定），往里丢一个 post-index-change 就能让下面那次 add -u 替它跑。这个新
+          # 目录在它死透之后才存在，它没机会往里写东西。
+          empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
+
+          # 指纹之前先认文件类型：凭据是用 git config --local 写回 .git/config 的，
+          # 它跟着快捷方式走。不是普通文件就红着停下，别让凭据落到别的地方去。
+          if [ -L "$git_dir/config" ] || [ ! -f "$git_dir/config" ]; then
+            echo '- verification: **rejected**, .git/config is no longer a regular file' >>"$GITHUB_STEP_SUMMARY"
+            echo '::error::.git/config is no longer a regular file; refusing to restore the credentials into it'
+            exit 1
+          fi
+
+          # 这一比对必须排在「把凭据塞回去」之前：凭据一回到 .git/config，下一步就
+          # 有了两把写权限钥匙，种下去的东西也就有人替它跑了。
+          if [ "$(git_state_digest)" != "$git_state_before" ]; then
+            echo '- verification: **rejected**, the verify command modified .git' >>"$GITHUB_STEP_SUMMARY"
+            echo '::error::the verify command modified .git (hooks or config); refusing to run any credentialed git command on this checkout'
+            exit 1
+          fi
+
+          [ -z "$cred_header" ] || sealed_git config --local http.https://github.com/.extraheader "$cred_header"
+
+          if [ "$verify_status" -ne 0 ]; then
+            echo '- verification: **failed**, nothing was pushed' >>"$GITHUB_STEP_SUMMARY"
+            echo '::error::verification failed after the Codex fix; the change was not pushed'
+            exit 1
+          fi
+
+          # 提交的必须是验过的那棵树。验证本身会改被跟踪的文件 —— `uv sync --dev`
+          # 默认就重写 uv.lock（`--frozen` 才不写），npm ci 重写 package-lock.json ——
+          # 而上面那次 add 发生在验证之前，这些差异会被 commit 静默丢掉，推出去的
+          # 是一棵从没被测过的树。`-u` 只更新已经在索引里的路径，所以验证顺手造出来
+          # 的 .venv / node_modules / __pycache__ 仍然进不来：它们从没进过索引。
+          sealed_git add -u
+
+          echo 'changed=true' >>"$GITHUB_OUTPUT"
+
+      # 令牌只在这一步出现。验证命令上一步就跑完了，碰不到这里的环境。
+      - name: Commit and push the Codex fix
+        id: codex_push
+        if: steps.codex_verify.outputs.changed == 'true'
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ROUND: ${{ steps.gate.outputs.round }}
+        run: |
+          set -euo pipefail
+
+          # 这一步手上同时有 GH_TOKEN 和 checkout 留在 .git/config 里的凭据，所以它
+          # 只信我们在命令行上给的那几项配置：上一步跑的是被审 PR 自己的代码，它能往
+          # .git/hooks 种钩子、往 .git/config 写 core.hooksPath 把钩子指到别处，也能写
+          # 机器上的全局配置（$HOME/.gitconfig 不在上一步的指纹里 —— 指纹只拍仓库自己
+          # 那份 .git）。全局配置里 url.<base>.insteadOf 配 ext:: 传输、credential.helper
+          # （! 开头就是 shell）、gpg.program、core.fsmonitor、filter.*.clean，每一个都
+          # 会让 git 去跑一条外部命令。逐条列键名堵就是把「跟着复审意见一条条追」换个
+          # 地方重演，所以按作用域整个关掉：GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM 指到
+          # /dev/null = 全局 + 系统两份一起作废，命令行 -c 压得过仓库那份里的同名键。
+          # 指到 /dev/null 而不是 mktemp 出来的空文件：文件放哪儿上一步那条验证命令
+          # 都写得动，$RUNNER_TEMP 下更是一个 glob 就找得到；/dev/null 它改不了。
+          # 代价是 actions/checkout 写在全局配置里的 safe.directory 也一起丢掉（自托管 /
+          # 容器 runner 上会炸），所以真正需要的那一项在命令行上显式补回来 —— 我们自己
+          # 给，别的一律不继承。protocol.ext.allow=never 是兜底，挡住仓库那份里的 ext::。
+          # --no-verify 挡不住 post-commit，所以不靠它。
+          empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
+          sealed_git() {
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              git -c "core.hooksPath=$empty_hooks" \
+                  -c protocol.ext.allow=never \
+                  -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
+          }
+
+          sealed_git config user.name 'github-actions[bot]'
+          sealed_git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          sealed_git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
+          sealed_git push -q origin "HEAD:$HEAD_REF"
+          new_head="$(sealed_git rev-parse HEAD)"
+          echo 'pushed=true' >>"$GITHUB_OUTPUT"
+          echo '- verification: passed, the fix was pushed' >>"$GITHUB_STEP_SUMMARY"
+
+          # M7 轮数标记：跟 Claude 推完那条一模一样。少了它，Codex 接手推的这一轮
+          # 不计数，下一轮 Gate 会从头数，max_fix_rounds 的上限就永远拦不住。
+          printf -v m7 '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fix-round head=%s round=%s -->' \
+            "$ROUND" "$new_head" "$ROUND"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" >/dev/null ||
+            echo "::warning::fix-round marker for $new_head not posted"
+
+      # Codex 接管推的那一轮同样要召唤复审 —— 否则换人成功，链条却停在这里。
+      # 这一步排在发总结之前，因为它才是链条的关键一环：step 的 if 不写状态
+      # 函数时 GitHub 会隐式补 success()，排在发总结之后的话，`gh pr comment`
+      # 一次偶发失败就会让它整个被跳过 —— Codex 刚推上去的那笔提交没人复看，
+      # 链条静默停在这里。总结是给人看的，晚一步发没关系。
       - name: Request Codex re-review after a new commit
-        if: steps.outcome.outputs.summon == 'true'
+        if: steps.outcome.outputs.summon == 'true' || steps.codex_push.outputs.pushed == 'true'
         env:
           # 必须属于已连接 Codex 的真人账号；GITHUB_TOKEN 的 bot 评论会被 Codex 拒绝。
           GH_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
@@ -508,3 +1088,24 @@ jobs:
             "$head_sha" "$FIX_ROUND"
           comment_url="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$request_body")"
           echo "summoned round $FIX_ROUND ($comment_url)"
+
+      - name: Post the Codex summary comment
+        if: steps.decide.outputs.run_codex == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SUMMARY: ${{ steps.codex.outputs['final-message'] }}
+          PUSHED: ${{ steps.codex_push.outputs.pushed }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUMMARY//[[:space:]]/}" ]; then
+            echo '::warning::Codex returned no summary; skipping the PR comment'
+            exit 0
+          fi
+          {
+            printf '%s\n' "$SUMMARY"
+            if [ "$PUSHED" = true ]; then
+              printf '\n验证：本仓库的 lint 与测试已在沙箱外跑过，全绿后才推送。\n'
+            fi
+          } | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -

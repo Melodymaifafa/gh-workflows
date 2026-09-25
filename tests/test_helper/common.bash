@@ -3,6 +3,8 @@
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
+ITERATE_WORKFLOW="$REPO_ROOT/.github/workflows/claude-codex-iterate.yml"
+SCRIPTS="$REPO_ROOT/scripts"
 
 # 打印 workflow 里某个 step 的 `run: |` 块，去掉 10 空格缩进。
 # 测试跑的是 ci.yml 里那段真代码——在测试里复制一份逻辑，两边迟早各改各的。
@@ -227,6 +229,38 @@ run_block() {
     return 98
   fi
   bash --noprofile --norc -eo pipefail "$script"
+}
+
+# step_env_keys <workflow-file> <step-name>：打印这一步 `env:` 块里声明的变量名，
+# 一行一个。守「这一步不许拿到某个变量」这类性质要靠它：run_block 只抽 run: 块，
+# 环境是测试自己喂的，光看块里写了什么看不出 step 真跑起来手上有哪些值。
+step_env_keys() {
+  local wf="$1"
+  case "$wf" in /*) ;; *) wf="$REPO_ROOT/$wf" ;; esac
+  awk -v want="      - name: $2" '
+    $0 == want                                       { in_step = 1; next }
+    in_step && !in_env && $0 == "        env:"        { in_env = 1; next }
+    in_env && $0 ~ /^          [A-Za-z_][A-Za-z0-9_]*:/ {
+      sub(/^ +/, ""); sub(/:.*$/, ""); print; next
+    }
+    in_env                                            { exit }
+    in_step && $0 ~ /^      - /                       { exit }
+  ' "$wf"
+}
+
+# run_step <workflow-file> <step-name>：同 run_block，但先把这一步 `env:` 里没声明
+# 的令牌从环境里摘掉 —— 真跑起来，step 手上只有自己声明的那几个值。
+# 「令牌照挂在 step 级 env、只在子进程里 env -u 抹掉」的写法在这里会原样暴露：
+# 父 shell 那份环境还在，验证命令跟它同一个用户，/proc/$PPID/environ 读得回来。
+run_step() {
+  local wf="$1" step="$2" keys
+  keys="$(step_env_keys "$wf" "$step")"
+  [ -n "$keys" ] || { echo "run_step: step '$step' declares no env: block in $wf" >&2; return 98; }
+  (
+    case "$keys" in *GH_TOKEN*) ;; *) unset GH_TOKEN ;; esac
+    case "$keys" in *GITHUB_TOKEN*) ;; *) unset GITHUB_TOKEN ;; esac
+    run_block "$wf" "$step"
+  )
 }
 
 # step_output <name>：读回 $GITHUB_OUTPUT 里的值（支持 name=v 和 name<<EOF 多行写法，后写的赢）。
