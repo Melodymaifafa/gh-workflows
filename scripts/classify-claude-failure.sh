@@ -54,10 +54,16 @@ STRUCTURED_PATTERNS=(
 )
 
 # 唯一允许的散文形态：Claude Code 用完订阅额度时，整个 `.result` 就是这一句（可带
-# |<重置时间戳>）。要求它独占整行、只容许调用方那段前缀 —— 模型在描述自己修的
-# 代码时，写不出只有这一句的一整行。多个终态对象时它不一定在第一行，所以这一种
-# 在哪一行都算。
-USAGE_LIMIT_PATTERN="^[[:space:]]*(${CALLER_PREFIX})?claude ai usage limit reached(\|[0-9]+)?[[:space:]]*\$"
+# |<重置时间戳>）。要求它独占整行。带前缀的那个变体（这一个终态对象的 `.result`
+# 整个就是这一句）不管排第几个对象都算数 —— 模型描述自己在改的代码时，写不出
+# 只由这一句独占、不多不少的一整行。
+#
+# 不带前缀的裸行变体只在 `$prose` 还是 false 时才算：它原本是留给 runner 自己
+# 写的结构化裸行的，可一旦某个对象的 `.result` 跨行、后续裸行是模型接着写的
+# 散文，模型完全可能在讲一次失败的测试时原样引用这句话（这个仓库自己的测试
+# 夹具里就有一模一样的字符串）——那不是额度证据，照旧判 business。
+USAGE_LIMIT_BARE_PATTERN="^[[:space:]]*claude ai usage limit reached(\|[0-9]+)?[[:space:]]*\$"
+USAGE_LIMIT_PREFIXED_PATTERN="^[[:space:]]*${CALLER_PREFIX}claude ai usage limit reached(\|[0-9]+)?[[:space:]]*\$"
 USAGE_LIMIT_LABEL='usage limit reached'
 
 source_file="${1:--}"
@@ -80,7 +86,8 @@ else
   shopt -s nocasematch
   prose=false
   while IFS= read -r line; do
-    if [[ $line =~ $USAGE_LIMIT_PATTERN ]]; then
+    if [[ $line =~ $USAGE_LIMIT_PREFIXED_PATTERN ]] ||
+      { [ "$prose" = false ] && [[ $line =~ $USAGE_LIMIT_BARE_PATTERN ]]; }; then
       class=quota
       reason="provider-side failure marker: $USAGE_LIMIT_LABEL"
       break

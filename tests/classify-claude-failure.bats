@@ -253,6 +253,16 @@ why() {
   assert_equal "$(verdict "$out")" business
 }
 
+@test "the usage-limit sentence quoted mid-prose is a business failure — no handover" {
+  # 这个仓库自己的测试夹具里就有一模一样的字符串（见本文件前面几条用例）；
+  # Claude 描述一次相关的失败测试时完全可能原样引用它，那不是额度证据。
+  out="$(printf '%s\n' \
+    'error_during_execution true the fixture asserts on this exact line:' \
+    'Claude AI usage limit reached' \
+    'and the test still fails after my fix.' | "$SCRIPTS/classify-claude-failure.sh")"
+  assert_equal "$(verdict "$out")" business
+}
+
 @test "the runner's own structured line outranks the prose that follows it" {
   # runner 把 SDK 判定的状态码写成裸行放在最前面（Decide the takeover 干的），
   # 那一行是唯一伪造不了的额度证据，后面跟着多行散文也不影响。
