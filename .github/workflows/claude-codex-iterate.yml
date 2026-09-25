@@ -24,6 +24,12 @@ on:
         description: Override the verify commands Claude must run before pushing (one per line).
         type: string
         default: ''
+      verify_writable_paths:
+        description: >-
+          Tracked files the verify command is allowed to rewrite (one per line, exact paths).
+          Empty means none. List the lock files your verify commands regenerate, e.g. uv.lock.
+        type: string
+        default: ''
       extra_tools:
         description: Override the runtime-specific entries appended to --allowedTools.
         type: string
@@ -760,6 +766,11 @@ jobs:
         if: steps.decide.outputs.run_codex == 'true'
         env:
           VERIFY: ${{ env.VERIFY_CMD }}
+          # 「允许验证命令改写哪些被跟踪的文件」只能来自调用方默认分支上的工作流
+          # 文件（workflow_call 的 input）—— 被审 PR 改不到它。这是它能当信任边界
+          # 的前提；一旦改成从 PR 内容里读（仓库里的某个清单文件、PR 正文……），
+          # 攻击者就自己给自己发通行证了。
+          VERIFY_WRITABLE_PATHS: ${{ inputs.verify_writable_paths }}
         run: |
           set -euo pipefail
 
@@ -871,6 +882,30 @@ jobs:
           }
           git_state_before="$(git_state_digest)"
 
+          # 验证命令重写它自己负责生成的那几个文件是合法的 —— uv sync --dev 默认
+          # 重写 uv.lock、npm ci 重写 package-lock.json —— 所以下面那次 add -u 不能
+          # 取消：取消了，推出去的就是一棵从没被验证过的树（MEL-252）。要跟它分开的
+          # 是另一件事：验证改写了**任意一个**被跟踪的源文件，借那次 add -u 把内容
+          # 夹带进提交里 —— 外部 PR 于是能借这条工作流的手，把复审机器人从没产出过
+          # 的改动发布进仓库。所以比对「验证前后会被提交的那棵树」，差异逐条比
+          # $VERIFY_WRITABLE_PATHS，有一条不在上面就红着停下。
+          #
+          # 每次现开一份 mktemp 索引来算，不拿真索引：在真索引上算 after 那次，等于
+          # 判定还没做完就先把验证的改动入了索引。结果只存在当前 shell 的变量里 ——
+          # 验证命令是子进程，改不到父 shell 的变量；存成文件它就改得动。算的时候
+          # 走 sealed_git（空钩子目录），别让 add -u 触发 post-index-change。
+          index_tree() {
+            local idx
+            idx="$(mktemp -d "$RUNNER_TEMP/verify-index-XXXXXX")/index"
+            cp "$git_dir/index" "$idx"
+            (
+              export GIT_INDEX_FILE="$idx"
+              sealed_git add -u
+              sealed_git write-tree
+            )
+          }
+          verify_tree_before="$(index_tree)"
+
           # 验证命令跑在它自己的进程组里：set -m 让后台任务另起一组（组号 = 该任务
           # 的 pid），跑完才能 kill -- -组号 连整组一起收掉。它可以 fork 一个进程再让
           # 自己退出 —— 指纹和废纸篓文件都不杀进程，那个进程活到「凭据塞回 .git/config」
@@ -942,6 +977,42 @@ jobs:
             echo '- verification: **rejected**, the verify command modified .git' >>"$GITHUB_STEP_SUMMARY"
             echo '::error::the verify command modified .git (hooks or config); refusing to run any credentialed git command on this checkout'
             exit 1
+          fi
+
+          # 同一道门的另一半，位置和理由跟上面那条指纹一样：排在「把凭据塞回去」
+          # 之前。这一份索引是验证死透之后才开的，它没机会动手脚。
+          # 比的是树而不是「add -u 会带进来哪些文件」：验证命令自己跑一条 git add
+          # 就能把新文件直接塞进真索引，那时候连 add -u 都不需要了 —— 比树就把这
+          # 一路一起盖住，凡是「会被提交的内容变了」都算。
+          verify_tree_after="$(index_tree)"
+          if [ "$verify_tree_after" != "$verify_tree_before" ]; then
+            # -z：路径里带换行的文件名照样一条是一条。--no-renames：改名要把来源和
+            # 去处两条都报出来，别被合并成一条。命令替换会吃掉 NUL，所以落文件读。
+            changed_list="$(mktemp "$RUNNER_TEMP/verify-changed-XXXXXX")"
+            sealed_git diff --name-only --no-renames -z \
+              "$verify_tree_before" "$verify_tree_after" >"$changed_list"
+
+            # 白名单一行一个路径，精确匹配，不认通配符：模糊的放行范围等于没有范围。
+            # read 不加 -r 之外的花样，默认 IFS 顺手把行首行尾空白削掉。
+            path_allowed() {
+              local want="$1" allowed
+              while read -r allowed; do
+                [ -n "$allowed" ] || continue
+                [ "$allowed" != "$want" ] || return 0
+              done <<<"$VERIFY_WRITABLE_PATHS"
+              return 1
+            }
+
+            offenders=''
+            while IFS= read -r -d '' changed; do
+              path_allowed "$changed" || offenders="$offenders $changed"
+            done <"$changed_list"
+
+            if [ -n "$offenders" ]; then
+              echo '- verification: **rejected**, it rewrote tracked files it is not allowed to touch' >>"$GITHUB_STEP_SUMMARY"
+              echo "::error::the verify command rewrote tracked files outside verify_writable_paths:$offenders; refusing to restore the credentials or push"
+              exit 1
+            fi
           fi
 
           [ -z "$cred_header" ] || sealed_git config --local http.https://github.com/.extraheader "$cred_header"

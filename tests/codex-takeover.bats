@@ -162,6 +162,9 @@ push_workspace() { # push_workspace <verify script>
   printf 'prefetched review\n' >.review/findings-99-1.md
   printf 'v2 fixed by codex\n' >app.txt
   export VERIFY="$1"
+  # 调用方没写白名单 = 一个被跟踪的文件都不许验证命令改写（失败关闭）。
+  # 要放行的测试自己在调用前 export 一份。
+  export VERIFY_WRITABLE_PATHS="${VERIFY_WRITABLE_PATHS:-}"
   export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
 }
 
@@ -261,6 +264,7 @@ printf "SNEAK=yes\n" >>"$REAL_ENV_FILE"'
 # 提交的必须是验过的那棵树：验证自己会改被跟踪的文件（uv sync --dev 重写
 # uv.lock），同时造出不该提交的垃圾目录。两个性质得同时成立。
 @test "takeover: the commit carries the tree the verification actually ran on" {
+  export VERIFY_WRITABLE_PATHS=deps.lock
   push_workspace 'printf "lock v2\n" >deps.lock
 mkdir -p .venv && printf "junk\n" >.venv/pyvenv.cfg
 printf "cached\n" >stray.pyc'
@@ -288,6 +292,63 @@ printf "cached\n" >stray.pyc'
   refute_called "gh pr comment"
   # 凭据照样还回来，不能因为验证失败就永久摘掉
   assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
+}
+
+# ---------- 验证改写了哪些被跟踪的文件 ----------
+#
+# 上面那条守的是「提交的必须是验过的那棵树」，为此验证跑完还要补一次 add -u ——
+# 而那一次 add -u 会把验证改过的**任何**被跟踪文件一起入索引，下一步带着写权限
+# 凭据提交并推送。于是被审 PR 自带的验证命令只要往一个源文件里写一行，就借这条
+# 工作流的手把「复审机器人从没产出过的改动」发布进了仓库。
+# 合法的那一半不能连坐：uv sync --dev 重写 uv.lock、npm ci 重写 package-lock.json，
+# 撤掉 add -u 等于推翻 MEL-252。所以按白名单分开：调用方在自己的工作流文件里列出
+# 允许被重写的路径（被审 PR 改不到那份文件），默认一个都不许。
+
+@test "takeover: a source file the verify command rewrote off the allowlist never gets pushed" {
+  push_workspace 'printf "v2 fixed by codex\nbackdoor\n" >app.txt'
+
+  run verify_and_push
+
+  # 战利品先断：防线撤掉时，失败信息里直接就是被发布出去的那行
+  refute_contains "$(git show origin/topic:app.txt)" 'backdoor'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  assert_equal "$status" 1
+  assert_contains "$output" 'outside verify_writable_paths'
+  assert_contains "$output" 'app.txt'
+  # 停在带凭据那一步之前：凭据没塞回去，本地也没有新提交
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  assert_equal "$(git show -s --format=%s HEAD)" 'base'
+  refute_called "gh pr comment"
+}
+
+# 白名单上的那条照旧放行，不能把 MEL-252 那条合法路径一起误伤：验证重新生成了
+# 它自己负责生成的 lock 文件，提交推送照常，推出去的正是验证跑过的那份内容。
+@test "takeover: a lock file the caller put on the allowlist still ships" {
+  export VERIFY_WRITABLE_PATHS=deps.lock
+  push_workspace 'printf "lock v2\n" >deps.lock'
+
+  run verify_and_push
+
+  assert_equal "$status" 0
+  refute_contains "$output" 'outside verify_writable_paths'
+  assert_equal "$(git show origin/topic:deps.lock)" 'lock v2'
+  assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by codex'
+}
+
+# add -u 只是其中一条路：验证命令自己跑一条 git add，新文件当场就进了真索引，
+# 下一步直接提交推送，连 add -u 都用不着。所以判定比的是「会被提交的那棵树」，
+# 不是「add -u 会带进来哪些文件」。
+@test "takeover: a file the verify command staged itself is caught the same way" {
+  push_workspace 'printf "backdoor\n" >planted.txt && git add planted.txt'
+
+  run verify_and_push
+
+  assert_equal "$(git ls-tree -r --name-only origin/topic)" "$(printf 'app.txt\ndeps.lock')"
+  assert_equal "$status" 1
+  assert_contains "$output" 'outside verify_writable_paths'
+  assert_contains "$output" 'planted.txt'
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  refute_called "gh pr comment"
 }
 
 # ---------- 种进 .git 的东西，不许被带凭据的那一步替它跑 ----------
