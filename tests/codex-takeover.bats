@@ -121,6 +121,25 @@ handover_workspace() {
   [ -s .review/findings-99-1.md ]
 }
 
+# 半成品还能藏在 .gitignore 后面：Claude 撞额度前跑过一半的 uv sync 留下 .venv，
+# 没有 -x 的 git clean 扫不走它，它就跟着进 Codex 这一轮，验证跑在一个被污染的
+# 工作区上。预取的意见在 clean 之前就挪出了工作区，clean 之后才放回去，所以 -x
+# 连它一起扫也不影响。
+@test "takeover: an ignored leftover never survives into the Codex round" {
+  handover_workspace
+  printf '.venv/\n' >.gitignore
+  git add .gitignore
+  git commit -q -m 'the caller repo ignores .venv'
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  mkdir -p .venv && printf 'half-built by claude\n' >.venv/pyvenv.cfg
+
+  run run_block "$WF" "Hand the round over to Codex"
+
+  assert_equal "$status" 0
+  [ ! -e .venv/pyvenv.cfg ]
+  assert_contains "$(cat .review/findings-99-1.md)" 'this swallows the error'
+}
+
 # ---------- 验证、提交、推送 ----------
 
 # 验证那一步和随后 commit/push 那一步共用的工作区：一个带 origin 的真仓库，加上 Codex 刚

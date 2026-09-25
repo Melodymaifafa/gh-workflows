@@ -679,14 +679,15 @@ jobs:
           # 一轮只允许一个 fixer 写 PR。Claude 可能在撞额度前已经改了工作区却
           # 没提交（提交过的那种在上一步就拒绝换人了）。不清掉的话，下面的
           # git add -A 会把它没验证完的半成品和 Codex 的改动一起当成「Codex 修
-          # 好了」推出去。
+          # 好了」推出去。`-x` 不能省：被 .gitignore 挡住的半成品（.venv、
+          # node_modules、build 产物）没有 -x 就留在原地，跟着进 Codex 这一轮。
           git reset --quiet --hard "$BASE_SHA"
-          git clean -qfd
+          git clean -qfdx
 
           # 交给 Codex 的那份换成带 run id 的名字再放回去，理由同「取脚本的落点
           # 必须带 run id」：这个路径不可能是调用方已跟踪的文件，所以 reset 恢复
-          # 不了它、也没有同名文件被它顶掉；`.review/` 在 .git/info/exclude 里，
-          # 它照样进不了 git add、也不会被 git clean 扫走。
+          # 不了它、也没有同名文件被它顶掉。它落在 clean 之后，所以 -x 也扫不到它；
+          # `.review/` 在 .git/info/exclude 里，后面的 git add 同样看不见它。
           mkdir -p .review
           findings=".review/findings-$RUN_SLUG.md"
           cp "$saved" "$findings"
