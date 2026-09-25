@@ -569,8 +569,13 @@ jobs:
             if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
               # 503 / 529 上一步归到 fix-failed，只有 api_error_status 能证明它是
               # provider 侧失败；不补这一行，它就只能靠模型散文被认出来。
-              jq -r '[.. | objects | select(.type? == "result") | .api_error_status | numbers]
-                     | last // empty | "API Error: \(.)"' \
+              # 状态码只认终态那一条 result：先把 result 挑出来取 last，再读它的
+              # api_error_status。反过来「把所有 result 的状态码收成数组取 last」
+              # 会把中途那条 429 捡起来当结论 —— 终态其实是「代码没修好、没有状态
+              # 码」，业务失败就这么被买成一次额度换人。写法跟同文件
+              # Check the fix outcome 保持一致。
+              jq -r '[(if type == "array" then .[] else empty end) | select(.type? == "result")]
+                     | last | .api_error_status | numbers | "API Error: \(.)"' \
                  "$EXECUTION_FILE" >>"$diag" 2>/dev/null || true
               jq -r '[.. | objects | select(.type? == "result")]
                      | map([.subtype, (.is_error | tostring), .result] | join(" "))

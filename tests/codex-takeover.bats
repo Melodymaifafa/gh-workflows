@@ -207,6 +207,50 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   assert_equal "$(step_output run_codex)" false
 }
 
+# 状态码只能从终态那一条 result 上读。把所有 result 的状态码收成数组再取 last，
+# 会捡起中途那条 429 —— 而终态其实是「代码没修好、根本没有状态码」。分类器只信
+# 这段结构化裸行，于是一次本该打红的业务失败直接买到一次换人，接手的那个 token
+# 有写权限。
+@test "takeover: a 429 on an earlier record buys nothing when the terminal record is a business failure" {
+  git init -q .
+  git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true
+  export OUTCOME_RESULT=success OUTCOME_FAILED=true
+  export OUTCOME_REASON=fix-failed OUTCOME_UNTIL=- HEAD_SHA="$H"
+  export EXECUTION_FILE="$BATS_TEST_TMPDIR/exec.json"
+  jq -n '[
+      {type:"result",subtype:"error",is_error:true,api_error_status:429,result:"transient blip, retrying"},
+      {type:"assistant"},
+      {type:"result",subtype:"error",is_error:true,result:"the assertion still fails after 3 attempts"}
+    ]' >"$EXECUTION_FILE"
+
+  run run_block "$WF" "Decide the takeover"
+
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-failed'
+}
+
+@test "takeover: a provider status on the terminal record still hands the round over" {
+  git init -q .
+  git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true
+  export OUTCOME_RESULT=success OUTCOME_FAILED=true
+  export OUTCOME_REASON=fix-failed OUTCOME_UNTIL=- HEAD_SHA="$H"
+  export EXECUTION_FILE="$BATS_TEST_TMPDIR/exec.json"
+  jq -n '[
+      {type:"result",subtype:"error",is_error:true,result:"first attempt failed"},
+      {type:"result",subtype:"error",is_error:true,api_error_status:529,result:"gave up"}
+    ]' >"$EXECUTION_FILE"
+
+  run run_block "$WF" "Decide the takeover"
+
+  assert_equal "$status" 0
+  assert_equal "$(step_output run_codex)" true
+}
+
 # 正常路径上 Check the fix outcome 会先打红，走不到这一步；这里守的是兜底本身。
 @test "takeover: review_fixer=claude never hands over, even on a real provider limit" {
   decide claude false fix-quota 'API Error: 429 rate_limit_error'
