@@ -290,6 +290,91 @@ printf "cached\n" >stray.pyc'
   assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
 }
 
+# ---------- 种进 .git 的东西，不许被带凭据的那一步替它跑 ----------
+#
+# 验证那一步跑的是被审 PR 自己的代码，它对工作副本有写权限。它不需要能读到令牌：
+# 往 .git 里种一个「下一步会去跑」的东西就够了 —— 下一步会把 checkout 凭据塞回
+# .git/config、挂上 GH_TOKEN，然后 git commit + git push。两道各守一半：
+#   1. 带凭据的那几条 git 命令免疫仓库本地配置（命令行 -c core.hooksPath=空目录）；
+#   2. 验证前后 .git/config 与 .git/hooks 的指纹不一致就红着停下，停在凭据回来之前。
+# 第 1 道只覆盖钩子，第 2 道覆盖「.git/config 里所有会去跑命令的键」这一整类。
+
+# 钩子里写的是它当场摸到的两把钥匙：文件存在 = 它真被执行了。
+plant_hook() { # plant_hook <hook path>
+  mkdir -p "$(dirname "$1")"
+  {
+    echo '#!/bin/sh'
+    printf 'loot=%s/hook-loot.txt\n' "$BATS_TEST_TMPDIR"
+    echo 'git config --local --get http.https://github.com/.extraheader >"$loot" || echo no-cred >"$loot"'
+    echo 'echo "GH_TOKEN=$GH_TOKEN" >>"$loot"'
+  } >"$1"
+  chmod +x "$1"
+}
+
+# 只跑带凭据那一步：这一道要单独立得住，不能靠上一步的指纹比对兜着。
+commit_with_planted_hook() {
+  git add -A
+  run run_step "$WF" "Commit and push the Codex fix"
+}
+
+hook_loot() {
+  cat "$BATS_TEST_TMPDIR/hook-loot.txt" 2>/dev/null || true
+}
+
+@test "takeover: a hook planted in .git never runs in the step that holds the credentials" {
+  push_workspace 'true'
+  plant_hook .git/hooks/pre-commit
+
+  commit_with_planted_hook
+
+  assert_equal "$status" 0
+  assert_equal "$(hook_loot)" ''
+  # 提交推送本身照旧，这一道不能靠「什么都不做」来通过
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  assert_equal "$(git show HEAD:app.txt)" 'v2 fixed by codex'
+}
+
+@test "takeover: a core.hooksPath planted in .git/config never runs in that step either" {
+  push_workspace 'true'
+  plant_hook "$BATS_TEST_TMPDIR/evil-hooks/pre-commit"
+  git config --local core.hooksPath "$BATS_TEST_TMPDIR/evil-hooks"
+
+  commit_with_planted_hook
+
+  assert_equal "$status" 0
+  assert_equal "$(hook_loot)" ''
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
+# .git/config 里会去跑命令的键不止 core.hooksPath —— credential.helper（! 开头就是
+# shell）、core.pager、gpg.program、filter.*.clean、core.fsmonitor 都算。逐条堵就是
+# 把「跟着意见追」换个地方重演，所以守的是「验证期间 .git/config 变过就红」。
+@test "takeover: a verify command that writes .git/config stops the chain before the credentials return" {
+  push_workspace 'git config --local credential.helper "!f(){ echo password=stolen; }; f"'
+
+  run verify_and_push
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'the verify command modified .git'
+  # 停在带凭据那一步之前：凭据没塞回去，没有新提交，也没人发评论
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  assert_equal "$(git show -s --format=%s HEAD)" 'base'
+  refute_called "gh pr comment"
+}
+
+# 指纹的另一半：.git/hooks 下的文件名和内容。少了这一半，种钩子这条路只剩第 1 道挡。
+@test "takeover: a hook the verify command plants stops the chain as well" {
+  push_workspace 'printf "#!/bin/sh\ntrue\n" >.git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit'
+
+  run verify_and_push
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'the verify command modified .git'
+  assert_equal "$(git show -s --format=%s HEAD)" 'base'
+  refute_called "gh pr comment"
+}
+
 # ---------- 谁来下结论 ----------
 
 # 这一步在 review_fixer 允许换人时把结论让给 Decide the takeover。

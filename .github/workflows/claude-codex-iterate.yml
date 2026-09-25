@@ -779,6 +779,39 @@ jobs:
           decoy="$RUNNER_TEMP/verify-decoy-$$"
           mkdir -p "$decoy"
 
+          # 验证命令对工作副本有写权限，所以它能往 .git 里种「后面某一步会去跑」的
+          # 东西：.git/hooks/ 下的钩子，或者 .git/config 里任意一个「会去跑命令」的键
+          # （core.hooksPath、credential.helper（! 开头就是 shell）、core.pager、
+          # gpg.program、filter.*.clean / .smudge、core.fsmonitor）。把这些键一条条
+          # 列出来堵，就是把「跟着复审意见逐条追」换个地方重演，所以这里按整体指纹
+          # 验收：验证前后 .git/config 和 .git/hooks 有任何差异就红着停下，停在下一
+          # 步之前（下一步手上同时有 GH_TOKEN 和 checkout 的凭据）。一律不静默恢复。
+          # 边角一起覆盖掉：验证命令自己写一个 extraheader 的话，下面那次「塞回去」
+          # 就变成两个值 —— 那也是一处差异，照样红。
+          # 指纹不经过 git 算：要比对的正是 git 的配置，拿 git 去读它，被种下的配置
+          # 就有机会插手。sha256sum 在 runner 上，shasum 在 macOS 上（本机跑测试）。
+          sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
+          }
+          git_dir="$(git rev-parse --git-dir)"
+          git_state_digest() {
+            {
+              sha256 <"$git_dir/config"
+              for entry in "$git_dir/hooks"/* "$git_dir/hooks"/.[!.]*; do
+                if [ -L "$entry" ]; then
+                  printf '%s symlink %s\n' "${entry##*/}" "$(readlink "$entry")"
+                elif [ -f "$entry" ]; then
+                  mode='not-executable'
+                  if [ -x "$entry" ]; then mode='executable'; fi
+                  printf '%s file %s %s\n' "${entry##*/}" "$(sha256 <"$entry")" "$mode"
+                elif [ -e "$entry" ]; then
+                  printf '%s other\n' "${entry##*/}"
+                fi
+              done | LC_ALL=C sort
+            } | sha256
+          }
+          git_state_before="$(git_state_digest)"
+
           verify_status=0
           env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
               GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
@@ -787,6 +820,14 @@ jobs:
           : >"$GITHUB_ENV"
           : >"$GITHUB_OUTPUT"
           [ -z "${GITHUB_PATH:-}" ] || : >"$GITHUB_PATH"
+
+          # 这一比对必须排在「把凭据塞回去」之前：凭据一回到 .git/config，下一步就
+          # 有了两把写权限钥匙，种下去的东西也就有人替它跑了。
+          if [ "$(git_state_digest)" != "$git_state_before" ]; then
+            echo '- verification: **rejected**, the verify command modified .git' >>"$GITHUB_STEP_SUMMARY"
+            echo '::error::the verify command modified .git (hooks or config); refusing to run any credentialed git command on this checkout'
+            exit 1
+          fi
 
           [ -z "$cred_header" ] || git config --local http.https://github.com/.extraheader "$cred_header"
 
@@ -821,8 +862,17 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
-          git push -q origin "HEAD:$HEAD_REF"
+          # 这两条命令手上同时有 GH_TOKEN 和 checkout 留在 .git/config 里的凭据，
+          # 所以它们必须免疫仓库本地配置：上一步跑的是被审 PR 自己的代码，它能往
+          # .git/hooks 种钩子，也能往 .git/config 写 core.hooksPath 把钩子指到别处。
+          # 命令行 -c 压得过任何配置文件里的同名键，指到一个空目录 = 两种种法一起
+          # 失效。--no-verify 挡不住 post-commit 这类，所以不靠它。上一步的快照比对
+          # 是同一件事的另一半：它覆盖整类，这一道只覆盖钩子。
+          empty_hooks="$RUNNER_TEMP/no-hooks-$$"
+          mkdir -p "$empty_hooks"
+
+          git -c "core.hooksPath=$empty_hooks" commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
+          git -c "core.hooksPath=$empty_hooks" push -q origin "HEAD:$HEAD_REF"
           new_head="$(git rev-parse HEAD)"
           echo 'pushed=true' >>"$GITHUB_OUTPUT"
           echo '- verification: passed, the fix was pushed' >>"$GITHUB_STEP_SUMMARY"
