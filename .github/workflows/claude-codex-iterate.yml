@@ -774,6 +774,42 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 我们自己跑的每一条命令，都必须来自「验证命令写不动」的目录。runner 的
+          # PATH 前几项在 $HOME 下（`.local/bin` 之类），验证命令跟我们同一个用户，
+          # 往那儿放一个假 ps 就能把自己从清点里隐掉，放一个假 git 就能报一棵假的树
+          # —— 下面每一道判定当场变成空转。所以把我们这份 PATH 过滤成「我们写不动
+          # 的目录」（我们写得动 = 它也写得动），连上一级目录一起看：目录本身不可写
+          # 但父目录可写的话，整个目录被换掉就行。原来那份 PATH 只交给验证命令自己，
+          # 它要 uv / npm / node 那些装在 $HOME 下的工具。
+          path_is_protected() {
+            local dir="$1"
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          verify_path="$PATH"
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+          # 少了哪一样都等于这一整步没法判定 —— 红着停下，别静默空转。
+          for tool in git ps awk sed cut id mktemp cp ls; do
+            command -v "$tool" >/dev/null 2>&1 && continue
+            echo "::error::$tool is not available from a write-protected PATH entry; cannot verify this checkout safely"
+            exit 1
+          done
+
           # 这一步跑完被审 PR 自己的命令之后还要接着用 git，所以它跟下一步同一个
           # 规矩：只认我们在命令行上给的那几项，机器上任何一份 git 配置文件都不
           # 作数（为什么是整个作用域关掉而不是逐条堵键名，见下一步同名的 sealed_git）。
@@ -915,36 +951,55 @@ jobs:
           # 树、以及下一步的提交推送）。按进程组去数只能算「原来那个组里没人了」——
           # 一条 setsid（或一次双重 fork）就把后代换到新的会话/新的组，按组号去 ps
           # 的收尾压根看不见它，它活到判定做完之后再动手，就把上面这些判定全废了。
-          # 所以要一份正面证据，而且证据本身不能由它来提供：开一条管道，写端交给
-          # 它那一棵树，读端我们自己拿着、并且立刻关掉我们自己那份写端。fork / exec /
-          # setsid / nohup 都原样带着打开的文件描述符走，所以只要那棵树里还有一个
-          # 进程活着，读端就永远读不到 EOF；读到 EOF = 持有者一个不剩。
-          # 残余：后代把继承来的描述符一个个显式关掉就能躲开这份证据（关光所有
-          # 描述符是 daemon 化的常见写法）。所以它不是唯一一道 —— 凭据从此根本不在
-          # 两步之间落盘，指纹和白名单照旧在它之前红着停下。
-          verify_live_dir="$(mktemp -d "$RUNNER_TEMP/verify-live-XXXXXX")"
-          mkfifo "$verify_live_dir/holder"
-          # FIFO 的两头要先都开上，单开一头会阻塞：9 先读写开一次，8/7 各自开好之后
-          # 再把 9 关掉，剩下 7 = 读端、8 = 写端。
-          exec 9<>"$verify_live_dir/holder"
-          exec 8>"$verify_live_dir/holder"
-          exec 7<"$verify_live_dir/holder"
-          exec 9>&-
+          # 拿「继承来的描述符」当正面证据也不行：工作流源码在 PR 里公开可见、描述符
+          # 号写死在里面，被审 PR 自己的验证命令开头一句 exec 8>&- 关掉它、再 setsid
+          # 躲起来，我们这头立刻读到 EOF，判定「死透了」而它还活着（Codex 2026-09-25
+          # 的 P1，审核方独立实跑复现）。
+          # 证据不能建立在任何一样「它自己交得出去的东西」上：进程组、会话、继承的
+          # 描述符，它都能主动丢掉。丢不掉的只有**运行用户** —— 它手上没有提权手段，
+          # fork / exec / setsid / nohup 出来的每一个进程都还挂在同一个 uid 上，而
+          # 「同一个 uid」正好就是它能读走凭据的那个条件（/proc/<pid>/environ 按 uid
+          # 放行）。所以按 uid 正面清点：跑验证之前拍一份「这个用户当下有哪些进程」，
+          # 跑完之后反复清点，直到某一刻这个用户名下除了基线里那些、以及我们自己的
+          # 后代之外一个都不剩 —— 那一刻就是正面证据（真有哪一刻空了它就再也回不来：
+          # 没有任何进程能把它拉起来）。一直不空就红着停下。
+          verify_uid="$(id -u)"
+
+          # 身份 = pid + 启动时刻，光看 pid 会被 pid 复用骗过（Linux 的 pid_max 默认
+          # 四百万，想撞上一个已经死掉的基线 pid 还得同一秒启动，跑不出来）。
+          # ps -U 选「真实用户」，GNU 和 BSD 都是这个意思（别写 -u：BSD 上它是格式
+          # 选项）。字段按 -o 给的顺序来：pid ppid stat lstart（固定 5 段）args…。
+          # 僵尸不算：它已经死了，只是还没被收尸，读不了任何东西。
+          user_procs() {
+            ps -U "$verify_uid" -o pid=,ppid=,stat=,lstart=,args= 2>/dev/null |
+              awk 'NF >= 8 && $3 !~ /^Z/ {
+                cmd = ""
+                for (i = 9; i <= NF; i++) cmd = cmd (i > 9 ? " " : "") $i
+                printf "%s|%s|%s %s %s %s %s|%s\n", $1, $2, $4, $5, $6, $7, $8, cmd
+              }'
+          }
+
+          # 清点不出来就等于这一道什么都没做 —— 静默的 no-op 比没有更糟，红着停下。
+          if [ -z "$(user_procs)" ]; then
+            echo '::error::cannot list this user'"'"'s processes; cannot prove the verify command leaves nothing alive'
+            exit 1
+          fi
+          # 基线只留 pid|ppid|启动时刻，不留命令行：拿它喂 awk -v，别让 PR 自己起的
+          # 进程名把内容带进去。
+          verify_procs_baseline="$(user_procs | cut -d'|' -f1-3)"
 
           # 验证命令跑在它自己的进程组里：set -m 让后台任务另起一组（组号 = 该任务
           # 的 pid），跑完才能 kill -- -组号 连整组一起收掉。它可以 fork 一个进程再让
           # 自己退出 —— 指纹和废纸篓文件都不杀进程，那个进程活到下一步导出 GH_TOKEN
           # 的时候，同一个用户，轮询就能把钥匙捞走。
           # stdin 接 /dev/null：后台进程组读终端会吃 SIGTTIN 停住。
-          # 7<&-：读端不给它，它只该拿到写端。
           set -m
           env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
               GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
-              bash -euo pipefail -c "$VERIFY" </dev/null 7<&- &
+              PATH="$verify_path" \
+              bash -euo pipefail -c "$VERIFY" </dev/null &
           verify_pgid=$!
           set +m
-          # 我们自己这份写端现在就关掉：留着的话读端永远等不到 EOF，这份证据就废了。
-          exec 8>&-
           verify_status=0
           wait "$verify_pgid" || verify_status=$?
 
@@ -986,34 +1041,65 @@ jobs:
             exit 1
           fi
 
-          # 上面按组号收完了，这里要那份正面证据：读端读到 EOF = 那棵树里再没有
-          # 进程持有写端。cat 在所有写端关闭时自己退出，所以「cat 退出了」就是证据；
-          # 时限内不退出 = 有后代逃出了进程组（setsid / 双重 fork），红着停下。
+          # 上面按组号收完了，这里要那份正面证据：这个用户名下再没有「不是基线里的、
+          # 也不是我们自己后代的」活进程。逃出进程组（setsid / 双重 fork）、关光继承
+          # 的描述符、改掉环境变量，都换不掉 uid，所以这份清点它退不出去。
+          # 「我们自己的后代」按当下这一份快照里的父子链认：验证命令那棵树的头已经被
+          # wait 掉了，逃掉的后代会被过继给 init，链子走不回我们这里，照样露出来。
           # 这一道必须排在指纹、树、以及下一步的提交推送之前：那些判定一旦在「验证
           # 还活着」的情况下做出来，结论当场就作废 —— 它可以等判定过去再改文件、再
           # 入索引，让下一步替它提交推送。
-          # 5 秒：写端全关掉之后 cat 是立刻退出的（EOF 在内核那一层就定了），这个数
-          # 只是给调度留余量。定得太短会误红 —— 19 个仓库一起误红，比慢 5 秒糟得多。
-          verify_tree_is_dead() {
-            local waited=0 probe
-            cat <&7 >/dev/null 2>&1 &
-            probe=$!
-            while [ "$waited" -lt 50 ]; do
-              if ! kill -0 "$probe" 2>/dev/null; then
-                wait "$probe" 2>/dev/null || true
-                return 0
-              fi
+          # 基线和当下这一份快照一起喂给同一个 awk，B/S 两种前缀分开 —— 不走 -v（本机
+          # 的 awk 不收带换行的 -v 值），更不落文件：基线文件在验证命令跑之前就存在，
+          # 它往里补一行自己的 pid 就把自己写成「基线里本来就有的」了。基线只活在
+          # 这个 shell 的变量里，验证命令是子进程，改不到。
+          verify_leftovers=''
+          unexplained_procs() {
+            {
+              printf '%s\n' "$verify_procs_baseline" | sed 's/^/B|/'
+              user_procs | sed 's/^/S|/'
+            } | awk -F'|' -v self="$$" '
+                $1 == "B" { known[$2 "|" $4] = 1; next }
+                $1 == "S" {
+                  n++; pid[n] = $2; parent[$2] = $3; key[n] = $2 "|" $4
+                  c = $5
+                  for (i = 6; i <= NF; i++) c = c "|" $i
+                  cmd[n] = c
+                }
+                END {
+                  for (r = 1; r <= n; r++) {
+                    if (key[r] in known) continue
+                    p = pid[r]; hops = 0; mine = 0
+                    while (p != "" && p != "0" && p != "1" && hops < 64) {
+                      if (p == self) { mine = 1; break }
+                      p = parent[p]; hops++
+                    }
+                    if (mine) continue
+                    printf "%s (%s)\n", pid[r], cmd[r]
+                  }
+                }'
+          }
+
+          # 清点到「某一刻干净」就算过，不要求次次干净：机器上别的进程刚好在这一瞬
+          # 起来也会被记一笔（本机跑测试时尤其常见）。反复清点、拿第一个干净的瞬间
+          # 当证据 —— 那一刻它名下一个进程都没有，就再也回不来了。5 秒内一直不干净
+          # 就红着停下；这个数只是给调度和噪声留余量，定太短会 19 个仓库一起误红。
+          # 不干净的那些**不杀**：我们分不清那是逃逸的后代还是机器上别人的进程，误杀
+          # 比红着停下糟得多 —— 而红着停下之后，带凭据的那一步压根不会开始。
+          verify_tree_is_contained() {
+            local waited=0
+            while :; do
+              verify_leftovers="$(unexplained_procs)"
+              [ -n "$verify_leftovers" ] || return 0
+              [ "$waited" -lt 50 ] || return 1
               sleep 0.1
               waited=$((waited + 1))
             done
-            kill -9 "$probe" 2>/dev/null || true
-            wait "$probe" 2>/dev/null || true
-            return 1
           }
 
-          if ! verify_tree_is_dead; then
-            echo '- verification: **rejected**, a descendant escaped its process group and is still alive' >>"$GITHUB_STEP_SUMMARY"
-            echo '::error::the verify command left a descendant alive outside its own process group (setsid / double fork); refusing to trust the post-verify tree'
+          if ! verify_tree_is_contained; then
+            echo '- verification: **rejected**, a process it started outlived it' >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::a process owned by this runner user outlived the verify command ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); refusing to trust the post-verify tree"
             exit 1
           fi
 
@@ -1089,8 +1175,19 @@ jobs:
 
           echo 'changed=true' >>"$GITHUB_OUTPUT"
 
-      # 令牌和写权限凭据都只在这一步出现：验证命令上一步就跑完了，碰不到这里的
-      # 环境，而 .git/config 里那份凭据上一步摘掉之后就没再还回去。
+      # 令牌和写权限凭据都只在这一步出现。这一步的 env: 里有 GH_TOKEN，而 Linux 上
+      # 同一个 uid 的活进程能从 /proc/<pid>/environ 把它读回去 —— 所以「令牌放在
+      # step env 里」这件事本身不是靠挪位置能修好的：放文件更糟（谁都能轮询），上
+      # 命令行也一样（argv 公开），而 unset 改不掉 /proc 里那份初始环境。
+      # 真正的条件是**这一步跑着的时候，被审 PR 没有任何活进程**：每个 step 是各自
+      # 一个进程，验证那一步的进程早已退出（死进程没有 environ 可读），这一步的进程
+      # 在验证那一步跑的时候还不存在。于是唯一的风险就是「验证留下了活进程」——
+      # 上一步按运行用户正面清点、清不干净就红着停下（fail closed），这一步靠
+      # steps.codex_verify 的输出把门；那一步红了，这一步压根不会开始。
+      # 上一版的验收记录写成「躲开之后它找不到任何可轮询的凭据」，那句话是错的：
+      # 凭据只是从文件挪进了进程环境，仍然有地方可以等。正确的说法是「不许有人等」。
+      # 想让 environ 连同一个用户也读不到，只有把验证命令换到另一个用户 / 容器里跑
+      # （代价见 README），本轮没做。
       - name: Commit and push the Codex fix
         id: codex_push
         if: steps.codex_verify.outputs.changed == 'true'
@@ -1102,6 +1199,37 @@ jobs:
           ROUND: ${{ steps.gate.outputs.round }}
         run: |
           set -euo pipefail
+
+          # 命令从哪儿来也只信写不动的那几个目录：上一步跑的是被审 PR 自己的代码，
+          # runner 的 PATH 前几项在 $HOME 下、它写得动 —— 往那儿放一个假 git，这一步
+          # 就把现造的那份凭据连同 GH_TOKEN 一起交到它手上（跟种钩子是同一类事，只是
+          # 换成了「换掉命令本身」）。所以同上一步：PATH 过滤成我们写不动的目录，
+          # 目录和它的上一级一起看。
+          path_is_protected() {
+            local dir="$1"
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+          if ! command -v git >/dev/null 2>&1; then
+            echo '::error::git is not available from a write-protected PATH entry; refusing to run a credentialed git command'
+            exit 1
+          fi
 
           # 这一步只信我们在命令行上给的那几项配置：上一步跑的是被审 PR 自己的代码，它能往
           # .git/hooks 种钩子、往 .git/config 写 core.hooksPath 把钩子指到别处，也能写
@@ -1138,8 +1266,10 @@ jobs:
           # 写权限凭据这一轮只在这里出现，而且只出现在这一条 push 的环境里：
           # 上一步把 checkout 留在 .git/config 里那份摘掉就没还回去，我们用手上的
           # GH_TOKEN 现造一份（actions/checkout 写进去的就是这一串）。
-          # 不落 .git/config：落了，任何一个活着的进程轮询那个文件就读得走，而这正是
-          # 「按进程组收尾挡不住 setsid」留下的那条路（MEL-255）。
+          # 不落 .git/config：落了就是一份谁都能轮询的文件，而这正是「按进程组收尾
+          # 挡不住 setsid」留下的那条路（MEL-255）。凭据只活在这一条 push 的环境里，
+          # 它的命门跟这一步的 GH_TOKEN 一样 —— 见上面那段：靠的是「上一步证明了没有
+          # 活进程」，不是靠藏。
           # 也不上命令行：argv 在 /proc 里是公开的，-c 等于把凭据贴到进程表上。
           # printf 是 bash 内建，令牌不会出现在任何一个进程的 argv 里；GNU 的 base64
           # 默认按 76 列折行，所以 tr 掉换行。
