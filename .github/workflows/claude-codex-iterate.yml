@@ -818,9 +818,26 @@ jobs:
             if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
           }
           git_dir="$(sealed_git rev-parse --git-dir)"
+          # 「还是不是原来那个文件」也要认，光比内容不够：sha256 <file 跟着快捷方式
+          # 走，验证命令把 .git/config 复制到仓库里一个被跟踪的文件、再把 .git/config
+          # 换成指向它的 symlink，内容一字不差、指纹照过 —— 凭据塞回去就顺着写进了
+          # 那个被跟踪的文件，紧接着的 add -u 把它入索引，下一步提交推送，凭据明文
+          # 进了 PR。硬链接同理（inode 没变、链接数从 1 变 2）。所以 inode / 权限位 /
+          # 链接数一起进指纹。ls -ldi 的前三列在 GNU 和 BSD 上是一样的，比 stat 好使。
+          file_ident() {
+            # shellcheck disable=SC2012  # 路径是写死的 .git/config，没有文件名解析问题；
+            # find 拿 inode 要 GNU 的 -printf，runner 有、本机跑测试的 macOS 没有。
+            ls -ldi "$1" | awk '{ print $1, $2, $3 }'
+          }
           git_state_digest() {
             {
-              sha256 <"$git_dir/config"
+              if [ -L "$git_dir/config" ]; then
+                printf 'config symlink %s\n' "$(readlink "$git_dir/config")"
+              elif [ -f "$git_dir/config" ]; then
+                printf 'config file %s %s\n' "$(sha256 <"$git_dir/config")" "$(file_ident "$git_dir/config")"
+              else
+                printf 'config other\n'
+              fi
               for entry in "$git_dir/hooks"/* "$git_dir/hooks"/.[!.]*; do
                 if [ -L "$entry" ]; then
                   printf '%s symlink %s\n' "${entry##*/}" "$(readlink "$entry")"
@@ -892,6 +909,14 @@ jobs:
           # 固定），往里丢一个 post-index-change 就能让下面那次 add -u 替它跑。这个新
           # 目录在它死透之后才存在，它没机会往里写东西。
           empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
+
+          # 指纹之前先认文件类型：凭据是用 git config --local 写回 .git/config 的，
+          # 它跟着快捷方式走。不是普通文件就红着停下，别让凭据落到别的地方去。
+          if [ -L "$git_dir/config" ] || [ ! -f "$git_dir/config" ]; then
+            echo '- verification: **rejected**, .git/config is no longer a regular file' >>"$GITHUB_STEP_SUMMARY"
+            echo '::error::.git/config is no longer a regular file; refusing to restore the credentials into it'
+            exit 1
+          fi
 
           # 这一比对必须排在「把凭据塞回去」之前：凭据一回到 .git/config，下一步就
           # 有了两把写权限钥匙，种下去的东西也就有人替它跑了。

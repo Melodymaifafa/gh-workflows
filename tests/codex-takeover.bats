@@ -520,6 +520,25 @@ done'
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
 }
 
+# ---------- 指纹要认「还是不是原来那个文件」，不能只认内容 ----------
+#
+# sha256 <file 跟着快捷方式走。验证命令把此刻还没凭据的 .git/config 复制到仓库里一个
+# 被跟踪的文件，再把 .git/config 换成指向它的快捷方式：内容一字不差 → 指纹通过 →
+# 凭据塞回去时 git 顺着快捷方式写进了那个被跟踪的文件 → 紧接着的 add -u 把它入索引 →
+# 带凭据那一步提交并推送，凭据明文进了 PR 的提交。
+@test "takeover: a .git/config swapped for a symlink into a tracked file stops the chain before the credentials return" {
+  push_workspace 'cp .git/config deps.lock && ln -sf "$PWD/deps.lock" .git/config'
+
+  run verify_and_push
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'no longer a regular file'
+  # 凭据没塞回去，更没顺着快捷方式写进那个被跟踪的文件
+  refute_contains "$(cat deps.lock)" 'extraheader'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  refute_called "gh pr comment"
+}
+
 # ---------- 验证留下的活进程，不许活到凭据回来 ----------
 #
 # 验证命令可以 fork 一个进程再让自己退出。指纹和废纸篓文件都不杀进程，那个进程
