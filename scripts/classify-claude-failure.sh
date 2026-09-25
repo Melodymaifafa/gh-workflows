@@ -45,7 +45,7 @@ PROSE_STARTS="^[[:space:]]*${CALLER_PREFIX}"
 STRUCTURED_PATTERNS=(
   # Anthropic API 的 HTTP 错误行，形如 `API Error: 429 {...}`。必须带 `API Error`
   # 前缀 —— 光有状态码不算，业务日志里到处是 503。
-  "API Error with a provider status code::^[[:space:]]*API Error:?[[:space:]]+(401|429|503|529)([^0-9]|\$)"
+  "API Error with a provider status code::^[[:space:]]*API Error:?[[:space:]]+(401|429|500|503|529)([^0-9]|\$)"
   # 错误体里的机器错误码：snake_case，后面要词边界。
   "structured provider error code::^[[:space:]]*(rate_limit_error|authentication_error|overloaded_error|insufficient_quota|invalid_api_key)([^a-zA-Z_]|\$)"
   # 余额不足和令牌过期，用 provider 的原话，不拆成 `credit` / `expired` 这种词。

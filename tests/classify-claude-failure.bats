@@ -39,6 +39,11 @@ why() {
   assert_equal "$(verdict "$out")" quota
 }
 
+@test "an API 500 internal error counts as a provider failure" {
+  out="$(classify 'API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}')"
+  assert_equal "$(verdict "$out")" quota
+}
+
 @test "matching is case-insensitive" {
   # 大小写不敏感，但位置照样要求在行首：provider 的报错自己占一行，散文里
   # 出现同样的词不算（见文件末尾那组「散文不能买到一次换人」）。
