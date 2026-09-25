@@ -780,6 +780,46 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   assert_equal "$(step_output run_codex)" false
 }
 
+# 同一条不变量的另一种长相：Claude 改了工作区却没提交就断了。只认 HEAD 的写法
+# 会把它放过去 —— 交接那步的 reset --hard 随后把那些改动整个丢掉，Claude 改到
+# 哪一步没人知道，这一轮还以 Codex 的名义报成功，「修到一半」一条告警都没有。
+@test "takeover: uncommitted edits block the handover the same way a commit does" {
+  decide claude true fix-quota 'API Error: 429 rate_limit_error'
+  # 对照：起点干净、工作区也干净时，这一轮确实换人
+  assert_equal "$status" 0
+  assert_equal "$(step_output run_codex)" true
+
+  # 起点一点没动，只是 Claude 留了没提交的改动
+  printf 'half-finished edit\n' >claude-wip.txt
+  run run_block "$WF" "Decide the takeover"
+
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+  assert_contains "$output" 'left uncommitted edits'
+  assert_contains "$(fake_last_body "gh pr comment")" '没提交'
+}
+
+# .review/ 是 Gate 预取意见的落点。调用方仓库自己跟踪了一个同名文件时，预取会
+# 把它显示成「被改过」—— 那不是 Claude 写的。拿它把换人挡掉，等于在那些仓库里
+# 永久关掉 Codex 兜底。
+@test "takeover: the prefetched review does not count as Claude's leftovers" {
+  decide claude true fix-quota 'API Error: 429 rate_limit_error'
+  assert_equal "$status" 0
+
+  mkdir -p .review
+  printf 'a file the caller repo tracks under .review\n' >.review/findings.md
+  git add .review/findings.md
+  git -c user.email=t@e -c user.name=t commit -q -m 'the caller tracks .review/findings.md too'
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  # Gate 把这一轮的意见预取进去，盖在被跟踪的那份上面
+  printf '## 行内评论\n' >.review/findings.md
+
+  run run_block "$WF" "Decide the takeover"
+
+  assert_equal "$status" 0
+  assert_equal "$(step_output run_codex)" true
+}
+
 # ---------------------------------------------------------------------------
 # step 门禁（MEL-250 F1）
 #
