@@ -958,6 +958,47 @@ EOS
   refute_contains "$push_block" 'config --local http'
 }
 
+# 重跑本身不许把载荷洗白：这一条看住 reset_workspace。第一次尝试故意留一个活到我们
+# 主动叫停为止的逃逸进程（它的 pid 不在探针那两个文件里，所以按「机器噪声」重跑），
+# 第二次尝试进来先把它叫停。重跑要是沿用上一次的工作区，夹带的文件已经在「验证前的
+# 那棵树」里了，前后一比没差异，整轮反而绿着把它推出去 —— 把 reset_workspace 那一行
+# 去掉，这条就是这样变红的。
+@test "harness: a noise retry restarts from a clean workspace, so the smuggled file is still caught" {
+  export NOISE_MARK="$BATS_TEST_TMPDIR/noise.mark"
+  export NOISY_DAEMON="$BATS_TEST_TMPDIR/noisy-daemon.sh"
+  cat >"$NOISY_DAEMON" <<'EOS'
+#!/bin/sh
+i=0
+while [ "$i" -lt 600 ] && [ ! -e "$NOISE_MARK.stop" ]; do
+  /bin/sleep 0.1
+  i=$((i + 1))
+done
+EOS
+  cat >"$BATS_TEST_TMPDIR/noisy.sh" <<'EOS'
+#!/bin/sh
+if [ -e "$NOISE_MARK" ]; then
+  : >"$NOISE_MARK.stop"
+else
+  : >"$NOISE_MARK"
+  perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec("/bin/sh", $ENV{NOISY_DAEMON});' >/dev/null 2>&1 &
+  /bin/sleep 1
+fi
+printf run >>"$NOISE_MARK.runs"
+printf 'backdoor\n' >planted.txt
+git add planted.txt
+EOS
+  push_workspace "sh $BATS_TEST_TMPDIR/noisy.sh"
+
+  run_chain
+
+  # 真的重跑过：载荷每跑一次记三个字节
+  runs="$(wc -c <"$NOISE_MARK.runs" | tr -d ' ')"
+  [ "$runs" -ge 6 ] || { echo "the chain ran only $((runs / 3)) time(s); the retry never happened" >&2; return 1; }
+  assert_equal "$status" 1
+  assert_contains "$output" 'outside verify_writable_paths'
+  assert_equal "$(git ls-tree -r --name-only origin/topic)" "$(printf 'app.txt\ndeps.lock')"
+}
+
 # ---------- 谁来下结论 ----------
 
 # 这一步在 review_fixer 允许换人时把结论让给 Decide the takeover。
