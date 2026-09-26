@@ -705,8 +705,14 @@ jobs:
           # git add -A 会把它没验证完的半成品和 Codex 的改动一起当成「Codex 修
           # 好了」推出去。`-x` 不能省：被 .gitignore 挡住的半成品（.venv、
           # node_modules、build 产物）没有 -x 就留在原地，跟着进 Codex 这一轮。
+          # 第二个 `-f` 也不能省：一个没被跟踪的目录，如果它自己是个 git 仓库
+          # （里面有 .git），单 `-f` 的 git clean 按设计跳过它，还 exit 0 —— 验证
+          # 命令 git clone 了点东西、或者 git init 了个临时目录，就留下这么一个，
+          # 它活过换人，Codex 和它之后那轮验证都跑在这堆不在推出去的 commit 里的
+          # 残留上。`-ff` 删得掉它，又动不了调用方已登记的 submodule —— submodule
+          # 是被跟踪的 gitlink，不属于「没被跟踪的目录」。
           git reset --quiet --hard "$BASE_SHA"
-          git clean -qfdx
+          git clean -qffdx
 
           # 交给 Codex 的那份换成带 run id 的名字再放回去，理由同「取脚本的落点
           # 必须带 run id」：这个路径不可能是调用方已跟踪的文件，所以 reset 恢复
