@@ -142,6 +142,32 @@ handover_workspace() {
   assert_contains "$(cat .review/findings-99-1.md)" 'this swallows the error'
 }
 
+# 还有一类残留连 -x 都扫不掉：一个没被跟踪的目录，如果它自己是个 git 仓库（里面
+# 有 .git），单 -f 的 git clean 按设计跳过它、还 exit 0。验证命令 git clone 了点
+# 东西、或者 git init 了个临时目录，就留下这么一个；它活过换人，Codex 和它之后那
+# 轮验证都跑在这堆残留上，而残留不在最后推出去的 commit 里。要第二个 -f 才删得掉。
+# 两种都摆上：被忽略的（-x 的范围）和纯没被跟踪的（-d 的范围）。
+@test "takeover: an untracked nested git repo never survives into the Codex round" {
+  handover_workspace
+  printf 'vendored/\n' >.gitignore
+  git add .gitignore
+  git commit -q -m 'the caller repo ignores vendored/'
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  # 验证命令 git clone / git init 出来的目录：自带 .git，所以单 -f 清不掉
+  git init -q vendored/dep
+  printf 'cloned by the verify command\n' >vendored/dep/payload.txt
+  git init -q scratch-clone
+  printf 'left behind by claude\n' >scratch-clone/payload.txt
+
+  run run_block "$WF" "Hand the round over to Codex"
+
+  assert_equal "$status" 0
+  [ ! -e vendored/dep ]
+  [ ! -e scratch-clone ]
+  assert_equal "$(git status --porcelain)" ''
+  assert_contains "$(cat .review/findings-99-1.md)" 'this swallows the error'
+}
+
 # ---------- 验证、提交、推送 ----------
 
 # 验证那一步和随后 commit/push 那一步共用的工作区：一个带 origin 的真仓库，加上 Codex 刚
