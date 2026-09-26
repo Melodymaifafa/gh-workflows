@@ -758,11 +758,9 @@ leftover_state() {
 # 下面这个探针因此故意把继承来的描述符全关掉再躲：它要是还能糊弄过去，这一道就
 # 白写了。
 
-# 逃逸探针：验证命令先关光继承来的描述符（3..30），再起一个新会话 + 双重 fork 的
-# 后台进程，然后自己正常退出。
-# CI 的 ubuntu 上走 Codex 点名的那条 setsid；macOS 没有 setsid，用 perl 的
-# POSIX::setsid 走同一条路。它盯着 .git/config，一看到凭据回来就抄走（再执行
-# ESCAPE_AFTER），没等到就在约 10 秒后自己退出 —— 测试不会被挂住。
+# 逃逸探针：验证命令起一个新会话 + 双重 fork 的后台进程，而且把继承来的描述符
+# （3..30）全关掉，然后自己正常退出。它盯着 .git/config，一看到凭据回来就抄走
+# （再执行 ESCAPE_AFTER），没等到就在约 10 秒后自己退出 —— 测试不会被挂住。
 # 探针要的变量得在测试自己这个 shell 里 export，所以这个函数直接改环境、把验证
 # 命令留在 $ESCAPE_VERIFY —— 写成 "$(escaped_probe)" 的话 export 全丢在子 shell 里。
 escaped_probe() { # escaped_probe [抄到凭据之后再干什么]
@@ -782,23 +780,14 @@ done
 EOS
   cat >"$BATS_TEST_TMPDIR/escape.sh" <<'EOS'
 #!/bin/sh
-# 继承来的描述符一个不留：工作流源码是公开的，描述符号写死在里面，关掉就等于
-# 把「靠继承的管道读到 EOF」那种证据作废。
-# 关这一下只能在 `sh -c` 里做，不能在脚本自己身上做：CI 的 /bin/sh 是 dash，它把
-# **脚本文件本身**挂在 fd 10 上，脚本里关掉 3..30 等于把自己还没读完的源码关掉，
-# 当场静默结束（macOS 的 /bin/sh 是 bash，脚本 fd 是 255，本机怎么跑都看不出来）。
-CLOSER='fd=3
-while [ "$fd" -le 30 ]; do
-  eval "exec $fd>&-" 2>/dev/null || true
-  fd=$((fd + 1))
-done
-exec sh "$ESCAPEE"'
-export CLOSER
-if command -v setsid >/dev/null 2>&1; then
-  setsid sh -c "$CLOSER" >/dev/null 2>&1 &
-else
-  perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec("/bin/sh", "-c", $ENV{CLOSER});' >/dev/null 2>&1 &
-fi
+# 一句 perl 把三件事做完：双重 fork + setsid 换到新会话、把继承来的描述符一个不留
+# 地关掉、再 exec 成载荷。这就是 daemon 化的标准写法，也是 Codex 那条 P1 的复现
+# 路径（它只用了一句 exec 8>&-）—— 描述符号写死在公开的工作流源码里，关掉就等于
+# 把「靠继承的管道读到 EOF」那种证据作废，所以探针故意做到底。
+# 关描述符为什么不用 shell：CI 的 /bin/sh 是 dash，它自己占着 fd 10，在脚本里、
+# 甚至在 sh -c 里关到 10，dash 当场静默死掉，探针压根起不来（本机的 /bin/sh 是
+# bash，脚本 fd 在 255，本机怎么跑都看不出来 —— 这一条在 CI 上红过两轮）。
+perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; POSIX::close($_) for (3 .. 30); exec("/bin/sh", $ENV{ESCAPEE});' >/dev/null 2>&1 &
 # 等它真的换完会话再让验证命令退出：慢一步的话，按组号那一下会在 setsid 之前就把
 # 它正当收掉，这条测试就测不到「逃出去之后」那一段了（探针的时序问题，不是防线的）。
 i=0
