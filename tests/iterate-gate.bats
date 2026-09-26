@@ -312,7 +312,8 @@ outcome_env() { # outcome_env <FIX_OUTCOME> <STRUCTURED> [exec fixture]
   if [ -n "${3:-}" ]; then export EXEC_FILE="$FIXTURES_DIR/sdk/$3"; fi
 }
 
-outcome() { run run_block "$WF" "Check the fix outcome"; }
+# 判的是这一步的行为（正文、额度换算、去重），不是它的 PATH —— 把假命令接回去。
+outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
 
 @test "outcome: head moved -> summon + one M7 round marker on the new head, no alert (even if the step failed)" {
   outcome_env failure '' exec-429-weekly-limit.json
@@ -534,9 +535,32 @@ outcome() { run run_block "$WF" "Check the fix outcome"; }
   refute_contains "$bodies" "claude-review-clean:"
 }
 
+# 这一步手上是 github.token（contents + pull-requests 写权限）和 Pushover 两个密钥，
+# 而排在它前面的验证那一步跑的是被审 PR 自己的命令 —— PR 往「自己写得动的 PATH 目录」
+# 放一个假 gh，这一步去跑它就等于把令牌递过去。验证那一步的三道门都看不见：文件在仓库
+# 外、没动 .git、放的是文件不是进程。所以它的命令只从我们写不动的目录里找。
+# 把那段过滤摘掉，这一条当场变红（假 gh 的日志里就有令牌）。
+@test "outcome: a gh planted on a writable PATH entry never gets the round-marker token" {
+  plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh jq date curl sleep
+  outcome_env failure '' exec-429-weekly-limit.json
+  export GH_TOKEN=write-token GH_HOST=127.0.0.1
+
+  run run_block "$WF" "Check the fix outcome"
+
+  refute_planted_ran
+  # 这一步判不了结局就必须红着停下，绝不静默当成「这轮没事」
+  [ "$status" -ne 0 ] || { echo 'the step went green without judging anything' >&2; return 1; }
+
+  # 对照：同一个假 gh，接回 PATH 就真被跑了 —— 上面那条不是因为它压根没种上
+  trust_fake_bin
+  FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_block "$WF" "Check the fix outcome"
+  assert_planted_runs_when_trusted
+}
+
 # ---------- 召唤 ----------
 
 summon_env() {
+  trust_fake_bin
   export FAKE_NOW=2026-09-18T08:10:00Z
   export REVIEWED_SHA="$H" REVIEWED_AT=2026-09-18T08:00:00Z FIX_ROUND=3
   fake_route repos/o/r '{"id":1}'
@@ -574,6 +598,63 @@ summon_env() {
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
   refute_called "gh pr comment"
+}
+
+# 本票堵的那个洞：这一步手上是 CODEX_TRIGGER_TOKEN（真人账号的 fine-grained PAT），
+# 而排在它前面的验证那一步跑的是被审 PR 自己的命令 —— PR 往「自己写得动的 PATH 目录」
+# 放一个假 gh，这一步去跑它，令牌就直接落到 PR 手上。所以它的命令只从我们写不动的
+# 目录里找。把那段过滤摘掉，这一条当场变红（假 gh 的日志里就有令牌）。
+@test "summon: a gh planted on a writable PATH entry never gets the Codex trigger token" {
+  plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh curl date sleep
+  export FAKE_NOW=2026-09-18T08:10:00Z
+  export REVIEWED_SHA="$H" REVIEWED_AT=2026-09-18T08:00:00Z FIX_ROUND=3
+  export REPO=o/r PR_NUMBER=7 GH_TOKEN=trigger-token GH_HOST=127.0.0.1
+  export PUSHOVER_TOKEN='' PUSHOVER_USER=''
+
+  run run_block "$WF" "Request Codex re-review after a new commit"
+
+  refute_planted_ran
+  # 不许红：它排在发 Codex 总结评论之前，一红那条总结也跟着被跳过
+  assert_equal "$status" 0
+  # 不是空转：这一步确实走到了「要用 gh」那一刻才停下。本机真 gh 在 /opt/homebrew
+  # 下、跟假 gh 一起被滤掉，所以报「找不到 gh」；runner 上真 gh 在 /usr/bin，用它去
+  # 探活、连回环地址被拒，报「令牌读不到这个仓库」。两条都说明假 gh 没被选中。
+  case "$output" in
+    *'gh is not available from a write-protected PATH entry'*) ;;
+    *'CODEX_TRIGGER_TOKEN cannot read'*) ;;
+    *) echo "the step never reached the gh call: $output" >&2; return 1 ;;
+  esac
+
+  # 对照：同一个假 gh，接回 PATH 就真被跑了
+  trust_fake_bin
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" \
+    run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_planted_runs_when_trusted
+}
+
+# ---------- PATH 过滤本身：奇形怪状的 PATH 项 ----------
+
+# 相对项按 cwd 解析，而 cwd 就是被审 PR 的工作副本 —— 它自己就能造出那个目录。
+# 而且「逐级往上剥父目录」的写法碰到不带 / 的相对项会原地打转：过滤不是判错，是
+# 整步挂到 45 分钟超时。所以相对项直接不认。
+@test "path filter: a relative PATH entry is refused instead of hanging the step" {
+  relative="$BATS_TEST_TMPDIR/cwd"
+  mkdir -p "$relative/relbin"
+  chmod a-w "$relative/relbin"
+  cd "$relative" || return 1
+
+  assert_equal "$(path_guard 'Request Codex re-review after a new commit' relbin)" rejected
+  assert_equal "$(path_guard 'Request Codex re-review after a new commit' .)" rejected
+}
+
+# PATH 里的空项（开头、结尾或中间的 ::）在 shell 里就是「当前目录」，同上不认。
+# 目录不存在的项也一样 —— 谁先把它创建出来，谁就说了算。
+@test "path filter: an empty or missing PATH entry is refused" {
+  assert_equal "$(path_guard 'Request Codex re-review after a new commit' '')" rejected
+  assert_equal "$(path_guard 'Request Codex re-review after a new commit' /nope/not/here)" rejected
+  # 判定本身还得能认出真的写保护目录，否则上面两条只是「什么都不认」
+  assert_equal "$(path_guard 'Request Codex re-review after a new commit' /usr/bin)" protected
 }
 
 # ---------- workflow 结构 ----------
