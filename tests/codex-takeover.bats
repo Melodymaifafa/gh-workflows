@@ -415,6 +415,56 @@ printf "cached\n" >stray.pyc'
   refute_called "gh pr comment"
 }
 
+# ---------- 提交落在哪儿：HEAD、refs 和「进行中的操作」 ----------
+#
+# 上面那一段比的是「会被提交的那棵树」——「提交里装了什么」。它认不出「提交落在
+# 哪儿」：验证命令对工作副本有写权限，也就动得了这个仓库的提交历史，而下一步那次
+# commit 的父亲、以及 push 解析出来的东西，都不在树里。两条真漏（都在本机实跑复现）：
+#   1. 先 git commit 一份带后门的载荷（HEAD 前进一格），再把索引恢复原样 —— 树一
+#      字不差地回到 verify_tree_before，比树那道门放行；外层那次 commit 落在已经
+#      前进过的 HEAD 上，恶意 commit 成了祖先，push 把它一起发布，而它在 PR 的最终
+#      diff 里看不见。
+#   2. 连 ref 都不用动：git commit-tree 造出一个游离的 commit 对象，写一个
+#      .git/MERGE_HEAD 指过去，下一步那次 commit 就凭空多一个父亲 —— HEAD、全部
+#      ref、树、.git/config 指纹，四样在验证前后完全一致。
+# 所以验证前把 HEAD + refs/** + 那几个「进行中的操作」哨兵一起拍进快照，验证跑完
+# 先比这份快照、再比树。
+
+@test "takeover: a commit the verify command made never becomes an ancestor of the push" {
+  push_workspace 'printf "v2 fixed by codex\nbackdoor\n" >app.txt
+git -c commit.gpgsign=false commit -q -a -m "malicious payload"
+printf "v2 fixed by codex\n" >app.txt
+git add app.txt'
+
+  run_chain
+
+  # 战利品先断：防线撤掉时，失败信息里直接就是被发布出去的那一笔提交
+  refute_contains "$(git log --format=%s origin/topic)" 'malicious payload'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  assert_equal "$status" 1
+  assert_contains "$output" 'HEAD, a ref or an in-progress git operation'
+  # 停在带凭据那一步之前：凭据没塞回去，也没人替它提交
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  refute_called "gh pr comment"
+}
+
+@test "takeover: a MERGE_HEAD the verify command plants cannot graft a commit onto the push" {
+  push_workspace 'blob=$(printf "backdoor\n" | git hash-object -w --stdin)
+tree=$(printf "100644 blob %s\tevil.txt\n" "$blob" | git mktree)
+evil=$(git -c commit.gpgsign=false commit-tree "$tree" -p HEAD -m "malicious payload")
+printf "%s\n" "$evil" >.git/MERGE_HEAD'
+
+  run_chain
+
+  refute_contains "$(git log --format=%s origin/topic)" 'malicious payload'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  assert_equal "$status" 1
+  assert_contains "$output" 'HEAD, a ref or an in-progress git operation'
+  assert_contains "$output" 'MERGE_HEAD'
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  refute_called "gh pr comment"
+}
+
 # ---------- 种进 .git 的东西，不许被带凭据的那一步替它跑 ----------
 #
 # 验证那一步跑的是被审 PR 自己的代码，它对工作副本有写权限。它不需要能读到令牌：

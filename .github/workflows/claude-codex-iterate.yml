@@ -923,6 +923,46 @@ jobs:
           }
           git_state_before="$(git_state_digest)"
 
+          # 指纹和树都只认「内容」，认不出「提交落在哪儿」。验证命令对工作副本有
+          # 写权限，也就动得了这个仓库的提交历史，而下一步那次 commit 的父亲、以及
+          # push 解析出来的东西，一样都不在树里。两条实跑复现过的路：
+          #   1. 先 git commit 一份带后门的载荷（HEAD 前进一格），再把索引恢复原样
+          #      —— 索引树一字不差地回到 verify_tree_before，比树那道门放行；外层
+          #      那次 commit 落在已经前进过的 HEAD 上，那个中间的 commit 就成了祖先，
+          #      push 把它一起发布，而它在 PR 的最终 diff 里压根看不见（Codex
+          #      2026-09-26 的 P1）。
+          #   2. 连 ref 都不用动：git commit-tree 造一个游离的 commit 对象，再写一个
+          #      .git/MERGE_HEAD 指过去，下一步那次 commit 就凭空多一个父亲 —— HEAD、
+          #      全部 ref、树、.git/config 指纹，四样在验证前后完全一致。「先 commit
+          #      再 reset 回来」也是同一类：只比首尾的快照看不见中间那一下。
+          # 所以把「下一步那次 commit + push 的全部输入」整个拍进快照，验证跑完先比
+          # 这一份、再比树：
+          #   HEAD —— 符号引用指向谁、解析出来是哪个 commit，就是新提交的父亲；
+          #   refs/** 全量 —— push 的 refspec 是 HEAD:<分支>，HEAD 又是指向
+          #     refs/heads/<分支> 的符号引用；tag / notes / stash / refs/replace 都在
+          #     refs/ 底下，一并罩住。松散的和 packed-refs 里的一起认：for-each-ref
+          #     报的是解析之后的那一份，只改 packed-refs 而被松散引用盖住的那种改动，
+          #     对 push 同样没有影响，不该误红。
+          #   进行中的操作 —— MERGE_HEAD 是唯一能给 commit 加父亲的那个；其余几个
+          #     （cherry-pick / revert / rebase / sequencer）改的是作者和信息，下一步
+          #     用 -m 和 GIT_AUTHOR_* 压过去了，但一起拍进来不要钱。shallow 和
+          #     info/grafts 会改写 git 眼里的父子关系，同理。
+          # 这一份要走 git 去读（自己解析 packed-refs 只会更糟），所以位置排在上面
+          # 那条 .git/config 指纹之后：那一条已经证明配置一个字节都没动，git 读 ref
+          # 的行为就没被掉包（比如 extensions.refStorage 换个后端）。
+          ref_state() {
+            {
+              printf 'head symref %s\n' "$(sealed_git symbolic-ref -q HEAD || printf '(detached)')"
+              printf 'head commit %s\n' "$(sealed_git rev-parse -q --verify HEAD || printf '(unborn)')"
+              sealed_git for-each-ref --format='ref %(refname) %(objectname)'
+              for entry in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD MERGE_MODE \
+                           rebase-merge rebase-apply sequencer shallow info/grafts; do
+                [ ! -e "$git_dir/$entry" ] || printf 'in-progress %s\n' "$entry"
+              done
+            } | LC_ALL=C sort
+          }
+          ref_state_before="$(ref_state)"
+
           # 验证命令重写它自己负责生成的那几个文件是合法的 —— uv sync --dev 默认
           # 重写 uv.lock、npm ci 重写 package-lock.json —— 所以下面那次 add -u 不能
           # 取消：取消了，推出去的就是一棵从没被验证过的树（MEL-252）。要跟它分开的
@@ -1121,6 +1161,33 @@ jobs:
           if [ "$(git_state_digest)" != "$git_state_before" ]; then
             echo '- verification: **rejected**, the verify command modified .git' >>"$GITHUB_STEP_SUMMARY"
             echo '::error::the verify command modified .git (hooks or config); refusing to run any credentialed git command on this checkout'
+            exit 1
+          fi
+
+          # 报「哪一条变了」，不要只报「变了」：出事的时候这一行就是证据。两份快照
+          # 一起喂给同一个 awk，B/S 两种前缀分开（同上面清点进程那一段的写法：不走
+          # awk -v，本机的 awk 不收带换行的值；更不落文件，验证命令写得动文件）。
+          ref_state_changes() {
+            {
+              printf '%s\n' "$ref_state_before" | sed 's/^/B /'
+              printf '%s\n' "$ref_state_after" | sed 's/^/S /'
+            } | awk '
+                { line = substr($0, 3) }
+                $1 == "B" { before[line] = 1; next }
+                { after[line] = 1 }
+                END {
+                  for (l in before) if (!(l in after)) printf "-[%s] ", l
+                  for (l in after) if (!(l in before)) printf "+[%s] ", l
+                }'
+          }
+
+          # 位置和上面那条指纹同一个理由：排在「把凭据塞回去」之前。另外还要排在
+          # 比树之前 —— 提交落在哪儿比提交里装了什么更靠前：树对得上、父亲被换掉，
+          # 一样把恶意 commit 发布出去。动过就红着停下，不 commit 不 push。
+          ref_state_after="$(ref_state)"
+          if [ "$ref_state_after" != "$ref_state_before" ]; then
+            echo '- verification: **rejected**, it moved a ref or left a git operation half-done' >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::the verify command changed HEAD, a ref or an in-progress git operation ($(ref_state_changes)); refusing to commit or push on top of it"
             exit 1
           fi
 
