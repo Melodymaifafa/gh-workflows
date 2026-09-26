@@ -1029,6 +1029,46 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 这一步手上也有写权限令牌（workflow 声明 contents: write + pull-requests:
+          # write），所以命令从哪儿来跟上一步同一个规矩：前面跑验证那一步跑的是被审
+          # PR 自己的代码，runner 的 PATH 前几项在 $HOME 下、它写得动 —— 往那儿放一个
+          # 假 gh / 假 jq，这一步就把令牌交到它手上。验证那一步的三道门都看不见这件事：
+          # 文件在仓库外（树差异看不见）、没动 .git（指纹看不见）、放的是文件不是进程
+          # （残留清点看不见），$GITHUB_PATH 那道也只挡「新追加目录」。所以同上一步：
+          # PATH 过滤成我们写不动的目录，目录和它的上一级一起看。这一段跟上一步一字
+          # 不差（tests/claude-verify-creds.bats 有一条判定盯着），合成一份是 MEL-262。
+          # 它前面那四步（Check the fix outcome / Decide the takeover / Request Codex
+          # re-review / Post the Codex summary comment）同一个毛病，是 develop 上本来
+          # 就有的，归 MEL-260；本轮只管本 PR 新加的这一步。
+          path_is_protected() {
+            local dir="$1"
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+          # 少了就不发这条评论，而不是红着停下：这一步排在 Check the fix outcome 之前，
+          # 它一红，M7 标记和召唤复审会跟着被跳过、链条静默停住（同下面 gh 偶发失败
+          # 那条的处理）。不发评论顶多少一条总结，令牌一次也没交出去。
+          if ! command -v jq >/dev/null 2>&1; then
+            echo '::warning::jq is not available from a write-protected PATH entry; skipping the PR comment'
+            exit 0
+          fi
+
           summary=''
           if [ -n "${STRUCTURED:-}" ]; then
             summary="$(jq -r 'if (.summary | type) == "string" then .summary else "" end' \
@@ -1039,12 +1079,22 @@ jobs:
             exit 0
           fi
 
-          {
+          # 正文先落进 run summary 再发：评论没发出去（gh 偶发失败，或者它不在写不动的
+          # 目录里）时，总结至少还留在这一轮的运行页上，不至于连文本一起丢。
+          body="$(
             printf '%s\n' "$summary"
             if [ "${PUSHED:-}" = true ]; then
               printf '\n验证：本仓库的 lint 与测试已在不带写权限的独立步骤里跑过，全绿后才推送。\n'
             fi
-          } | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - >/dev/null ||
+          )"
+          printf '%s\n' "$body" >>"$GITHUB_STEP_SUMMARY"
+
+          if ! command -v gh >/dev/null 2>&1; then
+            echo '::warning::gh is not available from a write-protected PATH entry; skipping the PR comment'
+            exit 0
+          fi
+          printf '%s\n' "$body" |
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - >/dev/null ||
             echo '::warning::the Claude summary comment was not posted'
 
       # 结果分流：head 变了 → 发轮数标记 M7 并去召唤复审；否则按原因告警一次（同 head 同原因只发一次）。

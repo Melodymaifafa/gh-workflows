@@ -35,6 +35,13 @@ claude_prompt() {
   awk '/^          prompt: \|/{f=1} f&&/^      - name:/{exit} f' "$REPO_ROOT/$WF"
 }
 
+# 某一步 run 块里那段「命令只从写不动的目录里找」的过滤：path_is_protected 那行起，
+# 到 PATH 被换掉那行止。
+trusted_path_block() {
+  extract_run_block "$REPO_ROOT/$WF" "$1" |
+    awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^PATH="\$trusted_path"$/{exit}'
+}
+
 # 这一步跟令牌同一个进程，所以清单里不许有任何「会跑仓库里的代码」的东西：
 # 工具链（npm / uv / bats…）执行的是被审 PR 自己带的脚本，拿到它就等于拿到令牌。
 @test "claude: the fixer step is given no tool that can execute the PR's own code" {
@@ -294,14 +301,20 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
 # ---------- 总结评论 ----------
 
 # 总结由外层步骤发，文本走结构化输出：Claude 自己发就得在跑验证的同一步里握着令牌。
-@test "claude: the summary comment is posted from the structured output" {
+# 正文断言读 run summary 里那一份：这一步的 gh 只从「被审 PR 写不动的目录」里找（见
+# 下面那条种假 gh 的判定），测试里那个假 gh 放在仓库目录下、过滤之后拦不到它了 ——
+# 而正文发不出去也会落进 run summary，所以判的还是同一段文本。
+@test "claude: the summary comment body comes from the structured output" {
   export STRUCTURED='{"pushed":true,"fixed":2,"skipped":1,"summary":"修了 2 条，跳过 1 条"}'
   export PUSHED=true REPO=o/r PR_NUMBER=7 GH_TOKEN=t
+  # 真 gh 在写保护目录里的机器（runner 就是）上，这一步会真去发一条评论：指到本机
+  # 回环地址上，连接直接被拒，不出网也不碰真 API。
+  export GH_HOST=127.0.0.1
 
   run run_step "$WF" "Post the Claude summary comment"
 
   assert_equal "$status" 0
-  body="$(fake_last_body 'gh pr comment')"
+  body="$(cat "$GITHUB_STEP_SUMMARY")"
   assert_contains "$body" '修了 2 条，跳过 1 条'
   assert_contains "$body" '不带写权限的独立步骤里跑过'
 }
@@ -316,6 +329,47 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
   assert_equal "$status" 0
   assert_contains "$output" 'returned no summary'
   refute_called 'gh pr comment'
+  assert_equal "$(cat "$GITHUB_STEP_SUMMARY")" ''
+}
+
+# 本票第 2 轮堵的那个洞：这一步手上有写权限令牌，而它前面那一步跑的是被审 PR 自己的
+# 命令 —— PR 往「自己写得动的 PATH 目录」放一个假 gh（顺手再放个假 jq），这一步去跑
+# 它就等于把令牌连同正文一起递过去。验证那一步的三道门都看不见：文件在仓库外、没动
+# .git、放的是文件不是进程。所以它跟「提交并推送」那一步同一个规矩：命令只从我们写
+# 不动的目录里找。把那段过滤摘掉，这一条当场变红（假 gh 的日志里就有令牌）。
+@test "claude: a gh planted on a writable PATH entry never gets the comment token" {
+  plantable="$BATS_TEST_TMPDIR/plantable-bin"
+  mkdir -p "$plantable"
+  export PLANTED_LOG="$BATS_TEST_TMPDIR/planted-gh.log"
+  for tool in gh jq; do
+    cat >"$plantable/$tool" <<EOS
+#!/bin/sh
+printf '$tool %s | GH_TOKEN=%s\n' "\$*" "\${GH_TOKEN:-}" >>"\$PLANTED_LOG"
+EOS
+    chmod +x "$plantable/$tool"
+  done
+  # 模拟 runner 的 PATH：第一项是验证命令（也就是被审 PR）写得动的目录
+  export PATH="$plantable:$PATH"
+  export STRUCTURED='{"pushed":true,"summary":"修了 2 条，跳过 1 条"}'
+  export PUSHED=true REPO=o/r PR_NUMBER=7 GH_TOKEN=write-token GH_HOST=127.0.0.1
+
+  run run_step "$WF" "Post the Claude summary comment"
+
+  assert_equal "$status" 0
+  [ -x "$plantable/gh" ] || { echo 'the fake gh was never planted' >&2; return 1; }
+  [ ! -s "$PLANTED_LOG" ] || { echo "the planted command ran: $(cat "$PLANTED_LOG")" >&2; return 1; }
+  # 这一道不能靠「这一步整个空转」通过：正文照旧是真 jq 解出来的那一段
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" '修了 2 条，跳过 1 条'
+}
+
+# 两处防线是逐行副本，这一条盯着它们不许各改各的：抽成 $RUNNER_TEMP 下的共享脚本
+# 等于把我们自己的防线放到验证命令写得动的地方，所以只能两处各写一份（合成一份
+# 是 MEL-262 的活）。
+@test "claude: the summary step filters PATH with the very same block as the push step" {
+  pushed="$(trusted_path_block 'Commit and push the Claude fix')"
+  commented="$(trusted_path_block 'Post the Claude summary comment')"
+  [ -n "$pushed" ] || { echo 'no PATH filter found in the push step' >&2; return 1; }
+  assert_equal "$commented" "$pushed"
 }
 
 # ---------- 门禁：谁跑得到验证和推送这两步 ----------
