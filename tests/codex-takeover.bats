@@ -764,15 +764,20 @@ EOS
 #!/bin/sh
 # 继承来的描述符一个不留：工作流源码是公开的，描述符号写死在里面，关掉就等于
 # 把「靠继承的管道读到 EOF」那种证据作废。
-fd=3
+# 关这一下只能在 `sh -c` 里做，不能在脚本自己身上做：CI 的 /bin/sh 是 dash，它把
+# **脚本文件本身**挂在 fd 10 上，脚本里关掉 3..30 等于把自己还没读完的源码关掉，
+# 当场静默结束（macOS 的 /bin/sh 是 bash，脚本 fd 是 255，本机怎么跑都看不出来）。
+CLOSER='fd=3
 while [ "$fd" -le 30 ]; do
   eval "exec $fd>&-" 2>/dev/null || true
   fd=$((fd + 1))
 done
+exec sh "$ESCAPEE"'
+export CLOSER
 if command -v setsid >/dev/null 2>&1; then
-  setsid sh "$ESCAPEE" >/dev/null 2>&1 &
+  setsid sh -c "$CLOSER" >/dev/null 2>&1 &
 else
-  perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec("/bin/sh", $ENV{ESCAPEE});' >/dev/null 2>&1 &
+  perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec("/bin/sh", "-c", $ENV{CLOSER});' >/dev/null 2>&1 &
 fi
 # 等它真的换完会话再让验证命令退出：慢一步的话，按组号那一下会在 setsid 之前就把
 # 它正当收掉，这条测试就测不到「逃出去之后」那一段了（探针的时序问题，不是防线的）。
