@@ -20,4 +20,12 @@ jobs:
       # 谁来修 PR：auto（默认，Claude 先上，撞额度才换 Codex）、claude、codex。
       # 不写就是 auto，行为和加这行之前完全一样。
       # review_fixer: auto
+      #
+      # 允许验证命令重写哪些被跟踪的文件（一行一个，精确路径）。默认一个都不许：
+      # 验证命令来自被审的那个 PR，它改过的被跟踪文件会跟着修复一起提交推送。
+      # 验证会重新生成 lock 文件的仓库（python 的 uv sync --dev 重写 uv.lock、
+      # node 的 npm ci 重写 package-lock.json）必须在这里列出来，否则整轮红着停下。
+      # 这份清单只从调用方默认分支上的这个文件读，被审 PR 改不到它。
+      # verify_writable_paths: |
+      #   uv.lock
     secrets: inherit

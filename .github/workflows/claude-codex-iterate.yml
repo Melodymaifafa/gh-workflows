@@ -24,6 +24,12 @@ on:
         description: Override the verify commands Claude must run before pushing (one per line).
         type: string
         default: ''
+      verify_writable_paths:
+        description: >-
+          Tracked files the verify command is allowed to rewrite (one per line, exact paths).
+          Empty means none. List the lock files your verify commands regenerate, e.g. uv.lock.
+        type: string
+        default: ''
       extra_tools:
         description: Override the runtime-specific entries appended to --allowedTools.
         type: string
@@ -760,8 +766,49 @@ jobs:
         if: steps.decide.outputs.run_codex == 'true'
         env:
           VERIFY: ${{ env.VERIFY_CMD }}
+          # 「允许验证命令改写哪些被跟踪的文件」只能来自调用方默认分支上的工作流
+          # 文件（workflow_call 的 input）—— 被审 PR 改不到它。这是它能当信任边界
+          # 的前提；一旦改成从 PR 内容里读（仓库里的某个清单文件、PR 正文……），
+          # 攻击者就自己给自己发通行证了。
+          VERIFY_WRITABLE_PATHS: ${{ inputs.verify_writable_paths }}
         run: |
           set -euo pipefail
+
+          # 我们自己跑的每一条命令，都必须来自「验证命令写不动」的目录。runner 的
+          # PATH 前几项在 $HOME 下（`.local/bin` 之类），验证命令跟我们同一个用户，
+          # 往那儿放一个假 ps 就能把自己从清点里隐掉，放一个假 git 就能报一棵假的树
+          # —— 下面每一道判定当场变成空转。所以把我们这份 PATH 过滤成「我们写不动
+          # 的目录」（我们写得动 = 它也写得动），连上一级目录一起看：目录本身不可写
+          # 但父目录可写的话，整个目录被换掉就行。原来那份 PATH 只交给验证命令自己，
+          # 它要 uv / npm / node 那些装在 $HOME 下的工具。
+          path_is_protected() {
+            local dir="$1"
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          verify_path="$PATH"
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+          # 少了哪一样都等于这一整步没法判定 —— 红着停下，别静默空转。
+          for tool in git ps awk sed cut id mktemp cp ls; do
+            command -v "$tool" >/dev/null 2>&1 && continue
+            echo "::error::$tool is not available from a write-protected PATH entry; cannot verify this checkout safely"
+            exit 1
+          done
 
           # 这一步跑完被审 PR 自己的命令之后还要接着用 git，所以它跟下一步同一个
           # 规矩：只认我们在命令行上给的那几项，机器上任何一份 git 配置文件都不
@@ -804,10 +851,15 @@ jobs:
           sealed_git add -A
 
           # actions/checkout 把写权限凭据持久化在 .git/config 里，它跟令牌一样能
-          # 换来仓库写权限，所以验证前摘掉、跑完还回来，只留给下一步 push 用。
-          cred_header=''
-          if cred_header="$(sealed_git config --local --get http.https://github.com/.extraheader)"; then
-            sealed_git config --local --unset-all http.https://github.com/.extraheader
+          # 换来仓库写权限。这里摘掉，而且**不再还回去**：下一步用它自己手上的
+          # GH_TOKEN 现造一份，只递给那一条 git push。于是「凭据躺在 .git/config 里」
+          # 这段时间整个收进了带凭据那一步内部，两步之间一个字都没有 —— 万一有哪个
+          # 进程逃过了下面的收尾，它盯着这个文件也等不到任何东西（MEL-255）。
+          sealed_git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          # 摘没摘掉要有证据：静默失败等于带着凭据去跑被审 PR 自己的命令。
+          if sealed_git config --local --get-all http.https://github.com/.extraheader >/dev/null 2>&1; then
+            echo '::error::failed to strip the checkout credential from .git/config; refusing to run the verify command'
+            exit 1
           fi
 
           # runner 的文件命令通道同样不能交给它：往 $GITHUB_PATH 追一个自带假 gh
@@ -871,14 +923,120 @@ jobs:
           }
           git_state_before="$(git_state_digest)"
 
+          # 指纹和树都只认「内容」，认不出「提交落在哪儿」。验证命令对工作副本有
+          # 写权限，也就动得了这个仓库的提交历史，而下一步那次 commit 的父亲、以及
+          # push 解析出来的东西，一样都不在树里。两条实跑复现过的路：
+          #   1. 先 git commit 一份带后门的载荷（HEAD 前进一格），再把索引恢复原样
+          #      —— 索引树一字不差地回到 verify_tree_before，比树那道门放行；外层
+          #      那次 commit 落在已经前进过的 HEAD 上，那个中间的 commit 就成了祖先，
+          #      push 把它一起发布，而它在 PR 的最终 diff 里压根看不见（Codex
+          #      2026-09-26 的 P1）。
+          #   2. 连 ref 都不用动：git commit-tree 造一个游离的 commit 对象，再写一个
+          #      .git/MERGE_HEAD 指过去，下一步那次 commit 就凭空多一个父亲 —— HEAD、
+          #      全部 ref、树、.git/config 指纹，四样在验证前后完全一致。「先 commit
+          #      再 reset 回来」也是同一类：只比首尾的快照看不见中间那一下。
+          # 所以把「下一步那次 commit + push 的全部输入」整个拍进快照，验证跑完先比
+          # 这一份、再比树：
+          #   HEAD —— 符号引用指向谁、解析出来是哪个 commit，就是新提交的父亲；
+          #   refs/** 全量 —— push 的 refspec 是 HEAD:<分支>，HEAD 又是指向
+          #     refs/heads/<分支> 的符号引用；tag / notes / stash / refs/replace 都在
+          #     refs/ 底下，一并罩住。松散的和 packed-refs 里的一起认：for-each-ref
+          #     报的是解析之后的那一份，只改 packed-refs 而被松散引用盖住的那种改动，
+          #     对 push 同样没有影响，不该误红。
+          #   进行中的操作 —— MERGE_HEAD 是唯一能给 commit 加父亲的那个；其余几个
+          #     （cherry-pick / revert / rebase / sequencer）改的是作者和信息，下一步
+          #     用 -m 和 GIT_AUTHOR_* 压过去了，但一起拍进来不要钱。shallow 和
+          #     info/grafts 会改写 git 眼里的父子关系，同理。
+          # 这一份要走 git 去读（自己解析 packed-refs 只会更糟），所以位置排在上面
+          # 那条 .git/config 指纹之后：那一条已经证明配置一个字节都没动，git 读 ref
+          # 的行为就没被掉包（比如 extensions.refStorage 换个后端）。
+          ref_state() {
+            {
+              printf 'head symref %s\n' "$(sealed_git symbolic-ref -q HEAD || printf '(detached)')"
+              printf 'head commit %s\n' "$(sealed_git rev-parse -q --verify HEAD || printf '(unborn)')"
+              sealed_git for-each-ref --format='ref %(refname) %(objectname)'
+              for entry in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD MERGE_MODE \
+                           rebase-merge rebase-apply sequencer shallow info/grafts; do
+                [ ! -e "$git_dir/$entry" ] || printf 'in-progress %s\n' "$entry"
+              done
+            } | LC_ALL=C sort
+          }
+          ref_state_before="$(ref_state)"
+
+          # 验证命令重写它自己负责生成的那几个文件是合法的 —— uv sync --dev 默认
+          # 重写 uv.lock、npm ci 重写 package-lock.json —— 所以下面那次 add -u 不能
+          # 取消：取消了，推出去的就是一棵从没被验证过的树（MEL-252）。要跟它分开的
+          # 是另一件事：验证改写了**任意一个**被跟踪的源文件，借那次 add -u 把内容
+          # 夹带进提交里 —— 外部 PR 于是能借这条工作流的手，把复审机器人从没产出过
+          # 的改动发布进仓库。所以比对「验证前后会被提交的那棵树」，差异逐条比
+          # $VERIFY_WRITABLE_PATHS，有一条不在上面就红着停下。
+          #
+          # 每次现开一份 mktemp 索引来算，不拿真索引：在真索引上算 after 那次，等于
+          # 判定还没做完就先把验证的改动入了索引。结果只存在当前 shell 的变量里 ——
+          # 验证命令是子进程，改不到父 shell 的变量；存成文件它就改得动。算的时候
+          # 走 sealed_git（空钩子目录），别让 add -u 触发 post-index-change。
+          index_tree() {
+            local idx
+            idx="$(mktemp -d "$RUNNER_TEMP/verify-index-XXXXXX")/index"
+            cp "$git_dir/index" "$idx"
+            (
+              export GIT_INDEX_FILE="$idx"
+              sealed_git add -u
+              sealed_git write-tree
+            )
+          }
+          verify_tree_before="$(index_tree)"
+
+          # 「验证这一棵进程树已经死透」这件事，下面每一个判定都建立在它上面（指纹、
+          # 树、以及下一步的提交推送）。按进程组去数只能算「原来那个组里没人了」——
+          # 一条 setsid（或一次双重 fork）就把后代换到新的会话/新的组，按组号去 ps
+          # 的收尾压根看不见它，它活到判定做完之后再动手，就把上面这些判定全废了。
+          # 拿「继承来的描述符」当正面证据也不行：工作流源码在 PR 里公开可见、描述符
+          # 号写死在里面，被审 PR 自己的验证命令开头一句 exec 8>&- 关掉它、再 setsid
+          # 躲起来，我们这头立刻读到 EOF，判定「死透了」而它还活着（Codex 2026-09-25
+          # 的 P1，审核方独立实跑复现）。
+          # 证据不能建立在任何一样「它自己交得出去的东西」上：进程组、会话、继承的
+          # 描述符，它都能主动丢掉。丢不掉的只有**运行用户** —— 它手上没有提权手段，
+          # fork / exec / setsid / nohup 出来的每一个进程都还挂在同一个 uid 上，而
+          # 「同一个 uid」正好就是它能读走凭据的那个条件（/proc/<pid>/environ 按 uid
+          # 放行）。所以按 uid 正面清点：跑验证之前拍一份「这个用户当下有哪些进程」，
+          # 跑完之后反复清点，直到某一刻这个用户名下除了基线里那些、以及我们自己的
+          # 后代之外一个都不剩 —— 那一刻就是正面证据（真有哪一刻空了它就再也回不来：
+          # 没有任何进程能把它拉起来）。一直不空就红着停下。
+          verify_uid="$(id -u)"
+
+          # 身份 = pid + 启动时刻，光看 pid 会被 pid 复用骗过（Linux 的 pid_max 默认
+          # 四百万，想撞上一个已经死掉的基线 pid 还得同一秒启动，跑不出来）。
+          # ps -U 选「真实用户」，GNU 和 BSD 都是这个意思（别写 -u：BSD 上它是格式
+          # 选项）。字段按 -o 给的顺序来：pid ppid stat lstart（固定 5 段）args…。
+          # 僵尸不算：它已经死了，只是还没被收尸，读不了任何东西。
+          user_procs() {
+            ps -U "$verify_uid" -o pid=,ppid=,stat=,lstart=,args= 2>/dev/null |
+              awk 'NF >= 8 && $3 !~ /^Z/ {
+                cmd = ""
+                for (i = 9; i <= NF; i++) cmd = cmd (i > 9 ? " " : "") $i
+                printf "%s|%s|%s %s %s %s %s|%s\n", $1, $2, $4, $5, $6, $7, $8, cmd
+              }'
+          }
+
+          # 清点不出来就等于这一道什么都没做 —— 静默的 no-op 比没有更糟，红着停下。
+          if [ -z "$(user_procs)" ]; then
+            echo '::error::cannot list this user'"'"'s processes; cannot prove the verify command leaves nothing alive'
+            exit 1
+          fi
+          # 基线只留 pid|ppid|启动时刻，不留命令行：拿它喂 awk -v，别让 PR 自己起的
+          # 进程名把内容带进去。
+          verify_procs_baseline="$(user_procs | cut -d'|' -f1-3)"
+
           # 验证命令跑在它自己的进程组里：set -m 让后台任务另起一组（组号 = 该任务
           # 的 pid），跑完才能 kill -- -组号 连整组一起收掉。它可以 fork 一个进程再让
-          # 自己退出 —— 指纹和废纸篓文件都不杀进程，那个进程活到「凭据塞回 .git/config」
-          # 和下一步导出 GH_TOKEN 的时候，同一个用户，轮询就能把钥匙捞走。
+          # 自己退出 —— 指纹和废纸篓文件都不杀进程，那个进程活到下一步导出 GH_TOKEN
+          # 的时候，同一个用户，轮询就能把钥匙捞走。
           # stdin 接 /dev/null：后台进程组读终端会吃 SIGTTIN 停住。
           set -m
           env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
               GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
+              PATH="$verify_path" \
               bash -euo pipefail -c "$VERIFY" </dev/null &
           verify_pgid=$!
           set +m
@@ -896,7 +1054,7 @@ jobs:
           }
 
           # 先礼后兵：TERM 收不掉的（trap '' TERM 就能扛住）再 KILL。收干净之前
-          # 不许往下走 —— 下面第一件事就是把凭据塞回 .git/config。
+          # 不许往下走 —— 下面每一个判定都以「验证已经不在了」为前提。
           reap_verify_group() {
             local sig waited
             for sig in TERM KILL; do
@@ -919,7 +1077,69 @@ jobs:
 
           if ! reap_verify_group; then
             echo '- verification: **rejected**, it left a process running' >>"$GITHUB_STEP_SUMMARY"
-            echo "::error::the verify command left live processes behind ($(verify_survivors | tr '\n' ' ')); refusing to restore the credentials"
+            echo "::error::the verify command left live processes behind ($(verify_survivors | tr '\n' ' ')); refusing to trust anything it ran"
+            exit 1
+          fi
+
+          # 上面按组号收完了，这里要那份正面证据：这个用户名下再没有「不是基线里的、
+          # 也不是我们自己后代的」活进程。逃出进程组（setsid / 双重 fork）、关光继承
+          # 的描述符、改掉环境变量，都换不掉 uid，所以这份清点它退不出去。
+          # 「我们自己的后代」按当下这一份快照里的父子链认：验证命令那棵树的头已经被
+          # wait 掉了，逃掉的后代会被过继给 init，链子走不回我们这里，照样露出来。
+          # 这一道必须排在指纹、树、以及下一步的提交推送之前：那些判定一旦在「验证
+          # 还活着」的情况下做出来，结论当场就作废 —— 它可以等判定过去再改文件、再
+          # 入索引，让下一步替它提交推送。
+          # 基线和当下这一份快照一起喂给同一个 awk，B/S 两种前缀分开 —— 不走 -v（本机
+          # 的 awk 不收带换行的 -v 值），更不落文件：基线文件在验证命令跑之前就存在，
+          # 它往里补一行自己的 pid 就把自己写成「基线里本来就有的」了。基线只活在
+          # 这个 shell 的变量里，验证命令是子进程，改不到。
+          verify_leftovers=''
+          unexplained_procs() {
+            {
+              printf '%s\n' "$verify_procs_baseline" | sed 's/^/B|/'
+              user_procs | sed 's/^/S|/'
+            } | awk -F'|' -v self="$$" '
+                $1 == "B" { known[$2 "|" $4] = 1; next }
+                $1 == "S" {
+                  n++; pid[n] = $2; parent[$2] = $3; key[n] = $2 "|" $4
+                  c = $5
+                  for (i = 6; i <= NF; i++) c = c "|" $i
+                  cmd[n] = c
+                }
+                END {
+                  for (r = 1; r <= n; r++) {
+                    if (key[r] in known) continue
+                    p = pid[r]; hops = 0; mine = 0
+                    while (p != "" && p != "0" && p != "1" && hops < 64) {
+                      if (p == self) { mine = 1; break }
+                      p = parent[p]; hops++
+                    }
+                    if (mine) continue
+                    printf "%s (%s)\n", pid[r], cmd[r]
+                  }
+                }'
+          }
+
+          # 清点到「某一刻干净」就算过，不要求次次干净：机器上别的进程刚好在这一瞬
+          # 起来也会被记一笔（本机跑测试时尤其常见）。反复清点、拿第一个干净的瞬间
+          # 当证据 —— 那一刻它名下一个进程都没有，就再也回不来了。5 秒内一直不干净
+          # 就红着停下；这个数只是给调度和噪声留余量，定太短会 19 个仓库一起误红。
+          # 不干净的那些**不杀**：我们分不清那是逃逸的后代还是机器上别人的进程，误杀
+          # 比红着停下糟得多 —— 而红着停下之后，带凭据的那一步压根不会开始。
+          verify_tree_is_contained() {
+            local waited=0
+            while :; do
+              verify_leftovers="$(unexplained_procs)"
+              [ -n "$verify_leftovers" ] || return 0
+              [ "$waited" -lt 50 ] || return 1
+              sleep 0.1
+              waited=$((waited + 1))
+            done
+          }
+
+          if ! verify_tree_is_contained; then
+            echo '- verification: **rejected**, a process it started outlived it' >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::a process owned by this runner user outlived the verify command ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); refusing to trust the post-verify tree"
             exit 1
           fi
 
@@ -944,7 +1164,68 @@ jobs:
             exit 1
           fi
 
-          [ -z "$cred_header" ] || sealed_git config --local http.https://github.com/.extraheader "$cred_header"
+          # 报「哪一条变了」，不要只报「变了」：出事的时候这一行就是证据。两份快照
+          # 一起喂给同一个 awk，B/S 两种前缀分开（同上面清点进程那一段的写法：不走
+          # awk -v，本机的 awk 不收带换行的值；更不落文件，验证命令写得动文件）。
+          ref_state_changes() {
+            {
+              printf '%s\n' "$ref_state_before" | sed 's/^/B /'
+              printf '%s\n' "$ref_state_after" | sed 's/^/S /'
+            } | awk '
+                { line = substr($0, 3) }
+                $1 == "B" { before[line] = 1; next }
+                { after[line] = 1 }
+                END {
+                  for (l in before) if (!(l in after)) printf "-[%s] ", l
+                  for (l in after) if (!(l in before)) printf "+[%s] ", l
+                }'
+          }
+
+          # 位置和上面那条指纹同一个理由：排在「把凭据塞回去」之前。另外还要排在
+          # 比树之前 —— 提交落在哪儿比提交里装了什么更靠前：树对得上、父亲被换掉，
+          # 一样把恶意 commit 发布出去。动过就红着停下，不 commit 不 push。
+          ref_state_after="$(ref_state)"
+          if [ "$ref_state_after" != "$ref_state_before" ]; then
+            echo '- verification: **rejected**, it moved a ref or left a git operation half-done' >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::the verify command changed HEAD, a ref or an in-progress git operation ($(ref_state_changes)); refusing to commit or push on top of it"
+            exit 1
+          fi
+
+          # 同一道门的另一半，位置和理由跟上面那条指纹一样：排在「把凭据塞回去」
+          # 之前。这一份索引是验证死透之后才开的，它没机会动手脚。
+          # 比的是树而不是「add -u 会带进来哪些文件」：验证命令自己跑一条 git add
+          # 就能把新文件直接塞进真索引，那时候连 add -u 都不需要了 —— 比树就把这
+          # 一路一起盖住，凡是「会被提交的内容变了」都算。
+          verify_tree_after="$(index_tree)"
+          if [ "$verify_tree_after" != "$verify_tree_before" ]; then
+            # -z：路径里带换行的文件名照样一条是一条。--no-renames：改名要把来源和
+            # 去处两条都报出来，别被合并成一条。命令替换会吃掉 NUL，所以落文件读。
+            changed_list="$(mktemp "$RUNNER_TEMP/verify-changed-XXXXXX")"
+            sealed_git diff --name-only --no-renames -z \
+              "$verify_tree_before" "$verify_tree_after" >"$changed_list"
+
+            # 白名单一行一个路径，精确匹配，不认通配符：模糊的放行范围等于没有范围。
+            # read 不加 -r 之外的花样，默认 IFS 顺手把行首行尾空白削掉。
+            path_allowed() {
+              local want="$1" allowed
+              while read -r allowed; do
+                [ -n "$allowed" ] || continue
+                [ "$allowed" != "$want" ] || return 0
+              done <<<"$VERIFY_WRITABLE_PATHS"
+              return 1
+            }
+
+            offenders=''
+            while IFS= read -r -d '' changed; do
+              path_allowed "$changed" || offenders="$offenders $changed"
+            done <"$changed_list"
+
+            if [ -n "$offenders" ]; then
+              echo '- verification: **rejected**, it rewrote tracked files it is not allowed to touch' >>"$GITHUB_STEP_SUMMARY"
+              echo "::error::the verify command rewrote tracked files outside verify_writable_paths:$offenders; refusing to commit or push"
+              exit 1
+            fi
+          fi
 
           if [ "$verify_status" -ne 0 ]; then
             echo '- verification: **failed**, nothing was pushed' >>"$GITHUB_STEP_SUMMARY"
@@ -961,7 +1242,19 @@ jobs:
 
           echo 'changed=true' >>"$GITHUB_OUTPUT"
 
-      # 令牌只在这一步出现。验证命令上一步就跑完了，碰不到这里的环境。
+      # 令牌和写权限凭据都只在这一步出现。这一步的 env: 里有 GH_TOKEN，而 Linux 上
+      # 同一个 uid 的活进程能从 /proc/<pid>/environ 把它读回去 —— 所以「令牌放在
+      # step env 里」这件事本身不是靠挪位置能修好的：放文件更糟（谁都能轮询），上
+      # 命令行也一样（argv 公开），而 unset 改不掉 /proc 里那份初始环境。
+      # 真正的条件是**这一步跑着的时候，被审 PR 没有任何活进程**：每个 step 是各自
+      # 一个进程，验证那一步的进程早已退出（死进程没有 environ 可读），这一步的进程
+      # 在验证那一步跑的时候还不存在。于是唯一的风险就是「验证留下了活进程」——
+      # 上一步按运行用户正面清点、清不干净就红着停下（fail closed），这一步靠
+      # steps.codex_verify 的输出把门；那一步红了，这一步压根不会开始。
+      # 上一版的验收记录写成「躲开之后它找不到任何可轮询的凭据」，那句话是错的：
+      # 凭据只是从文件挪进了进程环境，仍然有地方可以等。正确的说法是「不许有人等」。
+      # 想让 environ 连同一个用户也读不到，只有把验证命令换到另一个用户 / 容器里跑
+      # （代价见 README），本轮没做。
       - name: Commit and push the Codex fix
         id: codex_push
         if: steps.codex_verify.outputs.changed == 'true'
@@ -974,8 +1267,38 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 这一步手上同时有 GH_TOKEN 和 checkout 留在 .git/config 里的凭据，所以它
-          # 只信我们在命令行上给的那几项配置：上一步跑的是被审 PR 自己的代码，它能往
+          # 命令从哪儿来也只信写不动的那几个目录：上一步跑的是被审 PR 自己的代码，
+          # runner 的 PATH 前几项在 $HOME 下、它写得动 —— 往那儿放一个假 git，这一步
+          # 就把现造的那份凭据连同 GH_TOKEN 一起交到它手上（跟种钩子是同一类事，只是
+          # 换成了「换掉命令本身」）。所以同上一步：PATH 过滤成我们写不动的目录，
+          # 目录和它的上一级一起看。
+          path_is_protected() {
+            local dir="$1"
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+          if ! command -v git >/dev/null 2>&1; then
+            echo '::error::git is not available from a write-protected PATH entry; refusing to run a credentialed git command'
+            exit 1
+          fi
+
+          # 这一步只信我们在命令行上给的那几项配置：上一步跑的是被审 PR 自己的代码，它能往
           # .git/hooks 种钩子、往 .git/config 写 core.hooksPath 把钩子指到别处，也能写
           # 机器上的全局配置（$HOME/.gitconfig 不在上一步的指纹里 —— 指纹只拍仓库自己
           # 那份 .git）。全局配置里 url.<base>.insteadOf 配 ext:: 传输、credential.helper
@@ -997,11 +1320,36 @@ jobs:
                   -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
           }
 
-          sealed_git config user.name 'github-actions[bot]'
-          sealed_git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # 提交人走环境变量，不写 .git/config：这一步于是一个字都不改仓库的配置，
+          # 上一步拍的那份指纹在提交那一刻仍然成立。
+          authored_git() {
+            GIT_AUTHOR_NAME='github-actions[bot]' \
+            GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+            GIT_COMMITTER_NAME='github-actions[bot]' \
+            GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+              sealed_git "$@"
+          }
 
-          sealed_git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
-          sealed_git push -q origin "HEAD:$HEAD_REF"
+          # 写权限凭据这一轮只在这里出现，而且只出现在这一条 push 的环境里：
+          # 上一步把 checkout 留在 .git/config 里那份摘掉就没还回去，我们用手上的
+          # GH_TOKEN 现造一份（actions/checkout 写进去的就是这一串）。
+          # 不落 .git/config：落了就是一份谁都能轮询的文件，而这正是「按进程组收尾
+          # 挡不住 setsid」留下的那条路（MEL-255）。凭据只活在这一条 push 的环境里，
+          # 它的命门跟这一步的 GH_TOKEN 一样 —— 见上面那段：靠的是「上一步证明了没有
+          # 活进程」，不是靠藏。
+          # 也不上命令行：argv 在 /proc 里是公开的，-c 等于把凭据贴到进程表上。
+          # printf 是 bash 内建，令牌不会出现在任何一个进程的 argv 里；GNU 的 base64
+          # 默认按 76 列折行，所以 tr 掉换行。
+          push_auth="AUTHORIZATION: basic $(printf '%s' "x-access-token:$GH_TOKEN" | base64 | tr -d '\n')"
+          credentialed_git() {
+            GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="$push_auth" \
+              sealed_git "$@"
+          }
+
+          authored_git commit -q -m "fix: apply the Codex review feedback on PR #$PR_NUMBER"
+          credentialed_git push -q origin "HEAD:$HEAD_REF"
           new_head="$(sealed_git rev-parse HEAD)"
           echo 'pushed=true' >>"$GITHUB_OUTPUT"
           echo '- verification: passed, the fix was pushed' >>"$GITHUB_STEP_SUMMARY"

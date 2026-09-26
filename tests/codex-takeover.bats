@@ -22,6 +22,8 @@ setup() {
   cp "$SCRIPTS/classify-claude-failure.sh" "$RUNNER_TEMP/fixer-scripts/"
   cd "$BATS_TEST_TMPDIR/work" || return
   export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token
+  # 噪声重跑时要用的 git：在测试往 PATH 上种任何东西之前先认下来（见 reset_workspace）
+  export REAL_GIT="$(command -v git)"
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
   run_block "$WF" "Define pr-guard helpers" >/dev/null
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
@@ -162,6 +164,9 @@ push_workspace() { # push_workspace <verify script>
   printf 'prefetched review\n' >.review/findings-99-1.md
   printf 'v2 fixed by codex\n' >app.txt
   export VERIFY="$1"
+  # 调用方没写白名单 = 一个被跟踪的文件都不许验证命令改写（失败关闭）。
+  # 要放行的测试自己在调用前 export 一份。
+  export VERIFY_WRITABLE_PATHS="${VERIFY_WRITABLE_PATHS:-}"
   export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
 }
 
@@ -169,6 +174,67 @@ push_workspace() { # push_workspace <verify script>
 verify_and_push() {
   run_step "$WF" "Verify the Codex fix" &&
     run_step "$WF" "Commit and push the Codex fix"
+}
+
+# 「验证留下的活进程」那一道按**运行用户**清点残留 —— 这是它挡得住 setsid 的原因，
+# 也意味着本机跑测试时，机器上任何一个恰好在这一瞬起来、又活过 5 秒容忍窗口的进程
+# （浏览器渲染进程、编辑器的后台服务……）同样会被记一笔。runner 上进程表是干净的，
+# 生产路径不会撞上；本机会。
+# 所以：没种探针却撞上这条错误 = 机器噪声，原样重跑一遍。种了探针的测试永不重跑，
+# 真逃逸照旧红。代码真坏了也照旧红：重跑几次都是同一条错误，最后还是红。
+# 判据是「报出来的那个 pid 是不是我们种的那个」：是 = 防线抓到了探针，绝不重跑；
+# 不是 = 机器上别人的进程，重跑。
+is_machine_noise() {
+  local f pid
+  case "$output" in *'outlived the verify command'*) ;; *) return 1 ;; esac
+  for f in escaped.pid leftover.pid; do
+    pid="$(cat "$BATS_TEST_TMPDIR/$f" 2>/dev/null || true)"
+    [ -n "$pid" ] || continue
+    case "$output" in *"$pid ("*) return 1 ;; esac
+  done
+  return 0
+}
+
+# 重跑之前工作区必须退回 push_workspace 刚布好的样子。上一次尝试里验证命令已经把
+# 载荷写进工作区、还可能自己 git add 过了，而那一步是先 add -A、再拍「验证前的那棵
+# 树」—— 不退回去，第二次的「验证前」里就已经带着载荷，前后一比没差异，夹带的文件
+# 反倒顺利推出去（全量跑第 6 轮真撞到过一次：planted.txt 上了 origin）。
+# git 走绝对路径：有的测试让验证命令往 PATH 上种了一个假 git，退工作区不该去跑它。
+# 凭据故意不补回去：上一次尝试可能留着一个还在轮询 .git/config 的探针，补回去等于
+# 把战利品直接送给它；而带凭据那一步本来就不再往那个文件里写，少这一份不改变任何
+# 一条判定。
+reset_workspace() {
+  "$REAL_GIT" reset -q --hard origin/topic
+  "$REAL_GIT" clean -qfdx
+  printf 'v2 fixed by codex\n' >app.txt
+  mkdir -p .review
+  printf 'prefetched review\n' >.review/findings-99-1.md
+}
+
+# 代替 `run verify_and_push` / `run run_step … Verify`：bats 的 run 写的是全局
+# output/status，这里就地重跑覆盖掉。
+# 重跑之前先等一秒：本机噪声是一阵一阵的（写文件会招来 Spotlight 的 mdworker），
+# 等它过去再跑，比连着重试三次有用。
+run_chain() {
+  local tries=0
+  run verify_and_push
+  while [ "$tries" -lt 3 ] && is_machine_noise; do
+    tries=$((tries + 1))
+    /bin/sleep 1
+    reset_workspace
+    run verify_and_push
+  done
+}
+
+run_verify() {
+  local tries=0
+  run run_step "$WF" "Verify the Codex fix"
+  while [ "$tries" -lt 3 ] && is_machine_noise; do
+    tries=$((tries + 1))
+    /bin/sleep 1
+    reset_workspace
+    run run_step "$WF" "Verify the Codex fix"
+  done
 }
 
 # 令牌只在子进程里被 env -u 抹掉是不够的：父 shell 那份环境还在，验证命令跟它
@@ -194,14 +260,15 @@ printf "GH_TOKEN=[%s]\n" "${GH_TOKEN:-}" >"$probe"
 git config --local --get http.https://github.com/.extraheader >>"$probe" ||
   echo "git-credential=[]" >>"$probe"'
 
-  run run_step "$WF" "Verify the Codex fix"
+  run_verify
 
   assert_equal "$status" 0
   probe="$(cat "$BATS_TEST_TMPDIR/probe.txt")"
   assert_contains "$probe" 'GH_TOKEN=[]'
   assert_contains "$probe" 'git-credential=[]'
-  # push 还要用，验证跑完必须原样还回来
-  assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
+  # 摘掉之后不再还回去：凭据整个收进下一步内部，两步之间 .git/config 里一个字都
+  # 没有，逃过收尾的进程盯着这个文件也等不到东西（MEL-255）。
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
   assert_equal "$(step_output changed)" true
 }
 
@@ -213,7 +280,7 @@ git config --local --get http.https://github.com/.extraheader >>"$probe" ||
   [ -r /proc/self/environ ] || skip 'no /proc here; the env:-declaration test covers this platform'
   push_workspace 'tr "\0" "\n" <"/proc/$PPID/environ" >"$BATS_TEST_TMPDIR/parent-env.txt"'
 
-  run run_step "$WF" "Verify the Codex fix"
+  run_verify
 
   assert_equal "$status" 0
   parent="$(cat "$BATS_TEST_TMPDIR/parent-env.txt")"
@@ -233,7 +300,7 @@ git config --local --get http.https://github.com/.extraheader >>"$probe" ||
   push_workspace 'printf "%s\n" "$PWD/evil-bin" >>"$GITHUB_PATH"
 printf "SNEAK=yes\n" >>"$GITHUB_ENV"'
 
-  run run_step "$WF" "Verify the Codex fix"
+  run_verify
 
   assert_equal "$status" 0
   assert_equal "$(cat "$GITHUB_PATH")" ''
@@ -251,7 +318,7 @@ printf "SNEAK=yes\n" >>"$GITHUB_ENV"'
   push_workspace 'printf "%s\n" "$PWD/evil-bin" >>"$REAL_PATH_FILE"
 printf "SNEAK=yes\n" >>"$REAL_ENV_FILE"'
 
-  run run_step "$WF" "Verify the Codex fix"
+  run_verify
 
   assert_equal "$status" 0
   assert_equal "$(cat "$GITHUB_PATH")" ''
@@ -261,11 +328,12 @@ printf "SNEAK=yes\n" >>"$REAL_ENV_FILE"'
 # 提交的必须是验过的那棵树：验证自己会改被跟踪的文件（uv sync --dev 重写
 # uv.lock），同时造出不该提交的垃圾目录。两个性质得同时成立。
 @test "takeover: the commit carries the tree the verification actually ran on" {
+  export VERIFY_WRITABLE_PATHS=deps.lock
   push_workspace 'printf "lock v2\n" >deps.lock
 mkdir -p .venv && printf "junk\n" >.venv/pyvenv.cfg
 printf "cached\n" >stray.pyc'
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$status" 0
   assert_equal "$(git show HEAD:deps.lock)" 'lock v2'
@@ -281,13 +349,120 @@ printf "cached\n" >stray.pyc'
 @test "takeover: a failing verification pushes nothing" {
   push_workspace 'exit 3'
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$status" 1
   assert_contains "$output" 'verification failed'
   refute_called "gh pr comment"
-  # 凭据照样还回来，不能因为验证失败就永久摘掉
-  assert_equal "$(git config --local --get http.https://github.com/.extraheader)" 'AUTHORIZATION: basic c2VjcmV0'
+  # 验证失败也一样不还：下一步自己用手上的令牌现造一份，这里没人需要它（MEL-255）
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+}
+
+# ---------- 验证改写了哪些被跟踪的文件 ----------
+#
+# 上面那条守的是「提交的必须是验过的那棵树」，为此验证跑完还要补一次 add -u ——
+# 而那一次 add -u 会把验证改过的**任何**被跟踪文件一起入索引，下一步带着写权限
+# 凭据提交并推送。于是被审 PR 自带的验证命令只要往一个源文件里写一行，就借这条
+# 工作流的手把「复审机器人从没产出过的改动」发布进了仓库。
+# 合法的那一半不能连坐：uv sync --dev 重写 uv.lock、npm ci 重写 package-lock.json，
+# 撤掉 add -u 等于推翻 MEL-252。所以按白名单分开：调用方在自己的工作流文件里列出
+# 允许被重写的路径（被审 PR 改不到那份文件），默认一个都不许。
+
+@test "takeover: a source file the verify command rewrote off the allowlist never gets pushed" {
+  push_workspace 'printf "v2 fixed by codex\nbackdoor\n" >app.txt'
+
+  run_chain
+
+  # 战利品先断：防线撤掉时，失败信息里直接就是被发布出去的那行
+  refute_contains "$(git show origin/topic:app.txt)" 'backdoor'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  assert_equal "$status" 1
+  assert_contains "$output" 'outside verify_writable_paths'
+  assert_contains "$output" 'app.txt'
+  # 停在带凭据那一步之前：凭据没塞回去，本地也没有新提交
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  assert_equal "$(git show -s --format=%s HEAD)" 'base'
+  refute_called "gh pr comment"
+}
+
+# 白名单上的那条照旧放行，不能把 MEL-252 那条合法路径一起误伤：验证重新生成了
+# 它自己负责生成的 lock 文件，提交推送照常，推出去的正是验证跑过的那份内容。
+@test "takeover: a lock file the caller put on the allowlist still ships" {
+  export VERIFY_WRITABLE_PATHS=deps.lock
+  push_workspace 'printf "lock v2\n" >deps.lock'
+
+  run_chain
+
+  assert_equal "$status" 0
+  refute_contains "$output" 'outside verify_writable_paths'
+  assert_equal "$(git show origin/topic:deps.lock)" 'lock v2'
+  assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by codex'
+}
+
+# add -u 只是其中一条路：验证命令自己跑一条 git add，新文件当场就进了真索引，
+# 下一步直接提交推送，连 add -u 都用不着。所以判定比的是「会被提交的那棵树」，
+# 不是「add -u 会带进来哪些文件」。
+@test "takeover: a file the verify command staged itself is caught the same way" {
+  push_workspace 'printf "backdoor\n" >planted.txt && git add planted.txt'
+
+  run_chain
+
+  assert_equal "$(git ls-tree -r --name-only origin/topic)" "$(printf 'app.txt\ndeps.lock')"
+  assert_equal "$status" 1
+  assert_contains "$output" 'outside verify_writable_paths'
+  assert_contains "$output" 'planted.txt'
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  refute_called "gh pr comment"
+}
+
+# ---------- 提交落在哪儿：HEAD、refs 和「进行中的操作」 ----------
+#
+# 上面那一段比的是「会被提交的那棵树」——「提交里装了什么」。它认不出「提交落在
+# 哪儿」：验证命令对工作副本有写权限，也就动得了这个仓库的提交历史，而下一步那次
+# commit 的父亲、以及 push 解析出来的东西，都不在树里。两条真漏（都在本机实跑复现）：
+#   1. 先 git commit 一份带后门的载荷（HEAD 前进一格），再把索引恢复原样 —— 树一
+#      字不差地回到 verify_tree_before，比树那道门放行；外层那次 commit 落在已经
+#      前进过的 HEAD 上，恶意 commit 成了祖先，push 把它一起发布，而它在 PR 的最终
+#      diff 里看不见。
+#   2. 连 ref 都不用动：git commit-tree 造出一个游离的 commit 对象，写一个
+#      .git/MERGE_HEAD 指过去，下一步那次 commit 就凭空多一个父亲 —— HEAD、全部
+#      ref、树、.git/config 指纹，四样在验证前后完全一致。
+# 所以验证前把 HEAD + refs/** + 那几个「进行中的操作」哨兵一起拍进快照，验证跑完
+# 先比这份快照、再比树。
+
+@test "takeover: a commit the verify command made never becomes an ancestor of the push" {
+  push_workspace 'printf "v2 fixed by codex\nbackdoor\n" >app.txt
+git -c commit.gpgsign=false commit -q -a -m "malicious payload"
+printf "v2 fixed by codex\n" >app.txt
+git add app.txt'
+
+  run_chain
+
+  # 战利品先断：防线撤掉时，失败信息里直接就是被发布出去的那一笔提交
+  refute_contains "$(git log --format=%s origin/topic)" 'malicious payload'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  assert_equal "$status" 1
+  assert_contains "$output" 'HEAD, a ref or an in-progress git operation'
+  # 停在带凭据那一步之前：凭据没塞回去，也没人替它提交
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  refute_called "gh pr comment"
+}
+
+@test "takeover: a MERGE_HEAD the verify command plants cannot graft a commit onto the push" {
+  push_workspace 'blob=$(printf "backdoor\n" | git hash-object -w --stdin)
+tree=$(printf "100644 blob %s\tevil.txt\n" "$blob" | git mktree)
+evil=$(git -c commit.gpgsign=false commit-tree "$tree" -p HEAD -m "malicious payload")
+printf "%s\n" "$evil" >.git/MERGE_HEAD'
+
+  run_chain
+
+  refute_contains "$(git log --format=%s origin/topic)" 'malicious payload'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  assert_equal "$status" 1
+  assert_contains "$output" 'HEAD, a ref or an in-progress git operation'
+  assert_contains "$output" 'MERGE_HEAD'
+  assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
+  refute_called "gh pr comment"
 }
 
 # ---------- 种进 .git 的东西，不许被带凭据的那一步替它跑 ----------
@@ -334,6 +509,33 @@ hook_loot() {
   assert_equal "$(git show HEAD:app.txt)" 'v2 fixed by codex'
 }
 
+# 换掉命令本身，跟种钩子是同一类事，只是不用碰 `.git`：`ubuntu-latest` 的 PATH 第一项
+# 在 `$HOME` 下、验证命令写得动，往那儿放一个假 git 就行。带凭据那一步要是去跑它，
+# 现造的那份凭据原文就直接递到它手上（`GIT_CONFIG_VALUE_0`）；验证那一步去跑它，
+# 指纹和树的判定就由它说了算。所以两步的 PATH 都只认我们写不动的目录。
+@test "takeover: a git planted on a writable PATH entry never gets the push credential" {
+  plantable="$BATS_TEST_TMPDIR/plantable-bin"
+  mkdir -p "$plantable"
+  export PATH="$plantable:$PATH"
+  export FAKE_GIT_LOG="$BATS_TEST_TMPDIR/fake-git.log"
+  cat >"$BATS_TEST_TMPDIR/fake-git.sh" <<'EOS'
+#!/bin/sh
+printf '%s | GIT_CONFIG_VALUE_0=%s\n' "$*" "${GIT_CONFIG_VALUE_0:-}" >>"$FAKE_GIT_LOG"
+exec /usr/bin/git "$@"
+EOS
+  # 验证命令自己去种（跟真实时序一样：种完之后我们才接着用 git）
+  push_workspace "cp $BATS_TEST_TMPDIR/fake-git.sh $plantable/git && chmod +x $plantable/git"
+
+  run_chain
+
+  assert_equal "$status" 0
+  [ -x "$plantable/git" ] || { echo 'the fake git was never planted' >&2; return 1; }
+  [ ! -s "$FAKE_GIT_LOG" ] || { echo "the planted git ran: $(cat "$FAKE_GIT_LOG")" >&2; return 1; }
+  # 提交推送照旧走到真 origin：这一道不能靠「什么都没发生」通过
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by codex'
+}
+
 @test "takeover: a core.hooksPath planted in .git/config never runs in that step either" {
   push_workspace 'true'
   plant_hook "$BATS_TEST_TMPDIR/evil-hooks/pre-commit"
@@ -352,7 +554,7 @@ hook_loot() {
 @test "takeover: a verify command that writes .git/config stops the chain before the credentials return" {
   push_workspace 'git config --local credential.helper "!f(){ echo password=stolen; }; f"'
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$status" 1
   assert_contains "$output" 'the verify command modified .git'
@@ -367,7 +569,7 @@ hook_loot() {
   push_workspace 'printf "#!/bin/sh\ntrue\n" >.git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit'
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$status" 1
   assert_contains "$output" 'the verify command modified .git'
@@ -418,7 +620,7 @@ payload_loot() {
   export ORIGIN_URL="$BATS_TEST_TMPDIR/origin.git"
   push_workspace 'printf "[protocol \"ext\"]\n\tallow = always\n[url \"ext::%s\"]\n\tinsteadOf = %s\n" "$PAYLOAD" "$ORIGIN_URL" >"$GLOBAL_GITCONFIG"'
 
-  run verify_and_push
+  run_chain
 
   # 战利品先断：撤掉防线时，失败信息里直接就是被捞走的那两把钥匙
   assert_equal "$(payload_loot)" ''
@@ -437,7 +639,7 @@ payload_loot() {
   plant_payload
   push_workspace 'printf "[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = %s\n" "$PAYLOAD" >"$GLOBAL_GITCONFIG"'
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$(payload_loot)" ''
   assert_equal "$status" 0
@@ -481,7 +683,7 @@ for d in "$RUNNER_TEMP"/no-hooks-*; do
   cp "$PAYLOAD" "$d/post-index-change"
 done'
 
-  run verify_and_push
+  run_chain
 
   # 战利品先断：防线撤掉时，失败信息里直接就是被捞走的那把钥匙
   assert_equal "$(payload_loot)" ''
@@ -511,7 +713,7 @@ done'
   printf "[core]\n\tfsmonitor = %s\n" "$STAGE1" >"$f"
 done'
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$(payload_loot)" ''
   assert_equal "$status" 0
@@ -529,7 +731,7 @@ done'
 @test "takeover: a .git/config swapped for a symlink into a tracked file stops the chain before the credentials return" {
   push_workspace 'cp .git/config deps.lock && ln -sf "$PWD/deps.lock" .git/config'
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$status" 1
   assert_contains "$output" 'no longer a regular file'
@@ -568,7 +770,7 @@ leftover_state() {
 @test "takeover: a process the verify command leaves behind never sees the credentials return" {
   push_workspace "$(leftover_probe)"
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$(payload_loot)" ''
   assert_equal "$(leftover_state)" gone
@@ -581,12 +783,259 @@ leftover_state() {
 @test "takeover: a leftover that ignores SIGTERM is gone before the credentials return as well" {
   push_workspace "$(leftover_probe "trap '' TERM")"
 
-  run verify_and_push
+  run_chain
 
   assert_equal "$(payload_loot)" ''
   assert_equal "$(leftover_state)" gone
   assert_equal "$status" 0
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
+# ---------- 逃出自己进程组的那一个，按组号收不到 ----------
+#
+# 上面两条按「组号 = 验证命令的 pid」整组收掉。可验证命令起后台任务时加一句 setsid
+# （或者自己来一次双重 fork），后代就换到了新的会话、新的进程组 —— 按组号去 ps 的
+# 收尾压根看不见它。它活到「凭据塞回 .git/config」那一刻就把钥匙抄走，也可以等指纹
+# 和白名单判完之后再改一个源文件、入索引，让下一步替它提交推送，判定全部作废。
+# 两道各守一半：
+#   1. 凭据摘掉之后不再还回 .git/config —— 盯着那个文件的进程永远等不到东西；
+#   2. 「那一棵进程树死透了」要有正面证据，而且证据不能建立在任何一样它交得出去的
+#      东西上。进程组、会话、继承来的描述符它都能主动丢掉（关光所有描述符是
+#      daemon 化的常见写法，也正是 Codex 那条 P1 复现用的一句 exec 8>&-）；换不掉
+#      的只有运行用户。所以按用户正面清点残留进程，清不干净就在指纹 / 树 / 提交
+#      之前红着停下。
+#
+# 下面这个探针因此故意把继承来的描述符全关掉再躲：它要是还能糊弄过去，这一道就
+# 白写了。
+
+# 逃逸探针：验证命令起一个新会话 + 双重 fork 的后台进程，而且把继承来的描述符
+# （3..30）全关掉，然后自己正常退出。它盯着 .git/config，一看到凭据回来就抄走
+# （再执行 ESCAPE_AFTER），没等到就在约 10 秒后自己退出 —— 测试不会被挂住。
+# 探针要的变量得在测试自己这个 shell 里 export，所以这个函数直接改环境、把验证
+# 命令留在 $ESCAPE_VERIFY —— 写成 "$(escaped_probe)" 的话 export 全丢在子 shell 里。
+escaped_probe() { # escaped_probe [抄到凭据之后再干什么]
+  cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
+#!/bin/sh
+echo "$$" >"$ESCAPE_PID"
+i=0
+while [ "$i" -lt 200 ]; do
+  if grep -q extraheader "$ESCAPE_CFG" 2>/dev/null; then
+    cp "$ESCAPE_CFG" "$ESCAPE_LOOT"
+    [ -z "$ESCAPE_AFTER" ] || sh -c "$ESCAPE_AFTER"
+    exit 0
+  fi
+  /bin/sleep 0.05
+  i=$((i + 1))
+done
+EOS
+  cat >"$BATS_TEST_TMPDIR/escape.sh" <<'EOS'
+#!/bin/sh
+# 一句 perl 把三件事做完：双重 fork + setsid 换到新会话、把继承来的描述符一个不留
+# 地关掉、再 exec 成载荷。这就是 daemon 化的标准写法，也是 Codex 那条 P1 的复现
+# 路径（它只用了一句 exec 8>&-）—— 描述符号写死在公开的工作流源码里，关掉就等于
+# 把「靠继承的管道读到 EOF」那种证据作废，所以探针故意做到底。
+# 关描述符为什么不用 shell：CI 的 /bin/sh 是 dash，它自己占着 fd 10，在脚本里、
+# 甚至在 sh -c 里关到 10，dash 当场静默死掉，探针压根起不来（本机的 /bin/sh 是
+# bash，脚本 fd 在 255，本机怎么跑都看不出来 —— 这一条在 CI 上红过两轮）。
+perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; POSIX::close($_) for (3 .. 30); exec("/bin/sh", $ENV{ESCAPEE});' >/dev/null 2>&1 &
+# 等它真的换完会话再让验证命令退出：慢一步的话，按组号那一下会在 setsid 之前就把
+# 它正当收掉，这条测试就测不到「逃出去之后」那一段了（探针的时序问题，不是防线的）。
+i=0
+while [ "$i" -lt 100 ] && [ ! -s "$ESCAPE_PID" ]; do
+  /bin/sleep 0.05
+  i=$((i + 1))
+done
+EOS
+  export ESCAPEE="$BATS_TEST_TMPDIR/escapee.sh"
+  export ESCAPE_CFG="$BATS_TEST_TMPDIR/work/.git/config"
+  export ESCAPE_LOOT="$BATS_TEST_TMPDIR/payload-loot.txt"
+  export ESCAPE_PID="$BATS_TEST_TMPDIR/escaped.pid"
+  export ESCAPE_AFTER="${1:-}"
+  ESCAPE_VERIFY="sh $BATS_TEST_TMPDIR/escape.sh"
+}
+
+# 探针是异步起来的，而这一道判定红得很快（清点一遍就够），pid 文件可能比判定晚
+# 落地几毫秒。所以等一小会儿：等不到才算「压根没起来」，分得清这两件事。
+# 走 /bin/sleep 的绝对路径，PATH 上那个假 sleep 压根不睡。
+wait_for_escaped() {
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    [ -s "$BATS_TEST_TMPDIR/escaped.pid" ] && return 0
+    /bin/sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# 它真的起来过吗：pid 文件在 = 逃逸进程确实跑了，否则下面的 refute 只是空转。
+escaped_ran() {
+  wait_for_escaped || { echo 'the escaped probe never started' >&2; return 1; }
+}
+
+# 测试收尾把它收掉，别让它活到 bats 清理临时目录的时候。
+reap_escaped() {
+  local pid
+  wait_for_escaped || true
+  pid="$(cat "$BATS_TEST_TMPDIR/escaped.pid" 2>/dev/null || true)"
+  [ -z "$pid" ] || kill -9 "$pid" 2>/dev/null || true
+}
+
+@test "takeover: a descendant that escaped its process group stops the chain and never sees the credentials" {
+  escaped_probe
+  push_workspace "$ESCAPE_VERIFY"
+
+  run_chain
+  reap_escaped
+
+  # 战利品先断：防线撤掉时，失败信息里直接就是被它抄走的那把钥匙
+  assert_equal "$(payload_loot)" ''
+  escaped_ran
+  assert_equal "$status" 1
+  assert_contains "$output" 'outlived the verify command'
+  # 停在指纹 / 树 / 提交之前：本地没有新提交，origin 还停在 base，也没人发评论
+  assert_equal "$(git show -s --format=%s HEAD)" 'base'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  refute_called "gh pr comment"
+}
+
+# 清点靠的是 ps，而 runner 的 PATH 第一项在 $HOME 下、验证命令写得动 —— 往那儿放一个
+# 假 ps（把自己那一行过滤掉），这一整道就变成空转；同理，一个假 git 能报一棵假的树，
+# 一个假 gh 能在下一步把令牌直接拿走。所以我们自己跑的命令只从「写不动的目录」里找。
+@test "takeover: a fake ps planted on a writable PATH entry cannot hide the leftover" {
+  escaped_probe
+  # 模拟 runner 的 PATH：第一项是我们（也就是验证命令）写得动的目录
+  plantable="$BATS_TEST_TMPDIR/plantable-bin"
+  mkdir -p "$plantable"
+  export PATH="$plantable:$PATH"
+  # 验证命令先放一个假 ps，再把自己藏起来
+  cat >"$BATS_TEST_TMPDIR/fake-ps.sh" <<'EOS'
+#!/bin/sh
+# 把自己那一窝从清点里抹掉，别的照原样输出 —— 清点于是「证明」了它不存在。
+/bin/ps "$@" | { grep -v escapee.sh || true; }
+EOS
+  push_workspace "cp $BATS_TEST_TMPDIR/fake-ps.sh $plantable/ps && chmod +x $plantable/ps && $ESCAPE_VERIFY"
+
+  run_chain
+  reap_escaped
+
+  escaped_ran
+  [ -x "$plantable/ps" ] || { echo 'the fake ps was never planted' >&2; return 1; }
+  assert_equal "$status" 1
+  assert_contains "$output" 'outlived the verify command'
+  assert_contains "$output" "$(cat "$BATS_TEST_TMPDIR/escaped.pid")"
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+}
+
+# 同一个洞的另一半战利品：它不需要读到凭据，等判定做完之后改一个源文件、自己入
+# 索引，下一步就替它提交推送 —— MEL-258 那道白名单是在它动手之前跑完的。
+@test "takeover: an escaped descendant cannot smuggle a source file past the tree check" {
+  escaped_probe 'printf "v2 fixed by codex\nbackdoor\n" >app.txt; git add app.txt'
+  push_workspace "$ESCAPE_VERIFY"
+
+  run_chain
+  reap_escaped
+
+  refute_contains "$(git show origin/topic:app.txt)" 'backdoor'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  escaped_ran
+  assert_equal "$status" 1
+  assert_contains "$output" 'outlived the verify command'
+}
+
+# 这一道不靠「它干了坏事」才发现得了：一个什么都不做、只是活着的进程同样算。
+# 它是「凭据能被读走」的唯一前提 —— 同一个用户的活进程从 /proc/<pid>/environ 就把
+# 下一步的 GH_TOKEN 读走了，凭据挪进环境变量并不等于没地方可等。所以证据只能是
+# 「那一刻这个用户名下一个残留都没有」。
+@test "takeover: an idle daemon left behind is caught even though it steals nothing" {
+  escaped_probe
+  # 换掉载荷：什么都不偷，只是活着。exec 掉之后 pid 不变，收尾那一下收的正是它。
+  # 走 /bin/sleep 的绝对路径：测试环境里 PATH 上那个假 sleep 压根不睡。
+  cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
+#!/bin/sh
+echo "$$" >"$ESCAPE_PID"
+exec /bin/sleep 12
+EOS
+  push_workspace "$ESCAPE_VERIFY"
+
+  run_chain
+  reap_escaped
+
+  escaped_ran
+  assert_equal "$status" 1
+  assert_contains "$output" 'outlived the verify command'
+  # 停在提交推送之前
+  assert_equal "$(git show -s --format=%s HEAD)" 'base'
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  refute_called "gh pr comment"
+  # 这一道的位置也锁住：正面证据必须排在指纹、树、以及「这一步算通过」之前，
+  # 否则那些判定都是在「验证可能还活着」的情况下做出来的，做完就作废。
+  block="$(extract_run_block "$REPO_ROOT/$WF" 'Verify the Codex fix')"
+  contained="$(printf '%s\n' "$block" | grep -n 'outlived the verify command' | head -n 1 | cut -d: -f1)"
+  fingerprint="$(printf '%s\n' "$block" | grep -n 'the verify command modified .git' | head -n 1 | cut -d: -f1)"
+  passed="$(printf '%s\n' "$block" | grep -n "changed=true" | head -n 1 | cut -d: -f1)"
+  [ "$contained" -lt "$fingerprint" ] || { echo "containment proof at $contained is not before the fingerprint at $fingerprint" >&2; return 1; }
+  [ "$contained" -lt "$passed" ] || { echo "containment proof at $contained is not before changed=true at $passed" >&2; return 1; }
+}
+
+# 结构那一半单独立得住：正常一轮跑完，写权限凭据也不回 .git/config —— 带凭据那一步
+# 自己用手上的令牌现造一份，只递给那一条 push。于是凭据在两步之间压根不存在，
+# 任何活着的进程盯着那个文件都等不到东西。
+@test "takeover: the write credential never lands in .git/config again after verification" {
+  push_workspace 'true'
+
+  run_chain
+
+  assert_equal "$status" 0
+  assert_equal "$(git config --local --get-all http.https://github.com/.extraheader || echo none)" 'none'
+  # 推送照旧走到真 origin：这一道不能靠「凭据丢了所以什么都没发生」通过
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by codex'
+  # 结构上也锁住：凭据只走环境变量递给那一条 push，不许有任何一句把它写回配置文件
+  # —— 写回去了，盯着文件的进程就又有得可等（也别写到命令行上，argv 在 /proc 里公开）。
+  push_block="$(extract_run_block "$REPO_ROOT/$WF" 'Commit and push the Codex fix')"
+  assert_contains "$push_block" 'GIT_CONFIG_VALUE_0'
+  refute_contains "$push_block" 'config --local http'
+}
+
+# 重跑本身不许把载荷洗白：这一条看住 reset_workspace。第一次尝试故意留一个活到我们
+# 主动叫停为止的逃逸进程（它的 pid 不在探针那两个文件里，所以按「机器噪声」重跑），
+# 第二次尝试进来先把它叫停。重跑要是沿用上一次的工作区，夹带的文件已经在「验证前的
+# 那棵树」里了，前后一比没差异，整轮反而绿着把它推出去 —— 把 reset_workspace 那一行
+# 去掉，这条就是这样变红的。
+@test "harness: a noise retry restarts from a clean workspace, so the smuggled file is still caught" {
+  export NOISE_MARK="$BATS_TEST_TMPDIR/noise.mark"
+  export NOISY_DAEMON="$BATS_TEST_TMPDIR/noisy-daemon.sh"
+  cat >"$NOISY_DAEMON" <<'EOS'
+#!/bin/sh
+i=0
+while [ "$i" -lt 600 ] && [ ! -e "$NOISE_MARK.stop" ]; do
+  /bin/sleep 0.1
+  i=$((i + 1))
+done
+EOS
+  cat >"$BATS_TEST_TMPDIR/noisy.sh" <<'EOS'
+#!/bin/sh
+if [ -e "$NOISE_MARK" ]; then
+  : >"$NOISE_MARK.stop"
+else
+  : >"$NOISE_MARK"
+  perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec("/bin/sh", $ENV{NOISY_DAEMON});' >/dev/null 2>&1 &
+  /bin/sleep 1
+fi
+printf run >>"$NOISE_MARK.runs"
+printf 'backdoor\n' >planted.txt
+git add planted.txt
+EOS
+  push_workspace "sh $BATS_TEST_TMPDIR/noisy.sh"
+
+  run_chain
+
+  # 真的重跑过：载荷每跑一次记三个字节
+  runs="$(wc -c <"$NOISE_MARK.runs" | tr -d ' ')"
+  [ "$runs" -ge 6 ] || { echo "the chain ran only $((runs / 3)) time(s); the retry never happened" >&2; return 1; }
+  assert_equal "$status" 1
+  assert_contains "$output" 'outside verify_writable_paths'
+  assert_equal "$(git ls-tree -r --name-only origin/topic)" "$(printf 'app.txt\ndeps.lock')"
 }
 
 # ---------- 谁来下结论 ----------
