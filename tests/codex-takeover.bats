@@ -22,6 +22,8 @@ setup() {
   cp "$SCRIPTS/classify-claude-failure.sh" "$RUNNER_TEMP/fixer-scripts/"
   cd "$BATS_TEST_TMPDIR/work" || return
   export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token
+  # 噪声重跑时要用的 git：在测试往 PATH 上种任何东西之前先认下来（见 reset_workspace）
+  export REAL_GIT="$(command -v git)"
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
   run_block "$WF" "Define pr-guard helpers" >/dev/null
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
@@ -193,6 +195,22 @@ is_machine_noise() {
   return 0
 }
 
+# 重跑之前工作区必须退回 push_workspace 刚布好的样子。上一次尝试里验证命令已经把
+# 载荷写进工作区、还可能自己 git add 过了，而那一步是先 add -A、再拍「验证前的那棵
+# 树」—— 不退回去，第二次的「验证前」里就已经带着载荷，前后一比没差异，夹带的文件
+# 反倒顺利推出去（全量跑第 6 轮真撞到过一次：planted.txt 上了 origin）。
+# git 走绝对路径：有的测试让验证命令往 PATH 上种了一个假 git，退工作区不该去跑它。
+# 凭据故意不补回去：上一次尝试可能留着一个还在轮询 .git/config 的探针，补回去等于
+# 把战利品直接送给它；而带凭据那一步本来就不再往那个文件里写，少这一份不改变任何
+# 一条判定。
+reset_workspace() {
+  "$REAL_GIT" reset -q --hard origin/topic
+  "$REAL_GIT" clean -qfdx
+  printf 'v2 fixed by codex\n' >app.txt
+  mkdir -p .review
+  printf 'prefetched review\n' >.review/findings-99-1.md
+}
+
 # 代替 `run verify_and_push` / `run run_step … Verify`：bats 的 run 写的是全局
 # output/status，这里就地重跑覆盖掉。
 # 重跑之前先等一秒：本机噪声是一阵一阵的（写文件会招来 Spotlight 的 mdworker），
@@ -203,6 +221,7 @@ run_chain() {
   while [ "$tries" -lt 3 ] && is_machine_noise; do
     tries=$((tries + 1))
     /bin/sleep 1
+    reset_workspace
     run verify_and_push
   done
 }
@@ -213,6 +232,7 @@ run_verify() {
   while [ "$tries" -lt 3 ] && is_machine_noise; do
     tries=$((tries + 1))
     /bin/sleep 1
+    reset_workspace
     run run_step "$WF" "Verify the Codex fix"
   done
 }
