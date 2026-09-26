@@ -1349,10 +1349,10 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   run run_block "$WF" "Decide the takeover"
 
   refute_planted_ran
-  # 裁决不了就必须红着停下，绝不静默把这一轮判成「可以换人」
-  [ "$status" -ne 0 ] || { echo 'the step decided the round without a trustworthy git' >&2; return 1; }
-
-  # 对照：同一批假命令，接回 PATH 就真被跑了 —— 上面那条不是因为它压根没种上
+  # 只判这一条：那批假命令一次都没被执行。这一步走到哪个分支各机器不同 —— runner 上
+  # gh / git 都在 /usr/bin（写不动），它照常裁决；本机真 gh 在 /opt/homebrew 下、跟
+  # 假 gh 一起被滤掉，它在工具检查那儿就红了。两边都成立的只有「没跑假的」这一条。
+  # 对照：同一批假命令，接回 PATH 就真被跑了 —— 上面那条不是因为它压根没种上。
   trust_fake_bin
   FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_block "$WF" "Decide the takeover"
   assert_planted_runs_when_trusted
