@@ -1071,6 +1071,7 @@ outcome() { # outcome <FALLBACK_ALLOWED> <exec fixture>
   export HEAD_SHA="$H" ROUND=3 FIX_OUTCOME=failure STRUCTURED=''
   export FALLBACK_ALLOWED="$1" EXEC_FILE="$FIXTURES_DIR/sdk/$2"
   fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$H\"}}"
+  trust_fake_bin
   run run_block "$WF" "Check the fix outcome"
 }
 
@@ -1104,6 +1105,7 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
         + (if $s == "" then {} else {api_error_status: ($s | tonumber)} end)]' \
       >"$EXECUTION_FILE"
   fi
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
 }
 
@@ -1192,6 +1194,7 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
       {type:"result",subtype:"error",is_error:true,result:"the assertion still fails after 3 attempts"}
     ]' >"$EXECUTION_FILE"
 
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
 
   assert_equal "$status" 1
@@ -1212,6 +1215,7 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
       {type:"result",subtype:"error",is_error:true,api_error_status:529,result:"gave up"}
     ]' >"$EXECUTION_FILE"
 
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
 
   assert_equal "$status" 0
@@ -1230,6 +1234,7 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   export REVIEW_FIXER=codex FIRST=codex FALLBACK_ALLOWED=false
   export OUTCOME_RESULT=skipped OUTCOME_FAILED='' OUTCOME_REASON='' OUTCOME_UNTIL=''
   export HEAD_SHA="$H" EXECUTION_FILE=''
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
   assert_equal "$status" 0
   assert_equal "$(step_output run_codex)" true
@@ -1241,6 +1246,7 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true
   export OUTCOME_RESULT=failure OUTCOME_FAILED='' OUTCOME_REASON='' OUTCOME_UNTIL=''
   export HEAD_SHA="$H" EXECUTION_FILE=''
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
   assert_equal "$status" 1
   assert_equal "$(step_output run_codex)" false
@@ -1250,6 +1256,7 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   decide claude true fix-quota 'API Error: 429 rate_limit_error'
   # 上面那轮起点干净；这轮让 BASE_SHA 落后于 HEAD，模拟 Claude 失败前已经提交过
   export BASE_SHA=0000000000000000000000000000000000000000
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
   assert_equal "$status" 1
   assert_equal "$(step_output run_codex)" false
@@ -1266,6 +1273,7 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
 
   # 起点一点没动，只是 Claude 留了没提交的改动
   printf 'half-finished edit\n' >claude-wip.txt
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
 
   assert_equal "$status" 1
@@ -1289,6 +1297,7 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   # Gate 把这一轮的意见预取进去，盖在被跟踪的那份上面
   printf '## 行内评论\n' >.review/findings.md
 
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
 
   assert_equal "$status" 0
@@ -1314,12 +1323,60 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   printf '## 行内评论\n' >.review/findings.md
   printf 'edited by Claude before it ran out of quota\n' >>.review/policy.yml
 
+  trust_fake_bin
   run run_block "$WF" "Decide the takeover"
 
   assert_equal "$status" 1
   assert_equal "$(step_output run_codex)" false
   assert_contains "$output" 'left uncommitted edits'
   assert_contains "$(fake_last_body "gh pr comment")" '没提交'
+}
+
+# ---------- 命令从哪儿来 ----------
+
+# 裁决这一步手上同样有 github.token 和 Pushover 两个密钥，而且它还拿 git 读「Claude
+# 是不是已经写过这一轮」—— 一个种在可写 PATH 目录里的假 git 报一棵干净的树，就能把
+# 「改到一半」骗成「什么都没写」，换人照走，而假 gh 当场拿到令牌。所以它的命令只从
+# 我们写不动的目录里找。把那段过滤摘掉，这一条当场变红。
+@test "takeover: a gh planted on a writable PATH entry never gets the decision step's token" {
+  plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh git jq sed curl date
+  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true
+  export OUTCOME_RESULT=success OUTCOME_FAILED=true
+  export OUTCOME_REASON=fix-quota OUTCOME_UNTIL=1787569200 HEAD_SHA="$H"
+  export EXECUTION_FILE='' BASE_SHA=''
+  export REPO=o/r PR_NUMBER=7 GH_TOKEN=write-token GH_HOST=127.0.0.1
+
+  run run_block "$WF" "Decide the takeover"
+
+  refute_planted_ran
+  # 只判这一条：那批假命令一次都没被执行。这一步走到哪个分支各机器不同 —— runner 上
+  # gh / git 都在 /usr/bin（写不动），它照常裁决；本机真 gh 在 /opt/homebrew 下、跟
+  # 假 gh 一起被滤掉，它在工具检查那儿就红了。两边都成立的只有「没跑假的」这一条。
+  # 对照：同一批假命令，接回 PATH 就真被跑了 —— 上面那条不是因为它压根没种上。
+  trust_fake_bin
+  FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_block "$WF" "Decide the takeover"
+  assert_planted_runs_when_trusted
+}
+
+# 发总结这一步手上是 github.token，处置跟 Claude 那条路的同名步骤一样：找不到写保护
+# 目录里的 gh 就只 warning 跳过评论，正文照旧留在这一轮的运行页上。
+@test "takeover: a gh planted on a writable PATH entry never gets the Codex summary token" {
+  plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh
+  export SUMMARY='Codex 修了 2 条，跳过 1 条'
+  export PUSHED=true REPO=o/r PR_NUMBER=7 GH_TOKEN=write-token GH_HOST=127.0.0.1
+
+  run run_step "$WF" "Post the Codex summary comment"
+
+  assert_equal "$status" 0
+  refute_planted_ran
+  # 不是空转：正文照旧写进了这一轮的运行页
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" 'Codex 修了 2 条，跳过 1 条'
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" '沙箱外跑过'
+
+  # 对照：同一个假 gh，接回 PATH 就真被跑了
+  trust_fake_bin
+  FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_step "$WF" "Post the Codex summary comment"
+  assert_planted_runs_when_trusted
 }
 
 # ---------------------------------------------------------------------------
@@ -1357,6 +1414,7 @@ codex_mode_context() {
   export FALLBACK_ALLOWED=false
   fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$H\"}}"
 
+  trust_fake_bin
   run run_block "$WF" "Check the fix outcome"
 
   [ "$status" -ne 0 ]

@@ -445,6 +445,9 @@ jobs:
           # 它要 uv / npm / node 那些装在 $HOME 下的工具。
           path_is_protected() {
             local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
             [ -d "$dir" ] || return 1
             while :; do
               [ ! -w "$dir" ] || return 1
@@ -934,6 +937,9 @@ jobs:
           # 目录和它的上一级一起看。
           path_is_protected() {
             local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
             [ -d "$dir" ] || return 1
             while :; do
               [ ! -w "$dir" ] || return 1
@@ -1042,6 +1048,9 @@ jobs:
           # 就有的，归 MEL-260；本轮只管本 PR 新加的这一步。
           path_is_protected() {
             local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
             [ -d "$dir" ] || return 1
             while :; do
               [ ! -w "$dir" ] || return 1
@@ -1122,6 +1131,46 @@ jobs:
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
         run: |
           set -euo pipefail
+
+          # 命令从哪儿来只信写不动的那几个目录：前面跑验证那一步跑的是被审 PR 自己的
+          # 代码，runner 的 PATH 前几项在 $HOME 下、它写得动 —— 往那儿放一个假 gh，这
+          # 一步就把 github.token（contents + pull-requests 写权限）连同 Pushover 那两
+          # 个密钥一起交到它手上，顺带让「head 变没变」由它说了算。验证那一步的三道门
+          # 都看不见这件事：文件在仓库外（树差异看不见）、没动 .git（指纹看不见）、放
+          # 的是文件不是进程（残留清点看不见）。这一段跟前面几步一字不差（
+          # tests/claude-verify-creds.bats 有一条判定盯着），合成一份是 MEL-262。
+          path_is_protected() {
+            local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+          # 少了哪一样这一轮的结局都判不了 —— 红着停下，别静默空转。这一步红了后面
+          # 全跳过，正是想要的：结局没人判，就不许有人去召唤下一轮复审。
+          for tool in gh jq date curl sleep; do
+            command -v "$tool" >/dev/null 2>&1 && continue
+            echo "::error::$tool is not available from a write-protected PATH entry; cannot judge this fix round safely"
+            exit 1
+          done
+
           # shellcheck source=/dev/null
           . "$RUNNER_TEMP/pr-guard.sh"
 
@@ -1240,6 +1289,41 @@ jobs:
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
         run: |
           set -euo pipefail
+
+          # 同上一步：命令只从我们写不动的目录里找。这一步手上同样有 github.token 和
+          # Pushover 两个密钥，而且它还拿 git 读「Claude 是不是已经写过这一轮」—— 一个
+          # 假 git 报一棵干净的树，就能把「改到一半」骗成「什么都没写」，换人照走。
+          path_is_protected() {
+            local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+          # 少了哪一样这条链就没人裁决了 —— 红着停下，别静默空转。
+          for tool in git jq sed gh curl date; do
+            command -v "$tool" >/dev/null 2>&1 && continue
+            echo "::error::$tool is not available from a write-protected PATH entry; cannot decide this round safely"
+            exit 1
+          done
+
           # shellcheck source=/dev/null
           . "$RUNNER_TEMP/pr-guard.sh"
 
@@ -1496,6 +1580,9 @@ jobs:
           # 它要 uv / npm / node 那些装在 $HOME 下的工具。
           path_is_protected() {
             local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
             [ -d "$dir" ] || return 1
             while :; do
               [ ! -w "$dir" ] || return 1
@@ -1987,6 +2074,9 @@ jobs:
           # 目录和它的上一级一起看。
           path_is_protected() {
             local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
             [ -d "$dir" ] || return 1
             while :; do
               [ ! -w "$dir" ] || return 1
@@ -2094,6 +2184,35 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 这一步是这条链上最该收紧的一步：它手上是 CODEX_TRIGGER_TOKEN（真人账号的
+          # fine-grained PAT），而前面跑验证那一步跑的是被审 PR 自己的代码，runner 的
+          # PATH 前几项在 $HOME 下、它写得动 —— 往那儿放一个假 gh，令牌直接递过去。
+          # 所以同前面几步：PATH 过滤成我们写不动的目录，目录和它的上一级一起看。
+          path_is_protected() {
+            local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+
           # 链路断点告警：静默失败过一次就没人知道流水线停了（同 adb 看门狗的
           # 教训），每个终态失败路径都推一条 Pushover；每次 run 至多一条，不重复。
           push_alert() {
@@ -2105,6 +2224,14 @@ jobs:
                 --form-string "message=$2" >/dev/null 2>&1 || true
             fi
           }
+
+          # 少了 gh 就跟「令牌为空」一个处置：告警 + 退 0，绝不去跑一个来路不明的 gh。
+          # 不红着停下是因为它排在发 Codex 总结评论之前，一红那条总结也跟着被跳过。
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::warning::gh is not available from a write-protected PATH entry; request @codex review manually"
+            push_alert "🤖 Codex 召唤没能发出" "PR #$PR_NUMBER 的 runner 上找不到写保护目录里的 gh，这一轮没有自动召唤复审。请对该 PR 手动评论 @codex review。"
+            exit 0
+          fi
 
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::CODEX_TRIGGER_TOKEN is missing; request @codex review manually"
@@ -2160,13 +2287,56 @@ jobs:
           PUSHED: ${{ steps.codex_push.outputs.pushed }}
         run: |
           set -euo pipefail
+
+          # 同 Post the Claude summary comment：这一步手上是 github.token，而前面跑
+          # 验证那一步跑的是被审 PR 自己的代码，往它写得动的 PATH 目录里放一个假 gh，
+          # 这一步就把令牌连同正文一起递过去。所以命令只从我们写不动的目录里找。
+          path_is_protected() {
+            local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+
           if [ -z "${SUMMARY//[[:space:]]/}" ]; then
             echo '::warning::Codex returned no summary; skipping the PR comment'
             exit 0
           fi
-          {
+
+          # 正文先落进 run summary 再发：评论没发出去（gh 偶发失败，或者它不在写不动的
+          # 目录里）时，总结至少还留在这一轮的运行页上，不至于连文本一起丢。
+          body="$(
             printf '%s\n' "$SUMMARY"
             if [ "$PUSHED" = true ]; then
               printf '\n验证：本仓库的 lint 与测试已在沙箱外跑过，全绿后才推送。\n'
             fi
-          } | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
+          )"
+          printf '%s\n' "$body" >>"$GITHUB_STEP_SUMMARY"
+
+          # 少了就不发这条评论，而不是红着停下：它是链条最后一步，发不出去顶多少一条
+          # 总结，令牌一次也没交出去。
+          if ! command -v gh >/dev/null 2>&1; then
+            echo '::warning::gh is not available from a write-protected PATH entry; skipping the PR comment'
+            exit 0
+          fi
+          printf '%s\n' "$body" |
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - >/dev/null ||
+            echo '::warning::the Codex summary comment was not posted'
