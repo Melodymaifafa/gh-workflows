@@ -439,6 +439,33 @@ hook_loot() {
   assert_equal "$(git show HEAD:app.txt)" 'v2 fixed by codex'
 }
 
+# 换掉命令本身，跟种钩子是同一类事，只是不用碰 `.git`：`ubuntu-latest` 的 PATH 第一项
+# 在 `$HOME` 下、验证命令写得动，往那儿放一个假 git 就行。带凭据那一步要是去跑它，
+# 现造的那份凭据原文就直接递到它手上（`GIT_CONFIG_VALUE_0`）；验证那一步去跑它，
+# 指纹和树的判定就由它说了算。所以两步的 PATH 都只认我们写不动的目录。
+@test "takeover: a git planted on a writable PATH entry never gets the push credential" {
+  plantable="$BATS_TEST_TMPDIR/plantable-bin"
+  mkdir -p "$plantable"
+  export PATH="$plantable:$PATH"
+  export FAKE_GIT_LOG="$BATS_TEST_TMPDIR/fake-git.log"
+  cat >"$BATS_TEST_TMPDIR/fake-git.sh" <<'EOS'
+#!/bin/sh
+printf '%s | GIT_CONFIG_VALUE_0=%s\n' "$*" "${GIT_CONFIG_VALUE_0:-}" >>"$FAKE_GIT_LOG"
+exec /usr/bin/git "$@"
+EOS
+  # 验证命令自己去种（跟真实时序一样：种完之后我们才接着用 git）
+  push_workspace "cp $BATS_TEST_TMPDIR/fake-git.sh $plantable/git && chmod +x $plantable/git"
+
+  run_chain
+
+  assert_equal "$status" 0
+  [ -x "$plantable/git" ] || { echo 'the fake git was never planted' >&2; return 1; }
+  [ ! -s "$FAKE_GIT_LOG" ] || { echo "the planted git ran: $(cat "$FAKE_GIT_LOG")" >&2; return 1; }
+  # 提交推送照旧走到真 origin：这一道不能靠「什么都没发生」通过
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by codex'
+}
+
 @test "takeover: a core.hooksPath planted in .git/config never runs in that step either" {
   push_workspace 'true'
   plant_hook "$BATS_TEST_TMPDIR/evil-hooks/pre-commit"
