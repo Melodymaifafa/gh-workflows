@@ -606,7 +606,7 @@ summon_env() {
 }
 
 @test "resolve: shell runtime verifies with actionlint, shellcheck and bats" {
-  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE=''
+  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh
   run run_block "$WF" "Resolve runtime defaults"
   assert_equal "$status" 0
   env_file="$(cat "$GITHUB_ENV")"

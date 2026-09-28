@@ -21,6 +21,11 @@ jobs:
       # 不写就是 auto，行为和加这行之前完全一样。
       # review_fixer: auto
       #
+      # Claude 修复用哪个模型、想多深。默认 claude-opus-5-5 + xhigh；不许填 Sonnet / Haiku
+      # （填了整轮直接红）。每条总结评论末尾会写出实际跑的模型。
+      # claude_model: claude-opus-5-5
+      # claude_effort: xhigh
+      #
       # 允许验证命令重写哪些被跟踪的文件（一行一个，精确路径）。默认一个都不许：
       # 验证命令来自被审的那个 PR，它改过的被跟踪文件会跟着修复一起提交推送。
       # 验证会重新生成 lock 文件的仓库（python 的 uv sync --dev 重写 uv.lock、

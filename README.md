@@ -100,6 +100,8 @@ jobs:
 
 `claude-codex-iterate.yml` 另收一个 `review_fixer`：`auto`（默认，Claude 先上，只有额度耗尽 / 限流 / 认证失效 / 服务不可用才换 Codex）、`claude`（现有行为，永不换人）、`codex`（跳过 Claude）。**拼错直接红**，不会静默按 `auto` 跑掉一整轮。测试没修好、构建挂了这类业务失败**不换人**：换个模型一样挂，job 该红就红。谁上、有没有换人、为什么，三件事都写在那次 run 的 summary 里。换人成功的那一轮照样记轮数、照样召唤复审，链条不会停在这里；令牌失效这种不会自己恢复的原因，即使换人成功也推一条通知。
 
+`claude-codex-iterate.yml` 和 `codex-approved-merge.yml` 都收 `claude_model`（默认 `claude-opus-5-5`）和 `claude_effort`（默认 `xhigh`）。**默认值永远钉死，永远是 Opus 及以上**：不钉，action 就用 Claude Code 的账号默认模型 —— 2026-09 之前那是 Sonnet，静静跑了几周没人发现（PR #17 两轮修复都是它做的）。填 Sonnet / Haiku 整轮直接红。Opus 5.5 自带的思考力度是 medium，所以钉 xhigh。每条 Claude 总结评论末尾写出实际跑的模型名（从 SDK 执行记录里读，不是配置里抄的）—— 哪天默认值悄悄变了，PR 上一眼看得到。换新模型：改这两个默认值 → 合入 → 移 `v1` 标签。
+
 `claude-codex-iterate.yml` 还收一个 `verify_writable_paths`：允许验证命令重写哪些被跟踪的文件，一行一个、精确路径、**默认一个都不许**。**两条路都归它管**（Claude 那条从 MEL-254 起也走同一个验证步骤）：验证命令来自被审的那个 PR，它跑完还要补一次 `git add -u`（否则推出去的是一棵没验过的树），于是它改过的被跟踪文件会跟着修复一起提交推送 —— 外部 PR 借此就能把复审机器人从没产出过的改动发布进仓库。验证会重新生成 lock 文件的仓库（`python` 的 `uv sync --dev` 重写 `uv.lock`、`node` 的 `npm ci` 重写 `package-lock.json`）**必须在调用桩里列出来**，否则那一轮红着停下，错误信息里就是被改的路径。这份清单只从调用方默认分支上的工作流文件读，被审 PR 改不到它 —— 改成从 PR 内容里读，白名单就等于攻击者自己签发的通行证。
 
 ## 测试

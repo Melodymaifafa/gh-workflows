@@ -19,6 +19,16 @@ on:
         description: Integration branch that is eligible for unattended merge.
         type: string
         default: develop
+      claude_model:
+        description: >-
+          Model for the Claude fallback review (`--model`). Pinned so the review never
+          silently runs on the account default; keep it Opus-tier or above.
+        type: string
+        default: claude-opus-5-5
+      claude_effort:
+        description: Reasoning effort for the Claude fallback review (`--effort`), low | medium | high | xhigh | max.
+        type: string
+        default: xhigh
 
 permissions:
   actions: read
@@ -728,6 +738,8 @@ jobs:
               }
             }
           claude_args: |
+            --model ${{ inputs.claude_model }}
+            --effort ${{ inputs.claude_effort }}
             --max-turns 30
             --add-dir pr
             --allowedTools "Read,Glob,Grep"
