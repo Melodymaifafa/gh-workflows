@@ -108,3 +108,47 @@ setup() {
   assert_equal "$status" 0
   assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" '模型：claude-opus-5-5 · 思考力度：xhigh'
 }
+
+# ---------- 代审那条路同一段先验（Codex P2 on PR #18） ----------
+
+# model_guard_block <workflow>：两段 case 块（模型、思考力度），从 case "$CLAUDE_MODEL" 起到第二个 esac 止。
+model_guard_block() {
+  awk '
+    /case "\$CLAUDE_MODEL" in/ { on = 1 }
+    on { print }
+    on && /^ *esac$/ { if (++n == 2) exit }
+  ' "$REPO_ROOT/$1"
+}
+
+@test "merge: the fallback review refuses Sonnet, Haiku and unknown effort before Claude runs" {
+  export CLAUDE_EFFORT=xhigh
+  for model in claude-sonnet-5 sonnet claude-haiku-4-5 ''; do
+    export CLAUDE_MODEL="$model"
+    run run_block "$MERGE_WF" "Check the review model and effort"
+    assert_equal "$status" 1
+  done
+  export CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=ultra
+  run run_block "$MERGE_WF" "Check the review model and effort"
+  assert_equal "$status" 1
+  assert_contains "$output" 'not one of low, medium, high, xhigh, max'
+  export CLAUDE_EFFORT=xhigh
+  run run_block "$MERGE_WF" "Check the review model and effort"
+  assert_equal "$status" 0
+}
+
+# 两处是逐行副本，这一条盯着它们不许各改各的；改一处就得改另一处。
+@test "merge: the guard is the very same case block as the fixer's" {
+  fixer="$(model_guard_block "$WF")"
+  reviewer="$(model_guard_block "$MERGE_WF")"
+  [ -n "$fixer" ] || { echo 'no model guard found in the iterate workflow' >&2; return 1; }
+  assert_equal "$reviewer" "$fixer"
+}
+
+# 先验必须排在 Claude 那一步前面，否则 action 已经带着错值启动了。
+@test "merge: the guard runs before the Claude review step" {
+  job="$(awk '/^  claude-review:/{on=1} on' "$REPO_ROOT/$MERGE_WF")"
+  guard_at="$(awk '/- name: Check the review model and effort/{print NR; exit}' <<<"$job")"
+  review_at="$(awk '/- name: Claude review$/{print NR; exit}' <<<"$job")"
+  [ -n "$guard_at" ] && [ -n "$review_at" ] || { echo 'guard or review step missing' >&2; return 1; }
+  [ "$guard_at" -lt "$review_at" ] || { echo "guard at $guard_at is after review at $review_at" >&2; return 1; }
+}

@@ -715,6 +715,35 @@ jobs:
             perl -0pe 's/<!--.*?-->//gs; s/<!--.*//s' >.review/pr.md
           wc -c .review/pr.diff .review/pr.md
 
+      # 和 claude-codex-iterate.yml 的 Resolve runtime defaults 同一段先验（tests/claude-model.bats
+      # 盯着两处的 case 块一字不差）。这条路更要挡：降级模型跑完代审给出 clean 标记，
+      # 就等于用低一档的模型放行自动合并。拼错直接红，不让 action 带着错值启动；
+      # 这一步红了，Post Claude verdict 照 review-failed 告警，不会静默。
+      - name: Check the review model and effort
+        env:
+          CLAUDE_MODEL: ${{ inputs.claude_model }}
+          CLAUDE_EFFORT: ${{ inputs.claude_effort }}
+        run: |
+          set -euo pipefail
+
+          case "$CLAUDE_MODEL" in
+            '')
+              echo "::error::claude_model is empty; pass an Opus-tier model id such as claude-opus-5-5"
+              exit 1
+              ;;
+            *[Ss]onnet*|*[Hh]aiku*)
+              echo "::error::claude_model '$CLAUDE_MODEL' is below Opus; this workflow refuses Sonnet and Haiku"
+              exit 1
+              ;;
+          esac
+          case "$CLAUDE_EFFORT" in
+            low|medium|high|xhigh|max) ;;
+            *)
+              echo "::error::claude_effort '$CLAUDE_EFFORT' is not one of low, medium, high, xhigh, max"
+              exit 1
+              ;;
+          esac
+
       - name: Claude review
         id: review
         continue-on-error: true
