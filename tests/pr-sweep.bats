@@ -242,8 +242,8 @@ refute_writes() {
 
 # ── 规则 2 / 3：停车、额度 ──
 
-@test "parked heads stop: no-fix, round-cap, and ci while unstable" {
-  for r in no-fix round-cap; do
+@test "parked heads stop: no-fix, round-cap, merge-refused, and ci while unstable" {
+  for r in no-fix round-cap merge-refused; do
     : >"$FAKE_LOG"
     one_pr clean 900
     comments "$(alert_comment 1 "$r")"
@@ -257,6 +257,16 @@ refute_writes() {
   reviews
   sweep
   refute_writes
+}
+
+@test "a merge-failed alert does not park: the head is kicked again after 60 idle minutes" {
+  one_pr clean 3700
+  comments "$(alert_comment 1 merge-failed - 3700)"
+  reviews
+  sweep
+  assert_equal "$status" 0
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_contains "$(fake_all_bodies)" '<!-- pr-sweeper: kick -->'
 }
 
 @test "a ci alert stops parking once CI is green again" {
