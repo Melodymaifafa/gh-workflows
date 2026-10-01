@@ -20,6 +20,8 @@ setup() {
   export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp"
   mkdir -p "$RUNNER_TEMP/fixer-scripts" "$BATS_TEST_TMPDIR/work"
   cp "$SCRIPTS/classify-claude-failure.sh" "$RUNNER_TEMP/fixer-scripts/"
+  # Decide the takeover 跑的是 step output 里那份正文（真跑时由 env: 接过去），不执行上面那个文件。
+  export CLASSIFIER; CLASSIFIER="$(cat "$SCRIPTS/classify-claude-failure.sh")"
   cd "$BATS_TEST_TMPDIR/work" || return
   export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token
   # 噪声重跑时要用的 git：在测试往 PATH 上种任何东西之前先认下来（见 reset_workspace）
@@ -1140,6 +1142,47 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
     refute_contains "$(extract_run_block "$REPO_ROOT/$WF" "$step")" 'pr-guard.sh'
     assert_contains "$(step_env_keys "$WF" "$step")" 'PR_GUARD'
   done
+  refute_contains "$(extract_run_block "$REPO_ROOT/$WF" 'Decide the takeover')" 'fixer-scripts'
+  assert_contains "$(step_env_keys "$WF" 'Decide the takeover')" 'CLASSIFIER'
+}
+
+# 分类脚本同一个毛病（Codex 2026-10-01 的 P1）：它躺在 $RUNNER_TEMP/fixer-scripts 里，验证命令
+# 写得动，而这一步带着 github.token 执行它。换掉它不光拿得到令牌，回一句 class=quota 还能把
+# 一次业务失败骗成换人。现在这一步跑的是 step output 里那份正文，那个文件它不碰。
+@test "takeover: a classifier rewritten after it was staged never runs, and cannot buy a handover" {
+  export PLANTED_LOG="$BATS_TEST_TMPDIR/planted-classifier.log"
+  cat >"$RUNNER_TEMP/fixer-scripts/classify-claude-failure.sh" <<'EOS'
+#!/bin/sh
+printf 'GH_TOKEN=%s\n' "${GH_TOKEN:-}" >>"$PLANTED_LOG"
+echo class=quota
+echo reason=planted
+EOS
+  chmod +x "$RUNNER_TEMP/fixer-scripts/classify-claude-failure.sh"
+  decide claude true fix-failed 'FAILED tests/test_rate_limit_error.py, I could not fix it'
+  [ ! -s "$PLANTED_LOG" ] || { echo "the planted classifier ran: $(cat "$PLANTED_LOG")" >&2; return 1; }
+  # 判定照旧是可信那份做的：业务失败不换人，红着停下
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+}
+
+@test "takeover: without the classifier from the staging step the round goes red, never handed over" {
+  export CLASSIFIER=''
+  decide claude true fix-quota 'API Error: 429 rate_limit_error'
+  assert_equal "$status" 1
+  assert_contains "$output" 'failure classifier did not arrive'
+  refute_contains "$(cat "$GITHUB_OUTPUT")" 'run_codex=true'
+}
+
+# 交出去的那份正文必须就是落盘的那个脚本，一个字节都不差。
+@test "staging: the classifier handed to later steps is the staged script itself" {
+  git init -q .
+  git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
+  export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp-staging" CHECKOUT_DIR=shared-checkout
+  mkdir -p "$RUNNER_TEMP" "$CHECKOUT_DIR/scripts"
+  cp "$SCRIPTS/classify-claude-failure.sh" "$CHECKOUT_DIR/scripts/"
+  run run_block "$WF" "Move the fixer scripts out of the workspace"
+  assert_equal "$status" 0
+  assert_equal "$(step_output classifier)" "$(cat "$SCRIPTS/classify-claude-failure.sh")"
 }
 
 @test "takeover: a provider limit hands the round to Codex and says so in the summary" {

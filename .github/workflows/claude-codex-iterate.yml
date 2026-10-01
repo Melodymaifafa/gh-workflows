@@ -281,6 +281,7 @@ jobs:
           path: .gh-workflows-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Move the fixer scripts out of the workspace
+        id: fixer_scripts
         if: steps.gate.outputs.run == 'true'
         env:
           CHECKOUT_DIR: .gh-workflows-${{ github.run_id }}-${{ github.run_attempt }}
@@ -289,6 +290,14 @@ jobs:
           # 留在工作区里，fixer 会把它当成本 PR 的改动一并 commit 出去。
           mv "$CHECKOUT_DIR/scripts" "$RUNNER_TEMP/fixer-scripts"
           rm -rf -- "$CHECKOUT_DIR"
+          # 分类脚本要到验证命令跑完之后才被用到（Decide the takeover），而 $RUNNER_TEMP 验证
+          # 命令写得动。正文现在就交一份给 step output，那一步跑 output 里的文本，不执行这里
+          # 的文件 —— 理由同 Define pr-guard helpers。
+          {
+            echo 'classifier<<__CLASSIFIER_EOF__'
+            printf '%s\n' "$(cat "$RUNNER_TEMP/fixer-scripts/classify-claude-failure.sh")"
+            echo '__CLASSIFIER_EOF__'
+          } >>"$GITHUB_OUTPUT"
           # 起点 commit。Claude 若在失败前已经提交过，这一轮就不能再让 Codex
           # 接手写第二笔（一轮只允许一个 fixer 写 PR）。
           echo "BASE_SHA=$(git rev-parse HEAD)" >>"$GITHUB_ENV"
@@ -1359,6 +1368,7 @@ jobs:
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
           PR_GUARD: ${{ steps.helpers.outputs.script }}
+          CLASSIFIER: ${{ steps.fixer_scripts.outputs.classifier }}
         run: |
           set -euo pipefail
 
@@ -1390,7 +1400,7 @@ jobs:
           done
           PATH="$trusted_path"
           # 少了哪一样这条链就没人裁决了 —— 红着停下，别静默空转。
-          for tool in git jq sed gh curl date; do
+          for tool in git jq sed gh curl date bash; do
             command -v "$tool" >/dev/null 2>&1 && continue
             echo "::error::$tool is not available from a write-protected PATH entry; cannot decide this round safely"
             exit 1
@@ -1458,7 +1468,14 @@ jobs:
                      | join("\n")' "$EXECUTION_FILE" >>"$diag" 2>/dev/null || true
             fi
 
-            verdict="$("$RUNNER_TEMP/fixer-scripts/classify-claude-failure.sh" "$diag")"
+            # 分类脚本跑的是 Move the fixer scripts 那一步交过来的正文，不执行 $RUNNER_TEMP 里
+            # 那份文件：验证命令写得动它，换掉就在这一步里带着令牌跑，回一句「额度用完」还能
+            # 把一次业务失败骗成换人。bash 来自上面过滤过的 PATH。没拿到就红着停下。
+            [ -n "${CLASSIFIER:-}" ] || {
+              echo '::error::the failure classifier did not arrive from the staging step; cannot decide this round safely'
+              exit 1
+            }
+            verdict="$(bash -c "$CLASSIFIER" classify-claude-failure "$diag")"
             failure_class="$(printf '%s\n' "$verdict" | sed -n 's/^class=//p')"
             failure_reason="$(printf '%s\n' "$verdict" | sed -n 's/^reason=//p')"
 
