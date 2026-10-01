@@ -92,9 +92,13 @@ jobs:
           # 那一条 push（见下面的 credentialed_git）。
           persist-credentials: false
 
-      # 告警工具函数写进 $RUNNER_TEMP，Gate 和 Outcome 两步共用一份。
+      # 告警工具函数有两个出口。写进 $RUNNER_TEMP 的文件只给 Gate 用 —— 它排在验证命令之前。
+      # 验证命令之后的 Check the fix outcome / Decide the takeover 手上有令牌，而 $RUNNER_TEMP
+      # 验证命令写得动，所以它们不读文件，改从本步的 output 取同一份文本：output 在验证命令
+      # 起跑之前就被 runner 收走了，它改不到（Codex 2026-09-26 的 P1）。
       # alert_once：同一 (head, 原因) 首次告警先推 Pushover 再发标记，之后不再推。
       - name: Define pr-guard helpers
+        id: helpers
         run: |
           set -euo pipefail
 
@@ -139,6 +143,11 @@ jobs:
           }
 
           declare -f pushover trusted_comments alert_once >"$RUNNER_TEMP/pr-guard.sh"
+          {
+            echo 'script<<__PR_GUARD_HELPERS_EOF__'
+            declare -f pushover trusted_comments alert_once
+            echo '__PR_GUARD_HELPERS_EOF__'
+          } >>"$GITHUB_OUTPUT"
 
       # 决定这次修不修、修哪条 review、第几轮；并把意见预取成文件给 Claude 读。
       - name: Gate the fix round
@@ -1129,6 +1138,7 @@ jobs:
           FALLBACK_ALLOWED: ${{ steps.select.outputs.fallback_allowed }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          PR_GUARD: ${{ steps.helpers.outputs.script }}
         run: |
           set -euo pipefail
 
@@ -1171,8 +1181,15 @@ jobs:
             exit 1
           done
 
-          # shellcheck source=/dev/null
-          . "$RUNNER_TEMP/pr-guard.sh"
+          # 告警函数从 Define pr-guard helpers 的 output 取，不读 $RUNNER_TEMP 里那份文件：
+          # 那个文件验证命令写得动，往里塞一行就在这一步里、带着令牌跑起来 —— 上面的 PATH
+          # 过滤挡的是「跑哪个命令」，挡不住「加载哪个文件」。没拿到就红着停下，别带着半套
+          # 函数往下判。
+          eval "${PR_GUARD:-}"
+          declare -F pushover trusted_comments alert_once >/dev/null || {
+            echo '::error::the pr-guard helpers did not arrive from the Define step; cannot judge this fix round safely'
+            exit 1
+          }
 
           H="$HEAD_SHA"
           live_head() { gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha; }
@@ -1287,6 +1304,7 @@ jobs:
           OUTCOME_UNTIL: ${{ steps.outcome.outputs.until }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          PR_GUARD: ${{ steps.helpers.outputs.script }}
         run: |
           set -euo pipefail
 
@@ -1324,8 +1342,15 @@ jobs:
             exit 1
           done
 
-          # shellcheck source=/dev/null
-          . "$RUNNER_TEMP/pr-guard.sh"
+          # 告警函数从 Define pr-guard helpers 的 output 取，不读 $RUNNER_TEMP 里那份文件：
+          # 那个文件验证命令写得动，往里塞一行就在这一步里、带着令牌跑起来 —— 上面的 PATH
+          # 过滤挡的是「跑哪个命令」，挡不住「加载哪个文件」。没拿到就红着停下，别带着半套
+          # 函数往下判。
+          eval "${PR_GUARD:-}"
+          declare -F pushover trusted_comments alert_once >/dev/null || {
+            echo '::error::the pr-guard helpers did not arrive from the Define step; cannot decide this round safely'
+            exit 1
+          }
 
           run_codex=false
           fell_back=false

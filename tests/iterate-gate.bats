@@ -19,6 +19,9 @@ setup() {
   export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token MAX_FIX_ROUNDS=5
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
   run_block "$WF" "Define pr-guard helpers" >/dev/null
+  # 验证命令之后的两步从这一步的 output 拿告警函数（真跑时由 env: 接过去），不读文件。
+  export PR_GUARD; PR_GUARD="$(step_output script)"
+  : >"$GITHUB_OUTPUT"
   fake_route "$COMMENTS" '[]'
 }
 
@@ -314,6 +317,34 @@ outcome_env() { # outcome_env <FIX_OUTCOME> <STRUCTURED> [exec fixture]
 
 # 判的是这一步的行为（正文、额度换算、去重），不是它的 PATH —— 把假命令接回去。
 outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
+
+# 这一步手上有 github.token 和 Pushover 两把钥匙，而它前面跑过被审 PR 自己的验证命令。
+# $RUNNER_TEMP/pr-guard.sh 验证命令写得动：以前这一步 source 它，往里塞一行就等于带着
+# 令牌跑那一行（Codex 2026-09-26 的 P1）。PATH 过滤挡不住 —— 被换掉的是文件，不是命令。
+# 现在告警函数从 Define 那一步的 output 取，这个文件这一步碰都不碰。
+@test "outcome: a pr-guard.sh rewritten after it was defined never runs with the token" {
+  export PLANTED_LOG="$BATS_TEST_TMPDIR/planted-helper.log"
+  # shellcheck disable=SC2016  # 字面量写进被种的脚本
+  printf '%s\n' 'printf "GH_TOKEN=%s\n" "${GH_TOKEN:-}" >>"$PLANTED_LOG"' >"$RUNNER_TEMP/pr-guard.sh"
+  outcome_env success '{"pushed":false,"fixed":0,"skipped":1}'
+  live_head "$H"
+  outcome
+  assert_equal "$status" 0
+  [ ! -s "$PLANTED_LOG" ] || { echo "the planted helper ran: $(cat "$PLANTED_LOG")" >&2; return 1; }
+  # 不是靠「整步空转」通过：no-fix 告警照旧发了，用的是可信的那份 alert_once
+  assert_contains "$(fake_last_body "gh pr comment")" "reason=no-fix until=- -->"
+}
+
+# 没拿到告警函数就红着停下：带着半套函数往下判，告警发不出去，结局却照样写进 output。
+@test "outcome: without the helpers from the Define step the round goes red" {
+  export PR_GUARD=''
+  outcome_env success '{"pushed":false,"fixed":0,"skipped":1}'
+  live_head "$H"
+  outcome
+  assert_equal "$status" 1
+  assert_contains "$output" 'pr-guard helpers did not arrive'
+  refute_called "gh pr comment"
+}
 
 @test "outcome: head moved -> summon + one M7 round marker on the new head, no alert (even if the step failed)" {
   outcome_env failure '' exec-429-weekly-limit.json

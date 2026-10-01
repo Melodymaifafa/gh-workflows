@@ -26,6 +26,9 @@ setup() {
   export REAL_GIT="$(command -v git)"
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
   run_block "$WF" "Define pr-guard helpers" >/dev/null
+  # 验证命令之后的两步从这一步的 output 拿告警函数（真跑时由 env: 接过去），不读文件。
+  export PR_GUARD; PR_GUARD="$(step_output script)"
+  : >"$GITHUB_OUTPUT"
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
 }
 
@@ -1107,6 +1110,36 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   fi
   trust_fake_bin
   run run_block "$WF" "Decide the takeover"
+}
+
+# 同 iterate-gate.bats 里 Check the fix outcome 那一条：这一步手上也有 github.token 和
+# Pushover 两把钥匙，告警函数只从 Define 那一步的 output 取，$RUNNER_TEMP 里那个验证命令
+# 写得动的文件它不读。
+@test "takeover: a pr-guard.sh rewritten after it was defined never runs with the token" {
+  export PLANTED_LOG="$BATS_TEST_TMPDIR/planted-helper.log"
+  # shellcheck disable=SC2016  # 字面量写进被种的脚本
+  printf '%s\n' 'printf "GH_TOKEN=%s\n" "${GH_TOKEN:-}" >>"$PLANTED_LOG"' >"$RUNNER_TEMP/pr-guard.sh"
+  decide claude true auth 'API Error: 401'
+  assert_equal "$status" 0
+  [ ! -s "$PLANTED_LOG" ] || { echo "the planted helper ran: $(cat "$PLANTED_LOG")" >&2; return 1; }
+  # 不是靠「整步空转」通过：令牌失效的告警照旧发了
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=auth'
+}
+
+@test "takeover: without the helpers from the Define step the round goes red" {
+  export PR_GUARD=''
+  decide claude true auth 'API Error: 401'
+  assert_equal "$status" 1
+  assert_contains "$output" 'pr-guard helpers did not arrive'
+  refute_called "gh pr comment"
+}
+
+# 两步的 run 块里都不许再出现那个文件名：谁把 source 加回来，这一条当场红。
+@test "structure: no step after the verify command loads its alert helpers from RUNNER_TEMP" {
+  for step in 'Check the fix outcome' 'Decide the takeover'; do
+    refute_contains "$(extract_run_block "$REPO_ROOT/$WF" "$step")" 'pr-guard.sh'
+    assert_contains "$(step_env_keys "$WF" "$step")" 'PR_GUARD'
+  done
 }
 
 @test "takeover: a provider limit hands the round to Codex and says so in the summary" {
