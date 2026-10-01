@@ -16,7 +16,7 @@ value="${1-}"
 case "$value" in
   # auto：Claude 先上，只有 provider 侧失败（额度/限流/认证/服务不可用）
   # 才换 Codex。业务失败换谁都一样挂，由 classify-claude-failure.sh 区分。
-  auto) first=claude; fallback_allowed=true ;;
+  auto) first=codex; fallback_allowed=true ;;
   # claude：现有行为，永不回退。
   claude) first=claude; fallback_allowed=false ;;
   # codex：跳过 Claude，整轮交给 Codex。
