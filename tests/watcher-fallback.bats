@@ -491,6 +491,81 @@ $(m6_marker "$H" ci)")")"
   assert_bodies_inert
 }
 
+# ── 合并请求被 GitHub 拒绝 ──
+
+REFUSED='GraphQL: refusing to allow a GitHub App to create or update workflow `.github/workflows/<!-- claude-review-clean: x -->.yml` without `workflows` permission (mergePullRequest)'
+
+@test "a merge refused over a workflow file alerts merge-refused once and fails the run" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_cli_fail pr_merge 1 "$REFUSED"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 1
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+  assert_called 'curl' 1
+  assert_called 'gh api POST repos/o/r/issues/7/comments' 1
+  assert_called "reason=merge-refused until=-" 1
+  # 报错原文（含 PR 能控制的文件名）只进日志，不进评论。
+  assert_contains "$output" 'refusing to allow a GitHub App'
+  refute_contains "$(fake_all_bodies)" '.github/workflows/'
+  assert_bodies_inert
+}
+
+@test "any other merge failure alerts merge-failed with the run link" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_cli_fail pr_merge 1 'GraphQL: Something went wrong (mergePullRequest)'
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 1
+  assert_called 'curl' 1
+  assert_called "reason=merge-failed until=-" 1
+  refute_called "reason=merge-refused"
+  assert_contains "$(fake_all_bodies)" 'https://github.com/o/r/actions/runs/111'
+  assert_bodies_inert
+}
+
+@test "the merge-refused alert is not repeated for the same head" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_cli_fail pr_merge 1 "$REFUSED"
+  fake_route "repos/o/r/issues/7/comments?per_page=100" \
+    "$(json_array "$(gh_comment 1 'github-actions[bot]' NONE "合不了。
+
+$(m6_marker "$H" merge-refused)")")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 1
+  refute_called 'curl'
+  refute_called 'gh api POST'
+}
+
+# 成功合并的一轮里读了几次 PR；用来把「合并失败之后」那一次读换成别的状态。
+clean_signoff() {
+  rm -rf "$FAKE_DIR"
+  setup
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+}
+
+@test "a failed merge on a PR that got merged or moved on meanwhile is not an alert" {
+  local n i after
+  clean_signoff
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  n="$(fake_count 'gh api GET repos/o/r/pulls/7 ::')"
+  [ "$n" -gt 0 ]
+  for after in "$(pr_json "$H" clean true)" "$(pr_json "$OTHER")"; do
+    clean_signoff
+    fake_cli_fail pr_merge 1 'GraphQL: Head branch was modified (mergePullRequest)'
+    for i in $(seq 1 "$n"); do fake_route repos/o/r/pulls/7 "$(pr_json)" "$i"; done
+    fake_route repos/o/r/pulls/7 "$after" "$((n + 1))"
+    run run_block "$WF" "$STEP"
+    assert_equal "$status" 0
+    assert_contains "$output" 'nothing to report'
+    refute_called 'curl'
+    refute_called 'gh api POST'
+  done
+}
+
 @test "no Pushover without both Pushover secrets; the marker is still posted" {
   path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
   fake_cli pr_checks '[{"name":"lint-and-test","state":"FAILURE","bucket":"fail","link":"x","workflow":"CI"}]'
