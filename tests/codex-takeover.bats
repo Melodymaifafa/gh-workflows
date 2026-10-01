@@ -30,6 +30,11 @@ setup() {
   run_block "$WF" "Define pr-guard helpers" >/dev/null
   # 验证命令之后的两步从这一步的 output 拿告警函数（真跑时由 env: 接过去），不读文件。
   export PR_GUARD; PR_GUARD="$(step_output script)"
+  run_block "$WF" "Define the fix verify and push guards" >/dev/null
+  # 两条路的验证 / 推送跑的是同一段正文，由那一步的 output 交出来（真跑时由 env: 接
+  # 过去），不读 $RUNNER_TEMP 里的文件。
+  export FIX_VERIFY_GUARD; FIX_VERIFY_GUARD="$(step_output verify)"
+  export FIX_PUSH_GUARD; FIX_PUSH_GUARD="$(step_output push)"
   : >"$GITHUB_OUTPUT"
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
 }
@@ -257,6 +262,27 @@ run_chain() {
   done
 }
 
+# 只让「提交并推送」那一步信得过假命令目录，验证那一步照旧跑原样的块：轮数标记 M7
+# 走 gh，而 gh 只从写不动的目录里找，测试里那个假 gh 放在仓库目录下、过滤之后够不着。
+# 验证那一步不能跟着信 —— 假 sleep / 假 date 会把残留清点那几道判定搅了。
+verify_then_trusted_push() {
+  FAKE_BIN_TRUSTED=
+  run_step "$WF" "Verify the Codex fix" || return
+  trust_fake_bin
+  run_step "$WF" "Commit and push the Codex fix"
+}
+
+run_chain_trusted_push() {
+  local tries=0
+  run verify_then_trusted_push
+  while [ "$tries" -lt 3 ] && is_machine_noise; do
+    tries=$((tries + 1))
+    /bin/sleep 1
+    reset_workspace
+    run verify_then_trusted_push
+  done
+}
+
 run_verify() {
   local tries=0
   run run_step "$WF" "Verify the Codex fix"
@@ -275,11 +301,14 @@ run_verify() {
   keys="$(step_env_keys "$WF" 'Verify the Codex fix')"
   refute_contains "$keys" 'GH_TOKEN'
   refute_contains "$keys" 'GITHUB_TOKEN'
-  # 跑验证的确实是这一步，否则改个步骤名这条就空转
-  assert_contains "$(extract_run_block "$REPO_ROOT/$WF" 'Verify the Codex fix')" 'bash -euo pipefail -c "$VERIFY"'
-  # 带令牌的那一步反过来不许碰验证命令
+  # 跑验证的确实是这一步：它拿的是验证那份共用正文（两条路同一份，MEL-262），
+  # 而正文里跑的就是 $VERIFY。
+  assert_contains "$keys" 'FIX_VERIFY_GUARD'
+  assert_contains "$(fix_guard_body verify_the_fix)" 'bash -euo pipefail -c "$VERIFY"'
+  # 带令牌的那一步反过来一个字的验证正文都拿不到：它只拿推送那一份。
   assert_contains "$(step_env_keys "$WF" 'Commit and push the Codex fix')" 'GH_TOKEN'
-  refute_contains "$(extract_run_block "$REPO_ROOT/$WF" 'Commit and push the Codex fix')" 'VERIFY'
+  refute_contains "$(step_env_keys "$WF" 'Commit and push the Codex fix')" 'FIX_VERIFY_GUARD'
+  refute_contains "$(fix_guard_body commit_and_push_the_fix)" 'VERIFY'
 }
 
 # 验证命令来自被审的那个 PR：npm ci 的生命周期钩子、pytest 插件、bats 里的任意
@@ -383,7 +412,9 @@ printf "cached\n" >stray.pyc'
   run_chain
 
   assert_equal "$status" 1
-  assert_contains "$output" 'verification failed'
+  # 带上 fixer 的名字：两条路共用同一段正文，这一句是 $FIXER 唯一进到错误里的地方
+  # （MEL-262）。写死成 Claude 的话这一条就红。
+  assert_contains "$output" 'verification failed after the Codex fix'
   refute_called "gh pr comment"
   # 验证失败也一样不还：下一步自己用手上的令牌现造一份，这里没人需要它（MEL-255）
   assert_equal "$(git config --local --get http.https://github.com/.extraheader || echo none)" 'none'
@@ -1000,7 +1031,7 @@ EOS
   refute_called "gh pr comment"
   # 这一道的位置也锁住：正面证据必须排在指纹、树、以及「这一步算通过」之前，
   # 否则那些判定都是在「验证可能还活着」的情况下做出来的，做完就作废。
-  block="$(extract_run_block "$REPO_ROOT/$WF" 'Verify the Codex fix')"
+  block="$(fix_guard_body verify_the_fix)"
   contained="$(printf '%s\n' "$block" | grep -n 'outlived the verify command' | head -n 1 | cut -d: -f1)"
   fingerprint="$(printf '%s\n' "$block" | grep -n 'the verify command modified .git' | head -n 1 | cut -d: -f1)"
   passed="$(printf '%s\n' "$block" | grep -n "changed=true" | head -n 1 | cut -d: -f1)"
@@ -1023,9 +1054,25 @@ EOS
   assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by codex'
   # 结构上也锁住：凭据只走环境变量递给那一条 push，不许有任何一句把它写回配置文件
   # —— 写回去了，盯着文件的进程就又有得可等（也别写到命令行上，argv 在 /proc 里公开）。
-  push_block="$(extract_run_block "$REPO_ROOT/$WF" 'Commit and push the Codex fix')"
+  push_block="$(fix_guard_body commit_and_push_the_fix)"
   assert_contains "$push_block" 'GIT_CONFIG_VALUE_0'
   refute_contains "$push_block" 'config --local http'
+}
+
+
+# Codex 接手推的那一轮同样要留轮数标记 —— 两条路共用推送那段正文（MEL-262），
+# 这一条盯着共用之后 Codex 这半边没丢。
+@test "takeover: a pushed Codex round leaves exactly one round marker on the new head" {
+  push_workspace 'true'
+
+  run_chain_trusted_push
+
+  assert_equal "$status" 0
+  assert_equal "$(step_output pushed)" true
+  assert_called 'gh pr comment 7 --repo o/r' 1
+  assert_equal "$(fake_last_body 'gh pr comment')" "🤖 自动修复第 2 轮已推送。
+
+<!-- pr-guard: fix-round head=$(git rev-parse HEAD) round=2 -->"
 }
 
 # 重跑本身不许把载荷洗白：这一条看住 reset_workspace。第一次尝试故意留一个活到我们

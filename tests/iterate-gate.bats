@@ -346,27 +346,17 @@ outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
   refute_called "gh pr comment"
 }
 
-@test "outcome: head moved -> summon + one M7 round marker on the new head, no alert (even if the step failed)" {
+# 轮数标记 M7 由推送那一步发（两条路共用的那段正文里就有，MEL-262）。这一步再发一条
+# 就是同一轮两条标记，所以这里一条评论都不许发 —— 它只判「这一轮落地了没有」。标记
+# 本身红绿两头在 claude-verify-creds.bats / codex-takeover.bats 的推送判定里验。
+@test "outcome: head moved -> summon, no alert and no second round marker (even if the step failed)" {
   outcome_env failure '' exec-429-weekly-limit.json
   live_head "$H2"
   outcome
   assert_equal "$status" 0
   assert_equal "$(step_output summon)" true
-  assert_called "gh pr comment 7 --repo o/r" 1
-  assert_equal "$(fake_last_body "gh pr comment")" "🤖 自动修复第 3 轮已推送。
-
-<!-- pr-guard: fix-round head=$H2 round=3 -->"
+  refute_called "gh pr comment"
   refute_called "curl "
-}
-
-@test "outcome: a failed M7 post still summons" {
-  outcome_env success '{"pushed":true,"fixed":1,"skipped":0}'
-  live_head "$H2"
-  fake_cli_fail pr_comment 1
-  outcome
-  assert_equal "$status" 0
-  assert_equal "$(step_output summon)" true
-  assert_contains "$output" "fix-round marker for $H2 not posted"
 }
 
 @test "outcome: 429 with resetsAt -> fix-quota alert with until and Beijing resume time" {
@@ -540,8 +530,7 @@ outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
   outcome
   assert_equal "$(step_output summon)" true
   assert_called "sleep 10" 2
-  assert_called "gh pr comment" 1
-  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: fix-round head=$H2 round=3 -->"
+  refute_called "gh pr comment"
 }
 
 @test "outcome: no alert body carries trigger text" {
@@ -558,7 +547,6 @@ outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
   bodies="$(fake_all_bodies)"
   assert_contains "$bodies" "reason=no-fix"
   assert_contains "$bodies" "额度又用完了"
-  assert_contains "$bodies" "<!-- pr-guard: fix-round head=$H2 round=3 -->"
   refute_contains "$bodies" "codex-review-head:"
   refute_contains "$bodies" "claude-review-findings:"
   refute_contains "$bodies" "fix-retry:"
@@ -718,14 +706,16 @@ summon_env() {
 }
 
 @test "resolve: shell runtime verifies with actionlint, shellcheck and bats" {
-  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh
+  export RUNTIME=shell VERIFY_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh
   run run_block "$WF" "Resolve runtime defaults"
   assert_equal "$status" 0
   env_file="$(cat "$GITHUB_ENV")"
   assert_contains "$env_file" "actionlint"
   assert_contains "$env_file" "git ls-files '*.sh' | xargs -r shellcheck"
   assert_contains "$env_file" "bats tests/"
-  assert_contains "$env_file" "EXTRA_TOOLS=Bash(actionlint:*),Bash(shellcheck:*),Bash(bats:*)"
+  # 工具白名单 MEL-254 起就没人引用了：那份清单会让被审 PR 的代码在握着令牌的那一步
+  # 里跑起来，本轮删掉。inputs.extra_tools 保留着，调用桩不会因此失效。
+  refute_contains "$env_file" "EXTRA_TOOLS"
   wf="$(cat "$REPO_ROOT/$WF")"
   assert_contains "$wf" "actionlint/releases/download/v1.7.12/"
   assert_contains "$wf" "bats-core/archive/refs/tags/v1.14.0.tar.gz"
