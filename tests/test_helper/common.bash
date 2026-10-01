@@ -209,6 +209,89 @@ fake_now_epoch() {
   fake_clock_epoch
 }
 
+# ---------------------------------------------------------------------------
+# 假命令目录跟「PATH 只认写不动的目录」那道过滤的关系
+#
+# 有九步在自己的 run: 块里把 PATH 过滤掉所有「这台机器上写得动的目录」——「我们写得
+# 动 = 被审 PR 的验证命令也写得动」。tests/test_helper/fake-bin 就在仓库里，谁都写得
+# 动，所以过滤之后它必然被滤掉：假 gh、假时钟、假 curl 一个都调不到。这正是过滤要挡
+# 的那一类东西，不是 bug。
+#
+# 于是两种测试要分开：
+#   - 安全判定（种一个假 gh，看这一步跑不跑它）跑原样的块，绝不调 trust_fake_bin；
+#   - 行为判定（M7 正文长什么样、额度换算对不对、告警去不去重）要的是假命令，不是
+#     PATH，所以先调 trust_fake_bin：抽出来的脚本会在过滤那一行之后把假命令目录接
+#     回去，其余一字不改。
+#
+# 写成 opt-in 而不是默认：忘了加 = 那条测试红，看得见；反过来默认接回去、安全判定忘
+# 了关掉，就是假绿，看不见。
+trust_fake_bin() { FAKE_BIN_TRUSTED=1; }
+
+# 某一步 run 块里那段过滤本身：path_is_protected 那行起，到 PATH 被换掉那行止。
+# 九步共用一字不差的同一段（MEL-255 / MEL-254 / MEL-260），所以放在共享助手里。
+trusted_path_block() { # trusted_path_block <step>
+  extract_run_block "$ITERATE_WORKFLOW" "$1" |
+    awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^PATH="\$trusted_path"$/{exit}'
+}
+
+# path_guard <step> <dir>：只把那段里的 path_is_protected 抽出来，问它信不信一个目录。
+# 输出 protected / rejected / hung。带看门狗是因为「逐级往上剥」的写法碰到不带 / 的
+# 相对项会原地打转 —— 没有看门狗，这种 bug 的长相是整套测试挂死，不是一条红。
+path_guard() {
+  local script pid wd rc=0
+  script="$BATS_TEST_TMPDIR/path-guard-$$.sh"
+  trusted_path_block "$1" |
+    awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^\}$/{exit}' >"$script"
+  # shellcheck disable=SC2016  # 写进脚本的就是字面量 $1
+  printf 'path_is_protected "$1"\n' >>"$script"
+  bash "$script" "$2" >/dev/null 2>&1 &
+  pid=$!
+  { /bin/sleep 5; kill -9 "$pid"; } >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid" || rc=$?
+  kill "$wd" >/dev/null 2>&1 || true
+  case "$rc" in
+    0) echo protected ;;
+    1) echo rejected ;;
+    *) echo hung ;;
+  esac
+}
+
+# plant_fake_tools <dir> <tool>...：往一个「我们写得动」的目录里种几个假命令，再把它
+# 挂到 PATH 最前面 —— 这就是 ubuntu-latest 上 $HOME/.local/bin 那几项的样子，被审 PR
+# 自己的验证命令跟我们同一个用户，写得动。假命令一被执行就把当时手上的令牌记进
+# $PLANTED_LOG：文件非空 = 令牌递出去了。
+plant_fake_tools() {
+  local dir="$1" tool
+  shift
+  mkdir -p "$dir"
+  export PLANTED_LOG="$BATS_TEST_TMPDIR/planted.log"
+  : >"$PLANTED_LOG"
+  for tool in "$@"; do
+    cat >"$dir/$tool" <<EOS
+#!/bin/sh
+printf '$tool %s | GH_TOKEN=%s\n' "\$*" "\${GH_TOKEN:-}" >>"\$PLANTED_LOG"
+EOS
+    chmod +x "$dir/$tool"
+    [ -x "$dir/$tool" ] || { echo "plant_fake_tools: could not plant $tool" >&2; return 1; }
+  done
+  export PATH="$dir:$PATH"
+}
+
+refute_planted_ran() {
+  [ -s "${PLANTED_LOG:?plant_fake_tools was never called}" ] || return 0
+  printf 'the planted command ran: %s\n' "$(cat "$PLANTED_LOG")" >&2
+  return 1
+}
+
+# 对照：把同一个种了假命令的目录当成「可信」接回 PATH，这一步就真去跑它了。
+# 少了这一半，上面那条 refute 可能只是因为假命令压根没被种上 —— 空转的绿。
+assert_planted_runs_when_trusted() {
+  [ -s "$PLANTED_LOG" ] && return 0
+  echo 'control run: the planted command was never reachable at all' >&2
+  return 1
+}
+
 # run_block <workflow-file> <step-name>：抽出 step 的 run: | 块，按 GitHub 默认 shell
 # （bash --noprofile --norc -eo pipefail）执行。workflow 路径可写相对仓库根目录。
 # 块里有 ${{ }} 直接报错：表达式要挪到 env:，测试靠环境变量喂值。
@@ -217,7 +300,9 @@ run_block() {
   local wf="$1" step="$2" script
   case "$wf" in /*) ;; *) wf="$REPO_ROOT/$wf" ;; esac
   [ -f "$wf" ] || { echo "run_block: no workflow file $wf" >&2; return 98; }
-  script="$BATS_TEST_TMPDIR/block-$(printf '%s' "$step" | LC_ALL=C sed 's/[^A-Za-z0-9]/_/g').sh"
+  # 纯 bash 转换，不借 sed：种假命令的那几条测试会把一个假 sed 挂到 PATH 最前面，
+  # 助手自己去跑它就等于在 step 还没开始前先污染战利品日志。
+  script="$BATS_TEST_TMPDIR/block-${step//[^A-Za-z0-9]/_}.sh"
   extract_run_block "$wf" "$step" >"$script"
   if ! grep -q '[^[:space:]]' "$script"; then
     echo "run_block: step '$step' not found or has no 'run: |' block in $wf" >&2
@@ -227,6 +312,15 @@ run_block() {
   if grep -qF '${{' "$script"; then
     echo "run_block: step '$step' uses \${{ }} inside run:; move it to env:" >&2
     return 98
+  fi
+  # trust_fake_bin 说了才接：在过滤那一行之后把假命令目录加回 PATH 最前面。
+  # 这一步没有那道过滤时什么也不做 —— 假命令本来就在 PATH 上。
+  if [ "${FAKE_BIN_TRUSTED:-}" = 1 ]; then
+    awk -v d="$FAKE_BIN_DIR" '
+      { print }
+      $0 == "PATH=\"$trusted_path\"" && !patched { print "PATH=\"" d ":$PATH\""; patched = 1 }
+    ' "$script" >"$script.trusted"
+    mv "$script.trusted" "$script"
   fi
   bash --noprofile --norc -eo pipefail "$script"
 }

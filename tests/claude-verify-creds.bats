@@ -35,13 +35,6 @@ claude_prompt() {
   awk '/^          prompt: \|/{f=1} f&&/^      - name:/{exit} f' "$REPO_ROOT/$WF"
 }
 
-# 某一步 run 块里那段「命令只从写不动的目录里找」的过滤：path_is_protected 那行起，
-# 到 PATH 被换掉那行止。
-trusted_path_block() {
-  extract_run_block "$REPO_ROOT/$WF" "$1" |
-    awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^PATH="\$trusted_path"$/{exit}'
-}
-
 # 这一步跟令牌同一个进程，所以清单里不许有任何「会跑仓库里的代码」的东西：
 # 工具链（npm / uv / bats…）执行的是被审 PR 自己带的脚本，拿到它就等于拿到令牌。
 @test "claude: the fixer step is given no tool that can execute the PR's own code" {
@@ -338,38 +331,46 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
 # .git、放的是文件不是进程。所以它跟「提交并推送」那一步同一个规矩：命令只从我们写
 # 不动的目录里找。把那段过滤摘掉，这一条当场变红（假 gh 的日志里就有令牌）。
 @test "claude: a gh planted on a writable PATH entry never gets the comment token" {
-  plantable="$BATS_TEST_TMPDIR/plantable-bin"
-  mkdir -p "$plantable"
-  export PLANTED_LOG="$BATS_TEST_TMPDIR/planted-gh.log"
-  for tool in gh jq; do
-    cat >"$plantable/$tool" <<EOS
-#!/bin/sh
-printf '$tool %s | GH_TOKEN=%s\n' "\$*" "\${GH_TOKEN:-}" >>"\$PLANTED_LOG"
-EOS
-    chmod +x "$plantable/$tool"
-  done
   # 模拟 runner 的 PATH：第一项是验证命令（也就是被审 PR）写得动的目录
-  export PATH="$plantable:$PATH"
+  plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh jq
   export STRUCTURED='{"pushed":true,"summary":"修了 2 条，跳过 1 条"}'
   export PUSHED=true REPO=o/r PR_NUMBER=7 GH_TOKEN=write-token GH_HOST=127.0.0.1
 
   run run_step "$WF" "Post the Claude summary comment"
 
   assert_equal "$status" 0
-  [ -x "$plantable/gh" ] || { echo 'the fake gh was never planted' >&2; return 1; }
-  [ ! -s "$PLANTED_LOG" ] || { echo "the planted command ran: $(cat "$PLANTED_LOG")" >&2; return 1; }
+  refute_planted_ran
   # 这一道不能靠「这一步整个空转」通过：正文照旧是真 jq 解出来的那一段
   assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" '修了 2 条，跳过 1 条'
 }
 
-# 两处防线是逐行副本，这一条盯着它们不许各改各的：抽成 $RUNNER_TEMP 下的共享脚本
-# 等于把我们自己的防线放到验证命令写得动的地方，所以只能两处各写一份（合成一份
+# 九处防线是逐行副本，这一条盯着它们不许各改各的：抽成 $RUNNER_TEMP 下的共享脚本
+# 等于把我们自己的防线放到验证命令写得动的地方，所以只能各写一份（合成一份
 # 是 MEL-262 的活）。
 @test "claude: the summary step filters PATH with the very same block as the push step" {
   pushed="$(trusted_path_block 'Commit and push the Claude fix')"
   commented="$(trusted_path_block 'Post the Claude summary comment')"
   [ -n "$pushed" ] || { echo 'no PATH filter found in the push step' >&2; return 1; }
   assert_equal "$commented" "$pushed"
+}
+
+# 跑验证那两步的块里多一行 verify_path="$PATH"（原样那份要留给验证命令自己用），
+# 所以整块比不了；能比的是判定本身 —— 九步都得是同一个 path_is_protected。
+# 少了这一条，新加一步时照抄漏一行（比如漏掉「相对项不认」那句）没人拦。
+@test "claude: all nine credentialed steps share one and the same path guard" {
+  guard=''
+  for step in 'Verify the Claude fix' 'Commit and push the Claude fix' \
+              'Post the Claude summary comment' 'Check the fix outcome' \
+              'Decide the takeover' 'Verify the Codex fix' \
+              'Commit and push the Codex fix' \
+              'Request Codex re-review after a new commit' \
+              'Post the Codex summary comment'; do
+    this="$(trusted_path_block "$step" |
+      awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^\}$/{exit}')"
+    [ -n "$this" ] || { echo "no PATH filter in: $step" >&2; return 1; }
+    if [ -z "$guard" ]; then guard="$this"; continue; fi
+    assert_equal "$this" "$guard" || { echo "drifted in: $step" >&2; return 1; }
+  done
 }
 
 # ---------- 门禁：谁跑得到验证和推送这两步 ----------
