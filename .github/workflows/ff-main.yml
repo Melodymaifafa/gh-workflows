@@ -187,7 +187,15 @@ jobs:
           # 定时跑时没人替 target 背书「这版能用」，绿灯是唯一的替代品。
           # skipped / neutral 算过 —— 有些仓库还没配 lint 或测试。
           if [ "$REQUIRE_GREEN" = true ]; then
-            runs="$(gh api "repos/$REPO/commits/$goal/check-runs" --jq '.check_runs')"
+            # 落点是 $SOURCE 的最新提交时（min_age_days 填 0），本次 run 自己的 check run 也挂在
+            # 这个 commit 上，而它此刻正在跑 —— 不排除的话「填 0 立刻挪」永远报「1 项未完成」
+            # （2026-09-29 linear-agent-team 实测，CI 早已全绿）。按 run id 排除，不按 job 名：
+            # 调用桩里的 job 名各仓库自己定。
+            runs="$(
+              gh api "repos/$REPO/commits/$goal/check-runs" --jq '.check_runs' |
+                jq --arg own "/actions/runs/${GITHUB_RUN_ID:-none}/" \
+                  '[.[] | select(((.details_url // "") | contains($own)) | not)]'
+            )"
             total="$(jq length <<<"$runs")"
             pending="$(jq -r '[.[] | select(.status != "completed")] | length' <<<"$runs")"
             bad="$(jq -r '[.[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length' <<<"$runs")"

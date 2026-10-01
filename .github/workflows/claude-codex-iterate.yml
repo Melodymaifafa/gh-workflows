@@ -20,6 +20,20 @@ on:
         description: Model id for the Codex fixer. Empty keeps the action's own default; pin one to freeze the cost.
         type: string
         default: ''
+      claude_model:
+        description: >-
+          Model for the Claude fixer (`--model`). Pinned on purpose: with no pin the action
+          falls back to Claude Code's account default, which was Sonnet for weeks without
+          anyone noticing. Only explicit Opus-or-above selectors pass: opus, fable,
+          claude-opus-*, claude-fable-*, claude-mythos-*.
+        type: string
+        default: claude-opus-5-5
+      claude_effort:
+        description: >-
+          Reasoning effort for the Claude fixer (`--effort`): low | medium | high | xhigh | max.
+          Opus 5.5 defaults to medium on its own, so this pins xhigh.
+        type: string
+        default: xhigh
       verify_cmd:
         description: Override the verify commands Claude must run before pushing (one per line).
         type: string
@@ -317,8 +331,32 @@ jobs:
           RUNTIME: ${{ inputs.runtime }}
           VERIFY_OVERRIDE: ${{ inputs.verify_cmd }}
           TOOLS_OVERRIDE: ${{ inputs.extra_tools }}
+          CLAUDE_MODEL: ${{ inputs.claude_model }}
+          CLAUDE_EFFORT: ${{ inputs.claude_effort }}
         run: |
           set -euo pipefail
+
+          # 模型和思考力度先验：拼错直接红，不让 Claude 那一步带着错值跑掉一轮再被当成
+          # 「没跑成」告警。模型是白名单不是黑名单：default、opusplan 这类别名名字里没有
+          # Sonnet，却可能解析到 Sonnet —— 只认明确写出的 Opus 及以上。
+          case "$CLAUDE_MODEL" in
+            opus|opus\[1m\]|fable|fable\[1m\]|claude-opus-*|claude-fable-*|claude-mythos-*) ;;
+            '')
+              echo "::error::claude_model is empty; pass an Opus-tier model id such as claude-opus-5-5"
+              exit 1
+              ;;
+            *)
+              echo "::error::claude_model '$CLAUDE_MODEL' is not an explicit Opus-or-above selector; use opus, fable, claude-opus-*, claude-fable-* or claude-mythos-* (default, opusplan and the like can resolve to Sonnet)"
+              exit 1
+              ;;
+          esac
+          case "$CLAUDE_EFFORT" in
+            low|medium|high|xhigh|max) ;;
+            *)
+              echo "::error::claude_effort '$CLAUDE_EFFORT' is not one of low, medium, high, xhigh, max"
+              exit 1
+              ;;
+          esac
 
           case "$RUNTIME" in
             python)
@@ -383,6 +421,8 @@ jobs:
           # env: 里」那条）。所以验证、commit、push、发评论全部挪到后面的独立步骤
           # （MEL-254）。不许为了省事把工具链或 Bash(git:*) 放回来。
           claude_args: |
+            --model ${{ inputs.claude_model }}
+            --effort ${{ inputs.claude_effort }}
             --max-turns 80
             --allowedTools "Edit,MultiEdit,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git status),Bash(git diff:*),Bash(git log:*)"
             --json-schema '{"type":"object","properties":{"pushed":{"type":"boolean"},"fixed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["pushed","fixed","skipped"],"additionalProperties":false}'
@@ -1041,6 +1081,9 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           STRUCTURED: ${{ steps.fix.outputs.structured_output }}
           PUSHED: ${{ steps.claude_push.outputs.pushed }}
+          EXEC_FILE: ${{ steps.fix.outputs.execution_file }}
+          CLAUDE_MODEL: ${{ inputs.claude_model }}
+          CLAUDE_EFFORT: ${{ inputs.claude_effort }}
         run: |
           set -euo pipefail
 
@@ -1099,11 +1142,22 @@ jobs:
 
           # 正文先落进 run summary 再发：评论没发出去（gh 偶发失败，或者它不在写不动的
           # 目录里）时，总结至少还留在这一轮的运行页上，不至于连文本一起丢。
+          # 哪个模型干的活写进评论：默认模型曾悄悄是 Sonnet，几周没人发现。名字从 SDK
+          # 执行记录的 init 消息里读（配置里抄的看不出默认值变了），读不到才退回配置值。
+          model_used=''
+          if [ -n "${EXEC_FILE:-}" ] && [ -r "$EXEC_FILE" ]; then
+            model_used="$(jq -r '
+              (if type == "array" then . else [] end)
+              | [.[] | select(.type == "system" and .subtype == "init") | (.model // "")][0] // ""
+            ' "$EXEC_FILE" 2>/dev/null || true)"
+          fi
+          [ -n "$model_used" ] || model_used="${CLAUDE_MODEL:-unknown}"
           body="$(
             printf '%s\n' "$summary"
             if [ "${PUSHED:-}" = true ]; then
               printf '\n验证：本仓库的 lint 与测试已在不带写权限的独立步骤里跑过，全绿后才推送。\n'
             fi
+            printf '\n模型：%s · 思考力度：%s\n' "$model_used" "${CLAUDE_EFFORT:-unknown}"
           )"
           printf '%s\n' "$body" >>"$GITHUB_STEP_SUMMARY"
 
