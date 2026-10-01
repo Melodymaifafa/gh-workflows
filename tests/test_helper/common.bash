@@ -227,11 +227,34 @@ fake_now_epoch() {
 # 了关掉，就是假绿，看不见。
 trust_fake_bin() { FAKE_BIN_TRUSTED=1; }
 
-# 某一步 run 块里那段过滤本身：path_is_protected 那行起，到 PATH 被换掉那行止。
-# 九步共用一字不差的同一段（MEL-255 / MEL-254 / MEL-260），所以放在共享助手里。
+# 两条路的验证 / 推送跑的是同一段正文：Define the fix verify and push guards 里那两个
+# 函数（MEL-262）。fix_guard_body 把其中一个的函数体按 workflow 里写的样子取出来 ——
+# 真跑时它走 declare -f 出去，排版会变，所以结构判定一律比这份源文本。
+fix_guard_body() { # fix_guard_body <verify_the_fix|commit_and_push_the_fix>
+  extract_run_block "$ITERATE_WORKFLOW" 'Define the fix verify and push guards' |
+    awk -v fn="$1() {" '$0 == fn { f = 1; next } f && $0 == "}" { exit } f { sub(/^  /, ""); print }'
+}
+
+# 一段 shell 里那道 PATH 过滤本身：path_is_protected 那行起，到 PATH 被换掉那行止。
+trusted_path_filter() {
+  awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^PATH="\$trusted_path"$/{exit}'
+}
+
+# 某一步 run 块里那段过滤。验证 / 推送那四步的正文不在步骤里，用 step_path_guard。
 trusted_path_block() { # trusted_path_block <step>
-  extract_run_block "$ITERATE_WORKFLOW" "$1" |
-    awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^PATH="\$trusted_path"$/{exit}'
+  extract_run_block "$ITERATE_WORKFLOW" "$1" | trusted_path_filter
+}
+
+# step_path_guard <step>：这一步真正跑的那份 path_is_protected。验证 / 推送那四步跑的
+# 是共用正文里的函数，所以先看它 eval 的是哪一个，再去 Define 那一步里取；其余几步
+# 正文就写在自己的 run 块里。九个带凭据的步骤靠这个助手比成同一份。
+step_path_guard() { # step_path_guard <step>
+  local block fn
+  block="$(extract_run_block "$ITERATE_WORKFLOW" "$1")"
+  fn="$(printf '%s\n' "$block" | awk '/^(verify_the_fix|commit_and_push_the_fix)$/ { print; exit }')"
+  [ -z "$fn" ] || block="$(fix_guard_body "$fn")"
+  printf '%s\n' "$block" |
+    awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^\}$/{exit}'
 }
 
 # path_guard <step> <dir>：只把那段里的 path_is_protected 抽出来，问它信不信一个目录。
@@ -316,13 +339,29 @@ run_block() {
   # trust_fake_bin 说了才接：在过滤那一行之后把假命令目录加回 PATH 最前面。
   # 这一步没有那道过滤时什么也不做 —— 假命令本来就在 PATH 上。
   if [ "${FAKE_BIN_TRUSTED:-}" = 1 ]; then
-    awk -v d="$FAKE_BIN_DIR" '
-      { print }
-      $0 == "PATH=\"$trusted_path\"" && !patched { print "PATH=\"" d ":$PATH\""; patched = 1 }
-    ' "$script" >"$script.trusted"
+    trust_patch <"$script" >"$script.trusted"
     mv "$script.trusted" "$script"
+    # 验证 / 推送那四步的正文不在块里，而在 eval 进来的那两段里（MEL-262）：同一下
+    # 补丁要打在它们身上，否则 trust_fake_bin 对这四步静默失效，判定跟着空转。
+    # 只在这一次调用里生效。
+    (
+      FIX_VERIFY_GUARD="$(printf '%s\n' "${FIX_VERIFY_GUARD:-}" | trust_patch)"
+      FIX_PUSH_GUARD="$(printf '%s\n' "${FIX_PUSH_GUARD:-}" | trust_patch)"
+      export FIX_VERIFY_GUARD FIX_PUSH_GUARD
+      bash --noprofile --norc -eo pipefail "$script"
+    )
+    return
   fi
   bash --noprofile --norc -eo pipefail "$script"
+}
+
+# 把假命令目录接回 PATH 最前面，插在那道过滤之后。两种长相都认：步骤块里是顶格的
+# `PATH="$trusted_path"`，共用正文走 declare -f 出来会缩进、还带个分号。
+trust_patch() {
+  awk -v d="$FAKE_BIN_DIR" '
+    { print }
+    !patched && $0 ~ /^[[:space:]]*PATH="\$trusted_path";?$/ { print "PATH=\"" d ":$PATH\""; patched = 1 }
+  '
 }
 
 # step_env_keys <workflow-file> <step-name>：打印这一步 `env:` 块里声明的变量名，
@@ -342,17 +381,46 @@ step_env_keys() {
   ' "$wf"
 }
 
-# run_step <workflow-file> <step-name>：同 run_block，但先把这一步 `env:` 里没声明
-# 的令牌从环境里摘掉 —— 真跑起来，step 手上只有自己声明的那几个值。
+# step_env_literals <workflow-file> <step-name>：打印这一步 `env:` 里写死的字面量
+# （值里没有 ${{ }} 的那些，比如 FIXER: Claude），一行一个 `KEY=value`。表达式那些
+# 跳过 —— 它们的值只有真跑起来才知道，由测试自己喂。
+step_env_literals() {
+  local wf="$1"
+  case "$wf" in /*) ;; *) wf="$REPO_ROOT/$wf" ;; esac
+  awk -v want="      - name: $2" '
+    $0 == want                                       { in_step = 1; next }
+    in_step && !in_env && $0 == "        env:"        { in_env = 1; next }
+    in_env && $0 ~ /^          [A-Za-z_][A-Za-z0-9_]*:/ {
+      line = $0; sub(/^ +/, "", line)
+      k = line; sub(/:.*$/, "", k)
+      v = line; sub(/^[^:]*: ?/, "", v)
+      if (index(v, "${{") == 0 && v != "") print k "=" v
+      next
+    }
+    in_env                                            { exit }
+    in_step && $0 ~ /^      - /                       { exit }
+  ' "$wf"
+}
+
+# run_step <workflow-file> <step-name>：同 run_block，但先按这一步的 `env:` 把环境
+# 摆成真跑起来的样子 —— 没声明的令牌摘掉，写死的字面量照 workflow 里写的喂进去。
 # 「令牌照挂在 step 级 env、只在子进程里 env -u 抹掉」的写法在这里会原样暴露：
 # 父 shell 那份环境还在，验证命令跟它同一个用户，/proc/$PPID/environ 读得回来。
+# 字面量照喂是因为两条路现在共用同一段正文，差别只在 $FIXER 这类值上：测试要验的
+# 是 workflow 里写的那个值，不是测试自己编一个塞进去。
 run_step() {
-  local wf="$1" step="$2" keys
+  local wf="$1" step="$2" keys lit
   keys="$(step_env_keys "$wf" "$step")"
   [ -n "$keys" ] || { echo "run_step: step '$step' declares no env: block in $wf" >&2; return 98; }
   (
     case "$keys" in *GH_TOKEN*) ;; *) unset GH_TOKEN ;; esac
     case "$keys" in *GITHUB_TOKEN*) ;; *) unset GITHUB_TOKEN ;; esac
+    while IFS= read -r lit; do
+      [ -n "$lit" ] || continue
+      export "${lit?}"
+    done <<EOF
+$(step_env_literals "$wf" "$step")
+EOF
     run_block "$wf" "$step"
   )
 }

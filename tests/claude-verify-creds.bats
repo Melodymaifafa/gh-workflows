@@ -7,7 +7,9 @@
 #   2. 跑验证的那一步手上什么凭据都没有：没有令牌，也没有 checkout 留在 .git/config
 #      里那份。
 #   3. 验证动过 .git、改过不许它改的文件、或留下活进程，就红着停下，绝不 commit / push。
-# Codex 那条路的同名判定在 codex-takeover.bats；两份防线是逐行副本，改一份必须改另一份。
+# Codex 那条路的同名判定在 codex-takeover.bats。两条路跑的已经是同一段正文
+# （Define the fix verify and push guards 里那两个函数，MEL-262），差别只有 $FIXER
+# 一个名字 —— 所以这里改一道防线，Codex 那条路同时也改了。
 
 load test_helper/common
 load test_helper/step_gate
@@ -22,6 +24,12 @@ setup() {
   # 噪声重跑时要用的 git：在测试往 PATH 上种任何东西之前先认下来
   REAL_GIT="$(command -v git)"
   export REAL_GIT
+  run_block "$WF" "Define the fix verify and push guards" >/dev/null
+  # 两条路的验证 / 推送跑的是同一段正文，由那一步的 output 交出来（真跑时由 env: 接
+  # 过去），不读 $RUNNER_TEMP 里的文件。
+  export FIX_VERIFY_GUARD; FIX_VERIFY_GUARD="$(step_output verify)"
+  export FIX_PUSH_GUARD; FIX_PUSH_GUARD="$(step_output push)"
+  : >"$GITHUB_OUTPUT"
 }
 
 # ---------- 结构：Claude 那一步拿到的工具和提示词 ----------
@@ -86,12 +94,14 @@ claude_prompt() {
   keys="$(step_env_keys "$WF" 'Verify the Claude fix')"
   refute_contains "$keys" 'GH_TOKEN'
   refute_contains "$keys" 'GITHUB_TOKEN'
-  # 跑验证的确实是这一步，否则改个步骤名这条就空转
-  assert_contains "$(extract_run_block "$REPO_ROOT/$WF" 'Verify the Claude fix')" \
-    'bash -euo pipefail -c "$VERIFY"'
-  # 带令牌的那一步反过来不许碰验证命令
+  # 跑验证的确实是这一步：它拿的是验证那份共用正文，而正文里跑的就是 $VERIFY。
+  # 改个步骤名、或者哪天忘了把正文递过来，这条就空转不了。
+  assert_contains "$keys" 'FIX_VERIFY_GUARD'
+  assert_contains "$(fix_guard_body verify_the_fix)" 'bash -euo pipefail -c "$VERIFY"'
+  # 带令牌的那一步反过来一个字的验证正文都拿不到：它只拿推送那一份。
   assert_contains "$(step_env_keys "$WF" 'Commit and push the Claude fix')" 'GH_TOKEN'
-  refute_contains "$(extract_run_block "$REPO_ROOT/$WF" 'Commit and push the Claude fix')" 'VERIFY'
+  refute_contains "$(step_env_keys "$WF" 'Commit and push the Claude fix')" 'FIX_VERIFY_GUARD'
+  refute_contains "$(fix_guard_body commit_and_push_the_fix)" 'VERIFY'
 }
 
 # ---------- 真跑一遍：验证、提交、推送 ----------
@@ -119,7 +129,9 @@ push_workspace() { # push_workspace <verify script>
   export VERIFY="$1"
   # 调用方没写白名单 = 一个被跟踪的文件都不许验证命令改写（失败关闭）。
   export VERIFY_WRITABLE_PATHS="${VERIFY_WRITABLE_PATHS:-}"
-  export HEAD_REF=topic PR_NUMBER=7 GH_TOKEN=write-token
+  # ROUND / REPO 是推送那一步发轮数标记 M7 用的（以前只有 Codex 那半边发，MEL-262
+  # 之后两条路都在推送里发）。
+  export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
 }
 
 verify_and_push() {
@@ -173,6 +185,27 @@ run_chain() {
     /bin/sleep 1
     reset_workspace
     run verify_and_push
+  done
+}
+
+# 只让「提交并推送」那一步信得过假命令目录，验证那一步照旧跑原样的块：轮数标记 M7
+# 走 gh，而 gh 只从写不动的目录里找，测试里那个假 gh 放在仓库目录下、过滤之后够不着。
+# 验证那一步不能跟着信 —— 假 sleep / 假 date 会把残留清点那几道判定搅了。
+verify_then_trusted_push() {
+  FAKE_BIN_TRUSTED=
+  run_step "$WF" "Verify the Claude fix" || return
+  trust_fake_bin
+  run_step "$WF" "Commit and push the Claude fix"
+}
+
+run_chain_trusted_push() {
+  local tries=0
+  run verify_then_trusted_push
+  while [ "$tries" -lt 3 ] && is_machine_noise; do
+    tries=$((tries + 1))
+    /bin/sleep 1
+    reset_workspace
+    run verify_then_trusted_push
   done
 }
 
@@ -291,6 +324,94 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
 }
 
+# ---------- 两条路共用同一段正文 ----------
+
+# MEL-262 的那条不变量：验证和推送各只有一份正文，两条路都跑它，差别只有 $FIXER
+# 一个名字。谁要是把哪一边重新拆成自己的一份，这一条就红。
+@test "claude: both paths run the one shared verify body and the one shared push body" {
+  for step in 'Verify the Claude fix' 'Verify the Codex fix'; do
+    assert_contains "$(step_env_keys "$WF" "$step")" 'FIX_VERIFY_GUARD'
+    assert_contains "$(extract_run_block "$REPO_ROOT/$WF" "$step")" 'verify_the_fix'
+    # 跑验证的那一步拿不到推送正文
+    refute_contains "$(step_env_keys "$WF" "$step")" 'FIX_PUSH_GUARD'
+  done
+  for step in 'Commit and push the Claude fix' 'Commit and push the Codex fix'; do
+    assert_contains "$(step_env_keys "$WF" "$step")" 'FIX_PUSH_GUARD'
+    assert_contains "$(extract_run_block "$REPO_ROOT/$WF" "$step")" 'commit_and_push_the_fix'
+  done
+  # 两条路差的就是这一个名字
+  assert_contains "$(step_env_literals "$WF" 'Verify the Claude fix')" 'FIXER=Claude'
+  assert_contains "$(step_env_literals "$WF" 'Verify the Codex fix')" 'FIXER=Codex'
+  assert_contains "$(step_env_literals "$WF" 'Commit and push the Claude fix')" 'FIXER=Claude'
+  assert_contains "$(step_env_literals "$WF" 'Commit and push the Codex fix')" 'FIXER=Codex'
+  # 四步都得失败关闭：正文没递过来就红着停下，别带着半截防线往下跑
+  for step in 'Verify the Claude fix' 'Verify the Codex fix' \
+              'Commit and push the Claude fix' 'Commit and push the Codex fix'; do
+    assert_contains "$(extract_run_block "$REPO_ROOT/$WF" "$step")" 'did not arrive from the Define step'
+  done
+}
+
+# 正文没递过来就红着停下（跟「没拿到告警函数」同一个处置）：带着半截防线去跑被审
+# PR 自己带的命令，等于一道判定都没有。两条路共用这段正文，所以验一边就够。
+@test "claude: without the verify guard from the Define step the round goes red" {
+  push_workspace 'printf "smuggled\n" >app.txt'
+  export FIX_VERIFY_GUARD=''
+
+  run run_step "$WF" "Verify the Claude fix"
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'verify guard did not arrive'
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
+# 推送那一步同理：手上有写权限令牌，正文没递过来一个 git 命令都不许跑。
+@test "claude: without the push guard from the Define step nothing is committed or pushed" {
+  push_workspace 'true'
+  run_step "$WF" "Verify the Claude fix"
+  export FIX_PUSH_GUARD=''
+
+  run run_step "$WF" "Commit and push the Claude fix"
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'push guard did not arrive'
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  refute_called 'gh pr comment'
+}
+
+# ---------- 轮数标记 M7 ----------
+
+# 推送成功就留一条轮数标记。以前只有 Codex 那半边在推送里发，Claude 这半边在
+# Check the fix outcome 里发 —— 同一件事两处各写一份，正是 MEL-262 收掉的东西；
+# 现在两条路共用推送那段正文，标记也只有一个来源。少了它这一轮不计数，下一轮
+# Gate 从头数，修复轮数上限就永远拦不住。
+@test "claude: a pushed round leaves exactly one round marker on the new head" {
+  push_workspace 'true'
+
+  run_chain_trusted_push
+
+  assert_equal "$status" 0
+  assert_equal "$(step_output pushed)" true
+  assert_called 'gh pr comment 7 --repo o/r' 1
+  # 正文比全等，顺带守住「标记里不许有触发词」：混进一句 @codex review 就红。
+  assert_equal "$(fake_last_body 'gh pr comment')" "🤖 自动修复第 2 轮已推送。
+
+<!-- pr-guard: fix-round head=$(git rev-parse HEAD) round=2 -->"
+}
+
+# 标记发不出去（gh 偶发失败，或者它不在写不动的目录里）只警告，不把这一轮判红：
+# 推已经成功了，为一条评论打红会让后面召唤复审跟着被跳过，链条反而静默停住。
+@test "claude: a round marker that fails to post only warns; the push still stands" {
+  push_workspace 'true'
+  fake_cli_fail pr_comment 1
+
+  run_chain_trusted_push
+
+  assert_equal "$status" 0
+  assert_equal "$(step_output pushed)" true
+  assert_contains "$output" 'fix-round marker for'
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
 # ---------- 总结评论 ----------
 
 # 总结由外层步骤发，文本走结构化输出：Claude 自己发就得在跑验证的同一步里握着令牌。
@@ -347,17 +468,17 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
 # 九处防线是逐行副本，这一条盯着它们不许各改各的：抽成 $RUNNER_TEMP 下的共享脚本
 # 等于把我们自己的防线放到验证命令写得动的地方，所以只能各写一份（合成一份
 # 是 MEL-262 的活）。
-@test "claude: the summary step filters PATH with the very same block as the push step" {
-  pushed="$(trusted_path_block 'Commit and push the Claude fix')"
+@test "claude: the summary step filters PATH with the very same block as the push body" {
+  pushed="$(fix_guard_body commit_and_push_the_fix | trusted_path_filter)"
   commented="$(trusted_path_block 'Post the Claude summary comment')"
-  [ -n "$pushed" ] || { echo 'no PATH filter found in the push step' >&2; return 1; }
+  [ -n "$pushed" ] || { echo 'no PATH filter found in the shared push body' >&2; return 1; }
   assert_equal "$commented" "$pushed"
 }
 
 # 跑验证那两步的块里多一行 verify_path="$PATH"（原样那份要留给验证命令自己用），
 # 所以整块比不了；能比的是判定本身 —— 九步都得是同一个 path_is_protected。
 # 少了这一条，新加一步时照抄漏一行（比如漏掉「相对项不认」那句）没人拦。
-@test "claude: all nine credentialed steps share one and the same path guard" {
+@test "claude: all nine credentialed steps run one and the same path guard" {
   guard=''
   for step in 'Verify the Claude fix' 'Commit and push the Claude fix' \
               'Post the Claude summary comment' 'Check the fix outcome' \
@@ -365,8 +486,7 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
               'Commit and push the Codex fix' \
               'Request Codex re-review after a new commit' \
               'Post the Codex summary comment'; do
-    this="$(trusted_path_block "$step" |
-      awk '/^path_is_protected\(\) \{$/{f=1} f{print} f&&/^\}$/{exit}')"
+    this="$(step_path_guard "$step")"
     [ -n "$this" ] || { echo "no PATH filter in: $step" >&2; return 1; }
     if [ -z "$guard" ]; then guard="$this"; continue; fi
     assert_equal "$this" "$guard" || { echo "drifted in: $step" >&2; return 1; }
