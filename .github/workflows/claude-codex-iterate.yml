@@ -24,7 +24,8 @@ on:
         description: >-
           Model for the Claude fixer (`--model`). Pinned on purpose: with no pin the action
           falls back to Claude Code's account default, which was Sonnet for weeks without
-          anyone noticing. Must stay Opus-tier or above; Sonnet / Haiku are refused.
+          anyone noticing. Only explicit Opus-or-above selectors pass: opus, fable,
+          claude-opus-*, claude-fable-*, claude-mythos-*.
         type: string
         default: claude-opus-5-5
       claude_effort:
@@ -327,14 +328,16 @@ jobs:
           set -euo pipefail
 
           # 模型和思考力度先验：拼错直接红，不让 Claude 那一步带着错值跑掉一轮再被当成
-          # 「没跑成」告警。Sonnet / Haiku 一律拒 —— 这条链只许 Opus 及以上。
+          # 「没跑成」告警。模型是白名单不是黑名单：default、opusplan 这类别名名字里没有
+          # Sonnet，却可能解析到 Sonnet —— 只认明确写出的 Opus 及以上。
           case "$CLAUDE_MODEL" in
+            opus|opus\[1m\]|fable|fable\[1m\]|claude-opus-*|claude-fable-*|claude-mythos-*) ;;
             '')
               echo "::error::claude_model is empty; pass an Opus-tier model id such as claude-opus-5-5"
               exit 1
               ;;
-            *[Ss]onnet*|*[Hh]aiku*)
-              echo "::error::claude_model '$CLAUDE_MODEL' is below Opus; this workflow refuses Sonnet and Haiku"
+            *)
+              echo "::error::claude_model '$CLAUDE_MODEL' is not an explicit Opus-or-above selector; use opus, fable, claude-opus-*, claude-fable-* or claude-mythos-* (default, opusplan and the like can resolve to Sonnet)"
               exit 1
               ;;
           esac
