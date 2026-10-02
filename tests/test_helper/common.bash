@@ -22,6 +22,18 @@ extract_run_block() {
   ' "$workflow"
 }
 
+# step_key <workflow-file> <step-name> <key>：打印这一步自己那一级的某个键的值
+# （timeout-minutes、continue-on-error 之类）。没写就什么都不打印。
+step_key() {
+  local wf="$1"
+  case "$wf" in /*) ;; *) wf="$REPO_ROOT/$wf" ;; esac
+  awk -v want="      - name: $2" -v key="        $3:" '
+    $0 == want                  { in_step = 1; next }
+    in_step && index($0, key) == 1 { sub(/^[^:]*: ?/, ""); print; exit }
+    in_step && $0 ~ /^      - / { exit }
+  ' "$wf"
+}
+
 # 用指定 runtime 跑一遍 Resolve commands，结果落到 $GITHUB_ENV 指向的文件。
 # 三个 *_OVERRIDE 默认空串，对应调用方没传 install_cmd / lint_cmd / test_cmd。
 resolve_commands() {

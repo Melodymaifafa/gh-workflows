@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
-# ci.yml「Resolve commands」那段 runtime→命令映射的测试。
-# 这段是所有仓库共用的分发口：改错了不是一个仓库红，是全部一起红。
+# ci.yml 的测试：「Resolve commands」那段 runtime→命令映射，外加「lint 挂住时要红得
+# 出来」那几道（MEL-291）。这条流水线是所有仓库共用的分发口：改错了不是一个仓库红，
+# 是全部一起红 —— 挂住更糟，连红都没有。
 
 load test_helper/common
 
@@ -56,4 +57,21 @@ load test_helper/common
   run bash -c "$test_cmd"
   assert_equal "$status" 0
   assert_contains "$output" 'ok 1 sanity'
+}
+
+# ---------- lint 挂住的时候要红得出来，而不是一声不响挂满 6 小时（MEL-291） ----------
+
+# actionlint 对每个 run: 块自动跑 shellcheck，块是写进那个进程 stdin 的；一超过 64 KiB
+# 管道缓冲就两头互等，actionlint 既不报错也不退出。job 没有超时时 GitHub 要到 360 分钟
+# 上限才收，19 个调用方仓库看到的就是「CI 一直转」而不是红叉。超时让它红得出来。
+@test "the lint step has a timeout so a hung linter goes red instead of running to the job cap" {
+  minutes="$(step_key "$CI_WORKFLOW" Lint timeout-minutes)"
+  [ -n "$minutes" ] || {
+    echo 'the Lint step declares no timeout-minutes; a deadlocked linter would hang to the 360-minute job cap' >&2
+    return 1
+  }
+  [ "$minutes" -le 60 ] || {
+    echo "the Lint timeout is $minutes minutes, too close to the 360-minute job cap to be a backstop" >&2
+    return 1
+  }
 }
