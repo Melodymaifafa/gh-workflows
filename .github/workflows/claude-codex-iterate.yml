@@ -298,6 +298,7 @@ jobs:
             verify_user=''
             verify_sandbox=''
             verify_group=''
+            verify_bash=''
             self_uid="$(id -u)"
             verify_uid="$self_uid"
             # 专用账号的名字写死，不收调用方的输入：换个名字等于换一个「名下可能已经
@@ -393,6 +394,23 @@ jobs:
               return 1
             }
 
+            # 这个账号是不是这一次 run 里我们建的。捡机器上本来就有的来跑，等于把它身上
+            # 已排好的 crontab / at / allow 名单 / linger 定时器一整类接过来，逐条清不完。
+            # 标记由 root 写在 /run 下（tmpfs），名字带 run 号 + 重跑次数，装建号时的 uid。
+            # 判据：不是快捷方式（否则 cat 读到别处去），且归 root（/run 谁都写得动的话，
+            # 那个账号自己就能种一份）。问不出来一律当成「不是我们的」。详见验收记录。
+            the_account_is_ours_from_this_run() { # the_account_is_ours_from_this_run <uid> <标记>
+              as_root test ! -L "$2" >/dev/null 2>&1 || return 1
+              as_root test -O "$2" >/dev/null 2>&1 || return 1
+              [ "$(as_root cat "$2" 2>/dev/null)" = "$1" ] || return 1
+            }
+
+            # 写完立刻读回来（同两份拒绝名单那一段）：落不了地照样是「嘴上说已经隔离」。
+            mark_the_account_as_ours() { # mark_the_account_as_ours <uid> <标记>
+              printf '%s\n' "$1" | as_root tee "$2" >/dev/null 2>&1 || return 1
+              the_account_is_ours_from_this_run "$1" "$2"
+            }
+
             # 账号不是我们建的（跑之前机器上就有）：它原本在哪些组里是别人定的，而组
             # 自带权限 —— 有人用 root 预先建好一个 ghwf-verify 再塞进 docker，我们这一步
             # 就会把被审 PR 自己带的命令交到一个等于 root 的身份上去跑，比压根不分离还糟。
@@ -421,12 +439,21 @@ jobs:
             }
 
             separate_the_verify_user() {
-              local uid group sandbox existing preexisting=''
+              local uid group sandbox existing preexisting='' candidate marker
               command -v sudo >/dev/null 2>&1 || return 1
               as_root true >/dev/null 2>&1 || return 1
+              # 走绝对路径：下面那条启动把 PATH 换成验证命令自己那份，靠 PATH 找 bash
+              # 等于让它自己挑（MEL-278）。都没有就回退。
+              verify_bash=''
+              for candidate in /bin/bash /usr/bin/bash; do
+                [ -x "$candidate" ] || continue
+                verify_bash="$candidate"
+                break
+              done
+              [ -n "$verify_bash" ] || return 1
               # 同一个 job 里两条路各跑一次验证，第二次复用同一个账号。
-              # 「我们刚建的」和「机器上本来就有的」要分开记：后者原本在哪些组里是别人
-              # 定的，下面要连主组一起过一遍白名单。
+              # 「我们刚建的」和「机器上本来就有的」要分开记：后者身上带着什么我们问不清
+              # （上面那段标记），它原本在哪些组里也是别人定的（下面那道白名单）。
               if id -u "$verify_account" >/dev/null 2>&1; then
                 preexisting=1
               else
@@ -435,6 +462,15 @@ jobs:
               fi
               uid="$(id -u "$verify_account" 2>/dev/null)" || return 1
               case "$uid" in ''|0|*[!0-9]*) return 1 ;; esac
+              # 本来就有的只有「这次 run 我们建的」才接着走（同 job 第二次复用就是这种）；
+              # 刚建的立刻留标记。排在这里：还没给账号发出任何权限。
+              [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_RUN_ATTEMPT:-}" ] || return 1
+              marker="/run/ghwf-verify.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+              if [ -n "$preexisting" ]; then
+                the_account_is_ours_from_this_run "$uid" "$marker" || return 1
+              else
+                mark_the_account_as_ours "$uid" "$marker" || return 1
+              fi
               # 排不进定时任务是「过后没人来」的唯一拦截点，写不进去就回退（上面那段）。
               deny_the_account_scheduled_jobs || return 1
               # 现在就得是空的。名下已经有活进程（自建 runner 上账号跨 job 留着）说明
@@ -832,6 +868,11 @@ jobs:
               # 调用方仓库的测试套件照旧读得到 CI / GITHUB_* 那一堆。只有指向 runner
               # 那个用户私有目录的几个（HOME、XDG_*、uv / npm 的缓存）换成沙箱里的 ——
               # 漏一个的长相是「权限不够」当场失败，不是静默跑在我们的目录上。
+              # umask 002 设在 sudo **里面**：sudo 取「调用者的」和 sudoers 那个（默认
+              # 0022）的并集，设外面到不了验证进程，它造的 .venv 就 0755、组写不动，
+              # runner 回头 add -u / git clean -fdx 都动不了。2026-10-03 实测这台机器的
+              # sudo 其实传了进去，但设里面两种都对。先 umask 再 exec 跑 $VERIFY 本身。
+              # shellcheck disable=SC2016  # -c 的单引号是要的：$0 / $1 留给里面那层展开
               as_root -E -u "$verify_user" \
                 env HOME="$verify_sandbox/home" TMPDIR="$verify_sandbox/tmp" \
                     XDG_CACHE_HOME="$verify_sandbox/cache" \
@@ -844,18 +885,17 @@ jobs:
                     GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
                     GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
                     PATH="$verify_path" \
-                    bash -euo pipefail -c "$VERIFY"
+                    "$verify_bash" -euo pipefail \
+                      -c 'umask 002; exec "$0" -euo pipefail -c "$1"' \
+                      "$verify_bash" "$VERIFY"
             }
             # 它造出来的文件和目录，我们回头也要写得动（验证跑完那次 add -u、下一轮交接
-            # 前的 git clean -fdx）。目录 setgid 让组跟着工作区，umask 002 让那个组写得动；
-            # 子进程继承 umask，所以在这儿放宽、启动完立刻收回去。回退路径一个字不改。
-            saved_umask="$(umask)"
-            [ -z "$verify_user" ] || umask 002
+            # 前的 git clean -fdx）。目录 setgid 让组跟着工作区，umask 002 让那个组写得动
+            # —— 那句 umask 设在 sudo 起的命令里面（上面写了为什么）。回退路径不改。
             set -m
             launch_the_verify_command </dev/null &
             verify_pgid=$!
             set +m
-            umask "$saved_umask"
             verify_status=0
             wait "$verify_pgid" || verify_status=$?
 
