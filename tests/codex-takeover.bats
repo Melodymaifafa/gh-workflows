@@ -1698,15 +1698,96 @@ EOS
 }
 
 # 交出去的那份正文必须就是落盘的那个脚本，一个字节都不差。
-@test "staging: the classifier handed to later steps is the staged script itself" {
+# 取脚本的落点：一个真仓库 + 一份已经 checkout 好的 scripts/。
+staging_workspace() { # staging_workspace [少放哪个脚本]
+  local script
   git init -q .
   git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
-  export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp-staging" CHECKOUT_DIR=shared-checkout
+  # 每次调用各自一套落点：循环里连着跑时，第二次的 mv 会把新的 scripts/ 塞进上一次
+  # 留下的 fixer-scripts/ 里，判定于是看着上一轮的那套文件空转。
+  export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp-staging-${1:-all}"
+  export CHECKOUT_DIR="shared-checkout-${1:-all}"
+  export SCRIPTS_REF=0123456789012345678901234567890123456789
   mkdir -p "$RUNNER_TEMP" "$CHECKOUT_DIR/scripts"
-  cp "$SCRIPTS/classify-claude-failure.sh" "$CHECKOUT_DIR/scripts/"
+  for script in classify-claude-failure.sh select-review-fixer.sh extract-codex-patch.sh; do
+    [ "$script" != "${1:-}" ] || continue
+    cp "$SCRIPTS/$script" "$CHECKOUT_DIR/scripts/"
+  done
+}
+
+@test "staging: the bodies handed to later steps are the staged scripts themselves" {
+  staging_workspace
   run run_block "$WF" "Move the fixer scripts out of the workspace"
   assert_equal "$status" 0
   assert_equal "$(step_output classifier)" "$(cat "$SCRIPTS/classify-claude-failure.sh")"
+  assert_equal "$(step_output patch_extractor)" "$(cat "$SCRIPTS/extract-codex-patch.sh")"
+}
+
+# 上一步取错了版本（旧 commit 里还没有某个脚本）长相就是「少一个文件」，而一份空
+# 正文到了用它的那一步，看起来跟「验证命令把它掏空了」一模一样。所以在这里就红。
+@test "staging: a half-staged script set reds the round instead of handing over an empty body" {
+  for missing in classify-claude-failure.sh select-review-fixer.sh extract-codex-patch.sh; do
+    staging_workspace "$missing"
+    run run_block "$WF" "Move the fixer scripts out of the workspace"
+    assert_equal "$status" 1
+    assert_contains "$output" "$missing is missing"
+  done
+}
+
+# ---------- 取哪个版本的脚本 ----------
+#
+# github.job_workflow_sha 实跑是空的（2026-10-02 两次实测，调用桩分别钉分支和钉
+# tag）。空 ref 不会让 actions/checkout 报错 —— 它退回事件自己的 ref，在本仓库自己
+# 的 PR 上就是被审 PR 的合并树，于是被审 PR 自己提供了我们用来判它的脚本。所以版本
+# 改从本次 run 的记录里读，读不出一个完整 commit 就红着停下。
+
+REF_STEP='Resolve which version of the shared fixer scripts to take'
+WF_PATH='Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml'
+
+resolve_ref() { # resolve_ref <referenced_workflows 的 JSON>
+  export REPO=o/r RUN_ID=123 GH_TOKEN=read-token
+  fake_route repos/o/r/actions/runs/123 "{\"referenced_workflows\": $1}"
+  trust_fake_bin
+  run run_step "$WF" "$REF_STEP"
+}
+
+@test "scripts-ref: the commit comes from this run's own record of the reusable workflow" {
+  sha=5329f35611ffe5b07564edb0ec2f9203dfdb1850
+  resolve_ref "[{\"path\": \"$WF_PATH@mel-272-e2e-pin\", \"ref\": \"refs/tags/mel-272-e2e-pin\", \"sha\": \"$sha\"}]"
+  assert_equal "$status" 0
+  assert_equal "$(step_output ref)" "$sha"
+}
+
+@test "scripts-ref: another repo's reusable workflow in the same run buys nothing" {
+  resolve_ref '[{"path": "someone/else/.github/workflows/thing.yml@v3", "ref": "refs/tags/v3", "sha": "1111111111111111111111111111111111111111"}]'
+  assert_equal "$status" 1
+  assert_contains "$output" 'does not say which commit'
+  refute_contains "$(cat "$GITHUB_OUTPUT")" 'ref='
+}
+
+# 短 sha、ref 名、空记录都不收：收了就等于让 checkout 去猜，而猜错那一下是静默的。
+@test "scripts-ref: anything short of a full commit reds the round" {
+  for bad in '"5329f35"' '"refs/tags/v1"' '""' 'null'; do
+    : >"$GITHUB_OUTPUT"
+    resolve_ref "[{\"path\": \"$WF_PATH@v1\", \"ref\": \"refs/tags/v1\", \"sha\": $bad}]"
+    assert_equal "$status" 1
+    assert_contains "$output" 'does not say which commit'
+  done
+
+  : >"$GITHUB_OUTPUT"
+  resolve_ref '[]'
+  assert_equal "$status" 1
+  assert_contains "$output" 'does not say which commit'
+}
+
+# 这一步排在 Gate 之后、被审 PR 的代码跑起来之前，所以它不在那十步里。守住位置本身：
+# 它必须排在取脚本那次 checkout 之前，否则 checkout 又拿不到 ref 了。
+@test "scripts-ref: the resolver runs before the checkout that uses it" {
+  order="$(awk '/^      - name: Resolve which version of the shared fixer scripts to take$/{print "resolver"}
+                /^      - name: Fetch the shared fixer scripts$/{print "checkout"}' "$REPO_ROOT/$WF")"
+  assert_equal "$order" "$(printf 'resolver\ncheckout')"
+  assert_contains "$(cat "$REPO_ROOT/$WF")" 'ref: ${{ steps.scripts_ref.outputs.ref }}'
+  refute_contains "$(cat "$REPO_ROOT/$WF")" 'ref: ${{ github.job_workflow_sha }}'
 }
 
 @test "takeover: a provider limit hands the round to Codex and says so in the summary" {
