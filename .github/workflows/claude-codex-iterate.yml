@@ -289,7 +289,10 @@ jobs:
             # 19 个调用方仓库一起卡死，而回退回去的正是今天在跑的那条路（指纹、树、ref
             # 快照、按 uid 清点一道没少）。MEL-288 就是 fail closed 卡住的。只有「验证
             # 跑完之后的判定」才红。
-            verify_ws="${GITHUB_WORKSPACE:-$PWD}"
+            # 归属要改的是「这一步接下来要验的那个 checkout」，也就是本步的 cwd ——
+            # 不走 $GITHUB_WORKSPACE：真跑起来两者相同，而测试里 workflow 文件自己那份
+            # $GITHUB_WORKSPACE 指的是别的目录，给错的那棵树放权既没用又危险。
+            verify_ws="$PWD"
             verify_user=''
             verify_sandbox=''
             verify_uid="$(id -u)"
@@ -324,7 +327,7 @@ jobs:
               # shellcheck disable=SC2012  # 要的只是目录自己那一行的第 4 列（组名），
               # 路径是工作区、不是通配结果；stat 的格式串 GNU 和 BSD 不一样（本机跑测试
               # 的 macOS 是 BSD），ls -ld | awk 两边都是同一列，同上面的 file_ident。
-              group="$(ls -ld "$verify_ws" | awk '{ print $4 }')"
+              group="$(ls -ld "$verify_ws" | awk '{ print $4 }')" || return 1
               [ -n "$group" ] || return 1
               as_root usermod -aG "$group" "$verify_account" >/dev/null 2>&1 || return 1
               as_root chmod -R g+w "$verify_ws" >/dev/null 2>&1 || return 1
