@@ -75,3 +75,21 @@ load test_helper/common
     return 1
   }
 }
+
+# 上面那条超时是兜底，这条是正门：超长的块在本机 `bats tests/` 就红，附带说清要怎么改。
+# 真走到 actionlint 那一步已经看不出发生了什么 —— 没有输出、没有退出码、只有一个卡住的
+# 进程。实测的门槛是 65,338 字节过、65,500 左右死锁，这里取 64,000 留一截余量。
+@test "no run: block comes close to the 64 KiB pipe buffer that deadlocks actionlint" {
+  max=64000
+  over=''
+  while read -r bytes where; do
+    [ -n "$bytes" ] || continue
+    [ "$bytes" -lt "$max" ] && continue
+    over="$over  $where: $bytes bytes"$'\n'
+  done < <(run_block_sizes)
+  [ -z "$over" ] || {
+    printf 'these run: blocks are at or past %s bytes and will deadlock actionlint; split each into separate steps:\n%s' \
+      "$max" "$over" >&2
+    return 1
+  }
+}
