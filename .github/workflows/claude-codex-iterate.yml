@@ -44,6 +44,16 @@ on:
           Empty means none. List the lock files your verify commands regenerate, e.g. uv.lock.
         type: string
         default: ''
+      verify_isolation:
+        description: >-
+          auto | off — auto runs the PR's own verify command as a dedicated unprivileged
+          account, so no process it leaves behind can read this job's token out of
+          /proc/<pid>/environ; it falls back to the runner user (with the leftover-process
+          sweep) on runners without passwordless sudo. off never leaves the runner user:
+          an escape hatch for a repo whose verify command needs the runner user's own
+          $HOME, caches or workspace ownership.
+        type: string
+        default: auto
       extra_tools:
         description: >-
           Unused since MEL-254 — the fixer step no longer gets a toolchain (it only edits
@@ -257,6 +267,107 @@ jobs:
               exit 1
             fi
 
+            # ps 用不了就等于下面那道清点什么都没做 —— 静默的 no-op 比没有更糟，所以
+            # 在跑被审 PR 自己的命令**之前**就确认它在（以前这一判在验证之后，那时候
+            # 坏消息已经来晚了）。
+            if ! ps -p "$$" >/dev/null 2>&1; then
+              echo '::error::ps is unavailable; cannot prove the verify command left no live process behind'
+              exit 1
+            fi
+
+            # ---------- 验证命令归哪个用户跑 ----------
+            # 下一步那份写权限令牌挂在它那一步的进程环境里，而 Linux 按 uid 放行
+            # /proc/<pid>/environ：只要验证命令跟我们同一个用户，它留下的任何活进程都
+            # 读得回那份环境，于是下面那道「按 uid 清点」是唯一拦着它的东西（MEL-255）。
+            # 把验证命令整个挪到一个专用的无权限账号下跑，这个前提就没了：uid 不一样，
+            # /proc 不放行；「同一个用户名下谁都能请服务管理器代跑」那一整类
+            # （systemd-run --user / crontab / at，MEL-288 第一版放行判据就是被这个绕过的）
+            # 也一起失效 —— 账号是我们现建的，名下没有基线进程、没有按需服务，连自己的
+            # 服务管理器都没有（sudo 不建 logind 会话，2026-10-02 在 ubuntu-latest 上实测：
+            # 跑完 `ps -U` 空，`loginctl` 无会话）。那时候这道清点连载荷都没有。
+            # 备不成就回退到「跟我们同一个用户」那条路，**不红**：这一步 fail closed 会把
+            # 19 个调用方仓库一起卡死，而回退回去的正是今天在跑的那条路（指纹、树、ref
+            # 快照、按 uid 清点一道没少）。MEL-288 就是 fail closed 卡住的。只有「验证
+            # 跑完之后的判定」才红。
+            verify_ws="${GITHUB_WORKSPACE:-$PWD}"
+            verify_user=''
+            verify_sandbox=''
+            verify_uid="$(id -u)"
+            # 专用账号的名字写死，不收调用方的输入：换个名字等于换一个「名下可能已经
+            # 有进程」的账号，而这正是下面要证明不成立的那件事。
+            verify_account=ghwf-verify
+            # 提权只认免密 sudo。没有它（自建 runner / 容器）就回退 —— 这条判定必须
+            # 走过滤之后的 PATH：写得动的目录里放一个假 sudo，这一整段就是它说了算。
+            as_root() { sudo -n "$@"; }
+            separate_the_verify_user() {
+              local uid group sandbox
+              command -v sudo >/dev/null 2>&1 || return 1
+              as_root true >/dev/null 2>&1 || return 1
+              # 同一个 job 里两条路各跑一次验证，第二次复用同一个账号。
+              id -u "$verify_account" >/dev/null 2>&1 ||
+                as_root useradd --system --no-create-home --shell /usr/sbin/nologin \
+                  "$verify_account" >/dev/null 2>&1 ||
+                return 1
+              uid="$(id -u "$verify_account" 2>/dev/null)" || return 1
+              case "$uid" in ''|0|*[!0-9]*) return 1 ;; esac
+              # 现在就得是空的。名下已经有活进程（自建 runner 上账号跨 job 留着）说明
+              # 有人已经在等，那就回退，别带着一份解释不清的基线往下走。
+              [ -z "$(ps -U "$uid" -o pid= 2>/dev/null)" ] || return 1
+              # 工作区归属：它要写得动 .venv / node_modules，而我们回头还要 git add -u、
+              # 下一轮交接前还要 git clean -fdx 删得掉它造出来的目录。所有权一个字不改，
+              # 走组权限：工作区整个 g+w、目录全部 setgid（它新建的文件和目录跟着继承
+              # 工作区那个组），账号加进那个组，启动前再把 umask 放宽到 002。
+              # 加进那个组顺带解决「进得去」：hosted runner 上工作区在 /home/runner 底下，
+              # 那一级是 0750 runner:runner，组外的用户连 cd 都进不去。代价是它能读到
+              # 那个组读得到的东西（实测 hosted runner 的 /home/runner 下没有 runner 自己
+              # 的凭据文件；令牌从来不落盘，只在带凭据那一步的进程环境里）。
+              # shellcheck disable=SC2012  # 要的只是目录自己那一行的第 4 列（组名），
+              # 路径是工作区、不是通配结果；stat 的格式串 GNU 和 BSD 不一样（本机跑测试
+              # 的 macOS 是 BSD），ls -ld | awk 两边都是同一列，同上面的 file_ident。
+              group="$(ls -ld "$verify_ws" | awk '{ print $4 }')"
+              [ -n "$group" ] || return 1
+              as_root usermod -aG "$group" "$verify_account" >/dev/null 2>&1 || return 1
+              as_root chmod -R g+w "$verify_ws" >/dev/null 2>&1 || return 1
+              as_root find "$verify_ws" -type d -exec chmod g+s {} + >/dev/null 2>&1 || return 1
+              # 它自己的 HOME / 缓存 / 临时目录。runner 那个用户的 $HOME（0750）和
+              # $RUNNER_TEMP（0755）它一个字节都写不动，所以凡是指向那里的变量都要换成
+              # 沙箱里的 —— 缓存因此是冷的，这是本票预告过的代价。
+              # 沙箱开在 $RUNNER_TEMP 底下（job 收尾 runner 自己清掉）、整个 chown 给它：
+              # $RUNNER_TEMP 本身它照旧写不动，所以我们放在那儿的空钩子目录和临时索引
+              # 它碰不到（mktemp -d 是 0700，而且属于我们）——「它能改写我们给 git 备的
+              # 那份空设置」那一类（MEL-256）在这条路上从结构上就没有了。
+              sandbox="$(mktemp -d "$RUNNER_TEMP/verify-user-XXXXXX")" || return 1
+              mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cache" "$sandbox/run" \
+                       "$sandbox/decoy" || return 1
+              # 它那一侧的 git 要认这个工作区：目录所有者还是我们，另一个用户跑 git
+              # 默认判 dubious ownership 直接拒。这份配置在它自己的 HOME 里，它改得动
+              # 也只伤得到自己 —— 我们这头每一条 git 都走 sealed_git，全局和系统两个
+              # 作用域指到 /dev/null。
+              printf '[safe]\n\tdirectory = *\n' >"$sandbox/home/.gitconfig" || return 1
+              as_root chown -R "$uid" "$sandbox" || return 1
+              # 正面自测，三条：真以它的身份跑起来了（顺带证明这台机器的 sudoers 给
+              # -E 放行，不然下面那条启动会当场失败、而那时候回退已经来不及）、它写得动
+              # 工作区、它那一侧的 git 认这个仓库。自建 runner / 容器里目录归属千奇百怪，
+              # 猜不如试 —— 证不出来就回退，别等被审 PR 的命令跑到一半才发现写不进去。
+              [ "$(as_root -E -u "$verify_account" id -u 2>/dev/null)" = "$uid" ] || return 1
+              as_root -E -u "$verify_account" test -w "$verify_ws" >/dev/null 2>&1 || return 1
+              as_root -E -u "$verify_account" env HOME="$sandbox/home" \
+                git -C "$verify_ws" rev-parse --git-dir >/dev/null 2>&1 || return 1
+              verify_user="$verify_account"
+              verify_sandbox="$sandbox"
+              verify_uid="$uid"
+            }
+            # 调用方关掉是明说的，和「这台机器做不到」要分开报：前者不该每轮刷一条
+            # warning，后者必须刷 —— 它是「少了一层防线」的唯一可见信号。
+            if [ "${VERIFY_ISOLATION:-auto}" = off ]; then
+              echo '- verification: ran as the runner user (verify_isolation: off)' \
+                >>"$GITHUB_STEP_SUMMARY"
+            elif ! separate_the_verify_user; then
+              echo "::warning::this runner cannot run the verify command as a dedicated account; falling back to the runner user, where the leftover-process sweep is what keeps the credentials away from it"
+              echo '- verification: ran as the runner user (no dedicated account available here)' \
+                >>"$GITHUB_STEP_SUMMARY"
+            fi
+
             # 先入暂存区再验证：验证会造出 .venv / node_modules / __pycache__，
             # 验证后才 add 就可能把它们一起提交（仓库没写 .gitignore 时必然发生）。
             # 暂存区在验证前就定死 = 提交的正好是这一轮的 fixer 改出来的那些文件。
@@ -279,7 +390,11 @@ jobs:
             # CODEX_TRIGGER_TOKEN。两道：子进程先拿到一组废纸篓文件；跑完再把真文件
             # 清空，这样就算它从 /proc/$PPID/environ 摸回真路径写了东西，runner 在
             # step 收尾时读到的也是空文件（最后写的是我们）。
+            # 分离出去的时候这几个废纸篓文件要归它写：调用方仓库的验证命令里
+            # `echo >>"$GITHUB_ENV"` 很常见，写不进去就是一次无谓的失败。沙箱那个目录
+            # 在上面已经整个 chown 给它了，所以这里只是挑一个落点。
             decoy="$RUNNER_TEMP/verify-decoy-$$"
+            [ -z "$verify_sandbox" ] || decoy="$verify_sandbox/decoy"
             mkdir -p "$decoy"
 
             # 验证命令对工作副本有写权限，所以它能往 .git 里种「后面某一步会去跑」的
@@ -415,7 +530,8 @@ jobs:
             # 跑完之后反复清点，直到某一刻这个用户名下除了基线里那些、以及我们自己的
             # 后代之外一个都不剩 —— 那一刻就是正面证据（真有哪一刻空了它就再也回不来：
             # 没有任何进程能把它拉起来）。一直不空就红着停下。
-            verify_uid="$(id -u)"
+            # 清点哪个 uid 由上面那段决定：分离成功就是那个专用账号（名下本来一个进程
+            # 都没有），回退了就还是我们自己这个用户。
 
             # 一个进程落在哪一棵 cgroup 里。只在红着停下的时候用来报信（这一条残留是
             # 「又一个没预热到的按需服务」还是「真逃出去的后代」），不参与任何放不放行
@@ -479,8 +595,9 @@ jobs:
             # 方向，看得见、好诊断（红的时候每条残留的 cgroup 会一起报出来，落在
             # /user.slice/…/user@<uid>.service/ 下面的就是没预热到的那一类）；放行判据
             # 被绕过是**安全**的失败方向，看不见。宁可要前者。
-            # 要把「同一个用户下谁都能请服务管理器代跑」这一整类清零，只能把验证命令挪到
-            # 另一个用户下跑 —— MEL-289。
+            # 「同一个用户下谁都能请服务管理器代跑」这一整类，现在由「换一个专用账号跑
+            # 验证」从根上清零（MEL-289，见上面那段）：下面这些只在那条路走不通、退回到
+            # 同一个用户时才用得上。
             prewarm_socket_activated_services() {
               command -v systemctl >/dev/null 2>&1 || return 0
               local sockets socket services service
@@ -501,10 +618,17 @@ jobs:
               done <<<"$sockets"
               return 0
             }
-            prewarm_socket_activated_services || true
+            # 只有回退到「同一个用户」那条路才需要预热：专用账号没有自己的那一份
+            # systemd，也没有任何按需服务会在它名下被激活（它名下本来就是空的）。
+            # 这一段连同它那份脆性（镜像以后多一个按需服务就再红一次）于是只留在回退
+            # 路径上，分离成功的那条路上不存在。
+            [ -n "$verify_user" ] || prewarm_socket_activated_services || true
 
             # 清点不出来就等于这一道什么都没做 —— 静默的 no-op 比没有更糟，红着停下。
-            if [ -z "$(user_procs)" ]; then
+            # 分离出去之后反过来：那个账号名下**本来就该是空的**（上面已经证明过一次），
+            # 所以「空」不是清点坏了，正是我们要的基线。`ps` 本身好不好使在跑验证之前
+            # 就单独判过了。
+            if [ -z "$verify_user" ] && [ -z "$(user_procs)" ]; then
               echo '::error::cannot list this user'"'"'s processes; cannot prove the verify command leaves nothing alive'
               exit 1
             fi
@@ -517,13 +641,45 @@ jobs:
             # 自己退出 —— 指纹和废纸篓文件都不杀进程，那个进程活到下一步导出 GH_TOKEN
             # 的时候，同一个用户，轮询就能把钥匙捞走。
             # stdin 接 /dev/null：后台进程组读终端会吃 SIGTTIN 停住。
+            # 两条路只差「谁来跑」这一件事，所以写成一个函数：下面那一串 env 两边一字
+            # 不差，不留第二份 —— 「两份逐行副本，改一份忘了另一份」是 MEL-254 已经
+            # 吃过的亏。
+            launch_the_verify_command() {
+              if [ -z "$verify_user" ]; then
+                env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
+                    GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
+                    PATH="$verify_path" \
+                    bash -euo pipefail -c "$VERIFY"
+                return
+              fi
+              # -E 留着整份环境：这一步的 env: 里一个凭据都没有（MEL-254 的前提），而
+              # 调用方仓库的测试套件照旧读得到 CI / GITHUB_* 那一堆。只有指向 runner
+              # 那个用户私有目录的几个（HOME、XDG_*、uv / npm 的缓存）换成沙箱里的 ——
+              # 漏一个的长相是「权限不够」当场失败，不是静默跑在我们的目录上。
+              as_root -E -u "$verify_user" \
+                env HOME="$verify_sandbox/home" TMPDIR="$verify_sandbox/tmp" \
+                    XDG_CACHE_HOME="$verify_sandbox/cache" \
+                    XDG_CONFIG_HOME="$verify_sandbox/home/.config" \
+                    XDG_DATA_HOME="$verify_sandbox/home/.local/share" \
+                    XDG_STATE_HOME="$verify_sandbox/home/.local/state" \
+                    XDG_RUNTIME_DIR="$verify_sandbox/run" \
+                    UV_CACHE_DIR="$verify_sandbox/cache/uv" \
+                    npm_config_cache="$verify_sandbox/cache/npm" \
+                    GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
+                    GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
+                    PATH="$verify_path" \
+                    bash -euo pipefail -c "$VERIFY"
+            }
+            # 它造出来的文件和目录，我们回头也要写得动（验证跑完那次 add -u、下一轮交接
+            # 前的 git clean -fdx）。目录 setgid 让组跟着工作区，umask 002 让那个组写得动；
+            # 子进程继承 umask，所以在这儿放宽、启动完立刻收回去。回退路径一个字不改。
+            saved_umask="$(umask)"
+            [ -z "$verify_user" ] || umask 002
             set -m
-            env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
-                GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
-                PATH="$verify_path" \
-                bash -euo pipefail -c "$VERIFY" </dev/null &
+            launch_the_verify_command </dev/null &
             verify_pgid=$!
             set +m
+            umask "$saved_umask"
             verify_status=0
             wait "$verify_pgid" || verify_status=$?
 
@@ -537,13 +693,19 @@ jobs:
                 awk -v g="$verify_pgid" '$1 == g && $3 !~ /^Z/ { print $2 }'
             }
 
+            # 另一个用户名下的进程我们自己 kill 不动（EPERM，实测），得借 sudo 送信号。
+            # 回退路径照旧直接 kill。
+            verify_kill() {
+              if [ -z "$verify_user" ]; then kill "$@"; else as_root kill "$@"; fi
+            }
+
             # 先礼后兵：TERM 收不掉的（trap '' TERM 就能扛住）再 KILL。收干净之前
             # 不许往下走 —— 下面每一个判定都以「验证已经不在了」为前提。
             reap_verify_group() {
               local sig waited
               for sig in TERM KILL; do
                 [ -n "$(verify_survivors)" ] || return 0
-                kill -"$sig" -- "-$verify_pgid" 2>/dev/null || true
+                verify_kill -"$sig" -- "-$verify_pgid" 2>/dev/null || true
                 waited=0
                 while [ "$waited" -lt 20 ] && [ -n "$(verify_survivors)" ]; do
                   sleep 0.1
@@ -552,12 +714,6 @@ jobs:
               done
               [ -z "$(verify_survivors)" ]
             }
-
-            # ps 用不了就等于这一道什么都没做 —— 静默的 no-op 比没有更糟，所以红着停下。
-            if ! ps -p "$$" >/dev/null 2>&1; then
-              echo '::error::ps is unavailable; cannot prove the verify command left no live process behind'
-              exit 1
-            fi
 
             if ! reap_verify_group; then
               echo '- verification: **rejected**, it left a process running' >>"$GITHUB_STEP_SUMMARY"
@@ -637,8 +793,8 @@ jobs:
 
             if ! verify_tree_is_contained; then
               echo '- verification: **rejected**, a process it started outlived it' >>"$GITHUB_STEP_SUMMARY"
-              echo "::error::a process owned by this runner user outlived the verify command ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); refusing to trust the post-verify tree"
-              echo "::error::nothing is exempt from this gate; each leftover's cgroup, to tell an on-demand service the pre-warm missed from a real escapee: $(leftover_origins | tr '\n' ';')"
+              echo "::error::a process owned by uid $verify_uid (the user the verify command ran as${verify_user:+, the dedicated account $verify_user}) outlived the verify command ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); refusing to trust the post-verify tree"
+              echo "::error::nothing is exempt from this gate; each leftover's cgroup, to tell an on-demand service the pre-warm missed (runner-user path only) from a real escapee: $(leftover_origins | tr '\n' ';')"
               exit 1
             fi
 
@@ -1031,8 +1187,20 @@ jobs:
           VERIFY_OVERRIDE: ${{ inputs.verify_cmd }}
           CLAUDE_MODEL: ${{ inputs.claude_model }}
           CLAUDE_EFFORT: ${{ inputs.claude_effort }}
+          VERIFY_ISOLATION: ${{ inputs.verify_isolation }}
         run: |
           set -euo pipefail
+
+          # 拼错的开关值当场红，别静默降级：`of`、`false`、`no` 都会被验证那一步当成
+          # 「不是 auto」= 留在 runner 用户下跑，而那是**少一层**防线，静默少一层正是
+          # 这个仓库最怕的那种失败（同模型 / 力度那两条白名单）。
+          case "$VERIFY_ISOLATION" in
+            auto|off) ;;
+            *)
+              echo "::error::verify_isolation '$VERIFY_ISOLATION' is not one of auto, off"
+              exit 1
+              ;;
+          esac
 
           # 模型和思考力度先验：拼错直接红，不让 Claude 那一步带着错值跑掉一轮再被当成
           # 「没跑成」告警。模型是白名单不是黑名单：default、opusplan 这类别名名字里没有
@@ -1172,6 +1340,8 @@ jobs:
           # 的前提；一旦改成从 PR 内容里读（仓库里的某个清单文件、PR 正文……），
           # 攻击者就自己给自己发通行证了。
           VERIFY_WRITABLE_PATHS: ${{ inputs.verify_writable_paths }}
+          # 同理，「验证命令归哪个用户跑」也只能来自调用方默认分支上的这个文件。
+          VERIFY_ISOLATION: ${{ inputs.verify_isolation }}
         run: |
           set -euo pipefail
 
@@ -1197,8 +1367,9 @@ jobs:
       # steps.claude_verify 的输出把门；那一步红了，这一步压根不会开始。
       # 上一版的验收记录写成「躲开之后它找不到任何可轮询的凭据」，那句话是错的：
       # 凭据只是从文件挪进了进程环境，仍然有地方可以等。正确的说法是「不许有人等」。
-      # 想让 environ 连同一个用户也读不到，只有把验证命令换到另一个用户 / 容器里跑
-      # （代价见 README），本轮没做。
+      # 现在还多一层：验证那一步默认把被审 PR 的命令挪到一个专用账号下跑（MEL-289），
+      # uid 不一样，/proc 压根不放行 —— 这一步的进程环境它连读的资格都没有。那个账号
+      # 建不起来的 runner 上回退到同一个用户，于是上面那段仍然是回退路径的全部依据。
       - name: Commit and push the Claude fix
         id: claude_push
         if: steps.claude_verify.outputs.changed == 'true'
@@ -1808,6 +1979,8 @@ jobs:
           # 的前提；一旦改成从 PR 内容里读（仓库里的某个清单文件、PR 正文……），
           # 攻击者就自己给自己发通行证了。
           VERIFY_WRITABLE_PATHS: ${{ inputs.verify_writable_paths }}
+          # 同理，「验证命令归哪个用户跑」也只能来自调用方默认分支上的这个文件。
+          VERIFY_ISOLATION: ${{ inputs.verify_isolation }}
         run: |
           set -euo pipefail
 
@@ -1833,8 +2006,9 @@ jobs:
       # steps.codex_verify 的输出把门；那一步红了，这一步压根不会开始。
       # 上一版的验收记录写成「躲开之后它找不到任何可轮询的凭据」，那句话是错的：
       # 凭据只是从文件挪进了进程环境，仍然有地方可以等。正确的说法是「不许有人等」。
-      # 想让 environ 连同一个用户也读不到，只有把验证命令换到另一个用户 / 容器里跑
-      # （代价见 README），本轮没做。
+      # 现在还多一层：验证那一步默认把被审 PR 的命令挪到一个专用账号下跑（MEL-289），
+      # uid 不一样，/proc 压根不放行 —— 这一步的进程环境它连读的资格都没有。那个账号
+      # 建不起来的 runner 上回退到同一个用户，于是上面那段仍然是回退路径的全部依据。
       - name: Commit and push the Codex fix
         id: codex_push
         if: steps.codex_verify.outputs.changed == 'true'

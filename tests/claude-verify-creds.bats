@@ -324,6 +324,124 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
 }
 
+# ---------- 验证命令跑在哪个用户下（MEL-289） ----------
+
+# 回退路径。bats 自己那个临时目录是 0700，另一个用户连进都进不去，所以不管这台机器
+# 有没有免密 sudo，上面那三条自测必然失败 —— 这一条于是在哪儿跑都是回退路径。
+# 判据问的是验证命令自己（它报出来的用户名就是我们），不是「日志里有没有那句警告」：
+# 静默分离失败和静默不分离长得一模一样，只有问它才分得出。
+# fail closed 不是选项：这一步红了，19 个调用方仓库一起推不出修复（MEL-288 的教训）。
+@test "claude: a runner that cannot build the dedicated account falls back and still pushes" {
+  push_workspace 'id -un >ran-as.txt'
+
+  run_chain
+
+  assert_equal "$status" 0
+  assert_contains "$output" 'falling back to the runner user'
+  assert_equal "$(cat ran-as.txt)" "$(id -un)"
+  assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by claude'
+}
+
+# 逃生阀：哪个仓库的验证命令真离不开 runner 那个用户的 $HOME / 缓存 / 工作区归属，
+# 调用桩里写 verify_isolation: off 就留在原地跑，而且不刷那条「这台机器做不到」的
+# 警告 —— 那条警告要留给真·少了一层防线的情况。
+@test "claude: verify_isolation off keeps the verify command on the runner user" {
+  export VERIFY_ISOLATION=off
+  push_workspace 'id -un >ran-as.txt'
+
+  run_chain
+
+  assert_equal "$status" 0
+  assert_equal "$(cat ran-as.txt)" "$(id -un)"
+  refute_contains "$output" 'cannot run the verify command as a dedicated account'
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" 'verify_isolation: off'
+}
+
+# 开关只从调用方默认分支上的工作流文件来（同 verify_writable_paths）：被审 PR 改不到
+# 它。拼错当场红 —— `of` / `false` / `no` 被当成「不是 off」就还是 auto，反过来
+# 静默少一层防线才是这里最怕的（同模型 / 力度那两条白名单）。
+@test "claude: the dedicated-account switch comes from the caller's workflow file only" {
+  for step in 'Verify the Claude fix' 'Verify the Codex fix'; do
+    assert_contains "$(step_env_keys "$WF" "$step")" 'VERIFY_ISOLATION'
+  done
+  # shellcheck disable=SC2016  # 找的就是字面量 ${{
+  assert_contains "$(cat "$REPO_ROOT/$WF")" 'VERIFY_ISOLATION: ${{ inputs.verify_isolation }}'
+
+  export RUNTIME=shell VERIFY_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh
+  export VERIFY_ISOLATION=sometimes
+  run run_block "$WF" "Resolve runtime defaults"
+  assert_equal "$status" 1
+  assert_contains "$output" 'is not one of auto, off'
+}
+
+# ---------- 真的换了一个用户（只有 Linux runner 上跑得到） ----------
+
+# 工作区和 $RUNNER_TEMP 都搬到「另一个用户走得进去」的地方：bats 给的那个 0700 目录
+# 下面，三条自测必然失败、必然回退（上面第一条测的就是那个），分离路径一个字都跑不到。
+separated_workspace() { # separated_workspace <verify script>
+  command -v useradd >/dev/null 2>&1 ||
+    skip 'no useradd here; the dedicated account only exists on Linux runners'
+  sudo -n true >/dev/null 2>&1 ||
+    skip 'no passwordless sudo here; the dedicated account needs it'
+  SEP_ROOT="$(mktemp -d /tmp/mel289-sep-XXXXXX)"
+  chmod 0711 "$SEP_ROOT"
+  export RUNNER_TEMP="$SEP_ROOT/runner-temp"
+  export GITHUB_WORKSPACE="$SEP_ROOT/work"
+  mkdir -p "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+  cd "$GITHUB_WORKSPACE" || return 1
+  push_workspace "$1"
+}
+
+# 逃出去的进程我们自己 kill 不动，收尾也得借 sudo。
+reap_separated_account() {
+  sudo -n pkill -U ghwf-verify >/dev/null 2>&1 || true
+}
+
+# 本票的那条性质，正面证明：验证命令跑在另一个 uid 下，连「同一个用户」这个读
+# /proc/<pid>/environ 的资格都没有了 —— 它去读我们这一步的进程环境被内核当场拒掉。
+# 回退路径上它读得到（只是那份环境里没有令牌，MEL-254），所以这一条是分离路径独有的。
+# 顺带钉住那两件最容易做坏的事：它照旧写得动工作区（.venv / 锁文件），而它造出来的
+# 目录我们回头删得掉（下一轮交接前要 git clean -fdx）。
+@test "claude: the verify command runs as a dedicated account that cannot read our environ" {
+  export VERIFY_WRITABLE_PATHS=deps.lock
+  separated_workspace 'id -un >ran-as.txt
+if cat "/proc/$PPID/environ" >environ-read.txt 2>environ-err.txt; then echo yes; else echo no; fi >environ-verdict.txt
+if sudo -n true 2>/dev/null; then echo yes; else echo no; fi >sudo-verdict.txt
+mkdir -p .venv && printf x >.venv/marker
+printf "lock v2\n" >deps.lock'
+
+  run verify_and_push
+  reap_separated_account
+
+  assert_equal "$status" 0
+  assert_equal "$(cat ran-as.txt)" 'ghwf-verify'
+  assert_equal "$(cat environ-verdict.txt)" 'no'
+  assert_contains "$(cat environ-err.txt)" 'Permission denied'
+  # 这个账号不在 sudoers 里，所以「验证命令真要动 sudo 就能绕过上面这一整串」那一条
+  # （README 里那句）在这条路上不成立
+  assert_equal "$(cat sudo-verdict.txt)" 'no'
+  assert_equal "$(git show origin/topic:deps.lock)" 'lock v2'
+  # 它造出来的目录归属对不对，只有真删一次才知道
+  git clean -qfdx
+  [ ! -e .venv ] || { echo '.venv outlived git clean: the ownership grant is wrong' >&2; return 1; }
+}
+
+# 换了用户之后按 uid 清点仍然是那道正面证据，而且这一次基线本来就是空的：setsid
+# 躲出进程组照样露出来。顺带钉住「我们 kill 不动另一个用户的进程」那条坑 —— 收尾
+# 要借 sudo，不借的话这一条会卡在「收不干净」而不是「清点抓到」。
+@test "claude: a setsid escapee under the dedicated account still stops the round" {
+  separated_workspace 'setsid sleep 30 >/dev/null 2>&1 &
+echo "$!" >escaped.pid'
+
+  run run_step "$WF" "Verify the Claude fix"
+  reap_separated_account
+
+  [ "$status" -ne 0 ]
+  assert_contains "$output" 'outlived the verify command'
+  assert_contains "$output" 'ghwf-verify'
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
 # ---------- 两条路共用同一段正文 ----------
 
 # MEL-262 的那条不变量：验证和推送各只有一份正文，两条路都跑它，差别只有 $FIXER
