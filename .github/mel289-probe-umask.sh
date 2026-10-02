@@ -155,11 +155,9 @@ FIXER=Claude VERIFY="$PROBE_VERIFY" VERIFY_WRITABLE_PATHS='' VERIFY_ISOLATION=au
   run_block "$FIXED" 'Verify the Claude fix' 2>&1 | tee "$RUNNER_TEMP/roundB.out"
 b_status=${PIPESTATUS[0]}
 printf 'verify exit=%s\n' "$b_status"
-printf 'marker this run left behind: [%s]\n' \
-  "$(sudo -n ls -ldn /run/ghwf-verify 2>/dev/null)"
-printf 'marker file: [%s] content=[%s]\n' \
-  "$(sudo -n ls -1 /run/ghwf-verify 2>/dev/null | tr '\n' ' ')" \
-  "$(sudo -n cat "/run/ghwf-verify/$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" 2>/dev/null)"
+MARK="/run/ghwf-verify.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+printf 'marker this run left behind: [%s]\n' "$(sudo -n ls -ldn "$MARK" 2>/dev/null)"
+printf 'marker content (should be the account uid): [%s]\n' "$(sudo -n cat "$MARK" 2>/dev/null)"
 report_round B
 cd "$SRC" || exit 1
 
