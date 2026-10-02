@@ -28,10 +28,10 @@ fail() {
   exit 1
 }
 
-[ -n "$reply" ] && [ -n "$patch_out" ] || {
+if [ -z "$reply" ] || [ -z "$patch_out" ]; then
   echo 'usage: extract-codex-patch.sh <reply-file> <patch-out-file>' >&2
   exit 2
-}
+fi
 [ -r "$reply" ] || fail no-diff
 
 # 围栏代码块按 CommonMark 数：行首最多 3 个空格，3 个以上的 ` 或 ~，收尾围栏
