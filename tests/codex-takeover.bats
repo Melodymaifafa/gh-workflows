@@ -1039,6 +1039,229 @@ EOS
   [ "$contained" -lt "$passed" ] || { echo "containment proof at $contained is not before changed=true at $passed" >&2; return 1; }
 }
 
+# ---------- 按需拉起来的服务进基线，清点那一边一点不放宽 ----------
+#
+# 上面那一道按运行用户正面清点，连「验证命令跑的时候才被按需拉起来的系统服务」一起记一
+# 笔：2026-10-02 的实跑就红在 dbus 的会话总线上（MEL-288）—— 补丁改对了、360 条测试全绿、
+# lint 干净，最后一步照样红着停下，什么都没推出去。两条路共用这一段正文，所以那之后任何
+# 仓库的任何一轮自动修复都推不出去。
+#
+# 第一版的修法是给清点开一个口子：「systemd 照一份我们写不动的 unit 文件启动的」就放过。
+# 审核当天找到两条满足这个口子的路，两条都能让任意载荷活着通过。所以这一版不开口子：拍
+# 基线之前先把按需服务拉起来，让它们正正经经进基线，清点判据一个字不改。下面四条钉住它
+# —— 正面（误判解除）、两条绕法各一条反面、再加一条到处都跑的源码级。
+#
+# 这几条自己也跑在这道门里面（一轮自动修复的验证命令就是 bats tests/）：**停掉的服务必须
+# 保证不会再被拉起来**，否则后面某一条测试里嵌套的预热会把它重新启动，而那个新 pid 不在
+# 最外层那次清点的基线里 —— 外层当场红。所以正面那条用自己造的探针 unit，反面那条收尾时
+# 连「会把它重新拉起来的 socket」一起停掉。
+
+# 探针 unit 收尾。写出 unit 文件之后的每一条出口都得走到这儿 —— 包括中途 skip 的那几条，
+# 不然 ~/.config/systemd/user/mel288probe.* 和一个活着的 socket 会留在人家机器上（Codex 在
+# PR #29 上标的 P2）。bats 的 teardown 在 skip 之后照样跑，所以挂在这里最稳。
+drop_probe_units() {
+  local ud="$HOME/.config/systemd/user"
+  systemctl --user stop mel288probe.service mel288probe.socket >/dev/null 2>&1 || true
+  unlink "$ud/mel288probe.socket" 2>/dev/null || true
+  unlink "$ud/mel288probe.service" 2>/dev/null || true
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+}
+
+teardown() {
+  [ -z "${MEL288_PROBE_UNITS:-}" ] || drop_probe_units
+}
+
+# 两条反面测试种出来的那个载荷：收掉它，别让它活到后面几条测试里去。
+# pid 为 0 / 1 / 空的时候绝不 kill —— kill 0 会打到我们自己这一整个进程组。
+reap_planted_pid() {
+  local pid
+  pid="$(cat "$BATS_TEST_TMPDIR/leftover.pid" 2>/dev/null || true)"
+  case "$pid" in ''|0|1) return 0 ;; *[!0-9]*) return 0 ;; esac
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+# 机器上「由某个正在监听的 socket 按需拉起来、而且定义文件落在我们写不动的 /usr 下面」的
+# 那几个 service —— 第一版判据正是按这一类放行的，所以反面一就从这里面挑一个来劫持。
+# 会话总线排在最后：挑得到别的就别动它。
+packaged_user_services() {
+  local socket unit
+  systemctl --user list-units --type=socket --state=active --no-legend --plain 2>/dev/null |
+    awk '{ print $1 }' |
+    while IFS= read -r socket; do
+      [ -n "$socket" ] || continue
+      systemctl --user show -p Triggers --value "$socket" 2>/dev/null | tr ' ' '\n'
+    done |
+    sort -u |
+    while IFS= read -r unit; do
+      case "$unit" in *.service) ;; *) continue ;; esac
+      case "$(systemctl --user show -p FragmentPath --value "$unit" 2>/dev/null || true)" in
+        /usr/*) ;; *) continue ;;
+      esac
+      case "$unit" in dbus*) printf '9 %s\n' "$unit" ;; *) printf '1 %s\n' "$unit" ;; esac
+    done | sort | cut -d' ' -f2
+}
+
+# 反面测试收尾：把验证命令碰过的每一个 unit，连同所有会把它重新拉起来的 socket 一起停掉。
+# 留着停不住的 socket，后面某一条测试里嵌套的预热就会把它重新启动，那个新 pid 会把最外层
+# 那次清点弄红。
+settle_touched_units() {
+  local unit trigger
+  [ -r "$BATS_TEST_TMPDIR/touched.units" ] || return 0
+  while IFS= read -r unit; do
+    [ -n "$unit" ] || continue
+    unlink "$HOME/.config/systemd/user/$unit.d/mel288-substitution.conf" 2>/dev/null || true
+    for trigger in $(systemctl --user show -p TriggeredBy --value "$unit" 2>/dev/null || true); do
+      systemctl --user stop "$trigger" >/dev/null 2>&1 || true
+    done
+    systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  done <"$BATS_TEST_TMPDIR/touched.units"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+}
+
+# 正面：一个按需服务在验证命令跑的时候才被拉起来，这一轮照旧走完。
+# 用自己造的一对 socket + service 当探针，不碰机器上任何一个真服务。探针服务在跑之前是
+# 停着的 —— 所以它只可能是「拍基线之前的预热」把它放进基线的。没有预热，验证命令那句
+# start 起出来的进程就不在基线里，这一条就是 2026-10-02 那次生产失败本身。
+@test "takeover: a service the verify command pulls up on demand does not stop the chain" {
+  command -v systemctl >/dev/null 2>&1 || skip 'no systemctl here; nothing gets socket-activated'
+  local ud="$HOME/.config/systemd/user" came_up=1
+  mkdir -p "$ud"
+  # 从这一行起，teardown 负责把探针收干净 —— 下面每一条 skip 之后它照样跑
+  MEL288_PROBE_UNITS=1
+  printf '[Unit]\nDescription=MEL-288 probe socket\n[Socket]\nListenStream=%%t/mel288probe.sock\n' \
+    >"$ud/mel288probe.socket"
+  printf '[Unit]\nDescription=MEL-288 probe service\n[Service]\nType=simple\nExecStart=/bin/sleep 300\n' \
+    >"$ud/mel288probe.service"
+  systemctl --user daemon-reload >/dev/null 2>&1 || skip 'systemctl --user does not work here'
+  systemctl --user start mel288probe.socket >/dev/null 2>&1 ||
+    skip 'cannot bring up a probe socket unit here'
+  ! systemctl --user is-active --quiet mel288probe.service ||
+    skip 'the probe service is already running; the baseline would hold it either way'
+
+  push_workspace 'systemctl --user start mel288probe.service'
+
+  run_chain_trusted_push
+
+  systemctl --user is-active --quiet mel288probe.service || came_up=0
+
+  # 服务真的起来过，否则下面的断言什么都没证明
+  [ "$came_up" = 1 ] ||
+    { echo 'the probe service never came up; this test proved nothing' >&2; return 1; }
+  refute_contains "$output" 'outlived the verify command'
+  assert_equal "$status" 0
+  assert_equal "$(step_output pushed)" true
+}
+
+# 反面一（Codex 在 PR #29 上留的 P1）：验证命令往一个打包好的 unit 下塞一份覆盖 ExecStart
+# 的 drop-in，把载荷以那个 unit 的身份跑起来，再把 drop-in 删掉、daemon-reload 一次 ——
+# reload 不重启已经在跑的 unit，于是载荷活着，而事后查到的定义已经恢复干净：DropInPaths
+# 空、FragmentPath 指着 /usr/ 下那份我们写不动的文件。第一版判据会放行它。
+# 这一条不光断言「红了」，还把当时查到的那份定义一起捞出来断言它确实是干净的 —— 否则红得
+# 可能只是因为攻击压根没搭起来。
+@test "takeover: a payload started from a drop-in the verify command then deletes is still caught" {
+  # 这一条要真的把攻击搭起来：停掉机器上一个打包好的用户服务，而且不能再把它启动回来
+  # （新 pid 不在最外层那次清点的基线里）。在一次性的 runner 上这没代价，在谁的 Linux
+  # 桌面上跑就会把会话总线 / GPG / SSH agent 停在那儿。所以只在 CI 上跑。
+  [ -n "${CI:-}" ] || skip 'this one leaves packaged user services stopped; CI-only'
+  command -v systemctl >/dev/null 2>&1 || skip 'no systemctl here; no unit to hijack'
+  local units hijacked
+  units="$(packaged_user_services | tr '\n' ' ')"
+  [ -n "${units// /}" ] || skip 'no packaged user service to hijack here'
+
+  push_workspace "for u in $units; do
+      printf '%s\n' \"\$u\" >>'$BATS_TEST_TMPDIR/touched.units'
+      d=\"\$HOME/.config/systemd/user/\$u.d\"
+      mkdir -p \"\$d\"
+      printf '[Unit]\nRefuseManualStart=no\n[Service]\nType=simple\nExecStart=\nExecStart=/bin/sleep 300\n' >\"\$d/mel288-substitution.conf\"
+      systemctl --user daemon-reload || true
+      systemctl --user stop \"\$u\" >/dev/null 2>&1 || true
+      systemctl --user start \"\$u\" >/dev/null 2>&1 || true
+      pid=\"\$(systemctl --user show -p MainPID --value \"\$u\" 2>/dev/null || true)\"
+      unlink \"\$d/mel288-substitution.conf\" 2>/dev/null || true
+      systemctl --user daemon-reload || true
+      case \"\$pid\" in ''|0|1|*[!0-9]*) continue ;; esac
+      [ \"\$(cat \"/proc/\$pid/comm\" 2>/dev/null || true)\" = sleep ] || continue
+      printf '%s\n' \"\$pid\" >'$BATS_TEST_TMPDIR/leftover.pid'
+      printf '%s\n' \"\$u\" >'$BATS_TEST_TMPDIR/hijacked.unit'
+      systemctl --user show -p FragmentPath --value \"\$u\" >'$BATS_TEST_TMPDIR/hijacked.frag' || true
+      systemctl --user show -p DropInPaths --value \"\$u\" >'$BATS_TEST_TMPDIR/hijacked.dropins' || true
+      break
+    done
+    true"
+
+  run_chain
+  reap_planted_pid
+  settle_touched_units
+
+  hijacked="$(cat "$BATS_TEST_TMPDIR/hijacked.unit" 2>/dev/null || true)"
+  [ -n "$hijacked" ] || skip 'no packaged user unit would start a substituted payload here'
+  # 攻击真的搭起来了：载荷活着，而它所属 unit 此刻的定义看上去完全干净
+  echo "# hijacked $hijacked frag=$(cat "$BATS_TEST_TMPDIR/hijacked.frag") dropins=[$(cat "$BATS_TEST_TMPDIR/hijacked.dropins")]" >&3 || true
+  case "$(cat "$BATS_TEST_TMPDIR/hijacked.frag")" in
+    /usr/*) ;;
+    *) echo 'the hijacked unit is not a packaged one; this test proved nothing' >&2; return 1 ;;
+  esac
+  assert_equal "$(cat "$BATS_TEST_TMPDIR/hijacked.dropins")" ''
+  assert_equal "$status" 1
+  assert_contains "$output" 'outlived the verify command'
+  assert_contains "$output" "$(cat "$BATS_TEST_TMPDIR/leftover.pid")"
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+}
+
+# 反面二（审核独立找到的那条）：user@<uid>.service 那棵 cgroup 子树是委派给运行用户的，
+# 所以验证命令可以 mkdir 一个名字以 .service 结尾的 cgroup、把自己的 pid 写进去 —— 第一版
+# 按 cgroup 路径的最后一段认 unit 名，于是三条判据全都在替真正的 dbus.service 作答。
+# 伪造成不成功这一条都该红（这道门压根不拿 cgroup 做判断），所以伪造那几步是 best-effort；
+# pid 最后落到哪一棵 cgroup 里会打印出来，顺带把「委派子树到底可不可写」这件事探明。
+@test "takeover: a process the verify command hides in a cgroup it names itself is still caught" {
+  # 同上：它会在委派给本用户的 cgroup 子树里留下一个造出来的目录，别留在人家桌面上。
+  [ -n "${CI:-}" ] || skip 'this one leaves a forged cgroup behind; CI-only'
+  command -v systemd-run >/dev/null 2>&1 || skip 'no systemd-run here; nothing to launder through'
+  systemd-run --user --unit=mel288probe --collect /bin/true >/dev/null 2>&1 ||
+    skip 'systemd-run --user does not work here'
+
+  push_workspace "set -e
+    systemd-run --user --unit=mel288forged --collect /bin/sleep 300
+    pid=\"\$(systemctl --user show -p MainPID --value mel288forged.service)\"
+    printf '%s\n' \"\$pid\" >'$BATS_TEST_TMPDIR/leftover.pid'
+    own=\"\$(sed -n 's/^0:://p' \"/proc/\$pid/cgroup\")\"
+    forged=\"/sys/fs/cgroup\${own%/*}/dbus.service\"
+    mkdir -p \"\$forged\" 2>/dev/null || true
+    printf '%s\n' \"\$pid\" >\"\$forged/cgroup.procs\" 2>/dev/null || true
+    sed -n 's/^0:://p' \"/proc/\$pid/cgroup\" >'$BATS_TEST_TMPDIR/forged.cgroup' || true
+    true"
+
+  run_chain
+  systemctl --user stop mel288forged.service >/dev/null 2>&1 || true
+  reap_planted_pid
+
+  echo "# the laundered pid ended up in: $(cat "$BATS_TEST_TMPDIR/forged.cgroup" 2>/dev/null)" >&3 || true
+  assert_equal "$status" 1
+  assert_contains "$output" 'outlived the verify command'
+  assert_contains "$output" "$(cat "$BATS_TEST_TMPDIR/leftover.pid")"
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+}
+
+# 上面三条在没有 systemd 的机器上（本机 macOS）会跳过，钉不住。这一条直接钉源码，到处都跑：
+# 清点判据一个字没放宽，而预热排在拍基线之前 —— 排在后面的话，预热拉起来的服务照样不在
+# 基线里，等于白做。
+@test "takeover: the leftover gate exempts nothing, and the pre-warm runs before the baseline" {
+  local block prewarm baseline
+  block="$(fix_guard_body verify_the_fix)"
+  # 判据就是「不在基线里、也不是我们后代的」那一份，中间没有任何「可以放过」的夹层
+  assert_contains "$block" 'verify_leftovers="$(unexplained_procs)"'
+  refute_contains "$block" 'unexplained_leftovers'
+  refute_contains "$block" 'started_by_a_protected_unit'
+  # 预热拉不起来只是「基线少一个」，不许把整步弄红 —— 失败方向是照旧红着停下，不是放过
+  assert_contains "$block" 'prewarm_socket_activated_services || true'
+  prewarm="$(printf '%s\n' "$block" | grep -n '^prewarm_socket_activated_services || true$' | head -n 1 | cut -d: -f1)"
+  baseline="$(printf '%s\n' "$block" | grep -n '^verify_procs_baseline=' | head -n 1 | cut -d: -f1)"
+  [ -n "$prewarm" ] && [ -n "$baseline" ] ||
+    { echo 'pre-warm or baseline line is missing from the verify body' >&2; return 1; }
+  [ "$prewarm" -lt "$baseline" ] ||
+    { echo "pre-warm at $prewarm is not before the baseline snapshot at $baseline" >&2; return 1; }
+}
+
 # 结构那一半单独立得住：正常一轮跑完，写权限凭据也不回 .git/config —— 带凭据那一步
 # 自己用手上的令牌现造一份，只递给那一条 push。于是凭据在两步之间压根不存在，
 # 任何活着的进程盯着那个文件都等不到东西。
