@@ -33,4 +33,9 @@ jobs:
       # 这份清单只从调用方默认分支上的这个文件读，被审 PR 改不到它。
       # verify_writable_paths: |
       #   uv.lock
+      #
+      # 验证命令归谁跑：auto（默认，换一个专用的无权限账号，读不到我们的进程环境）、
+      # off（留在 runner 用户下）。缓存会变冷；验证命令真需要 runner 用户的 $HOME 或
+      # 工作区归属时才填 off。
+      # verify_isolation: auto
     secrets: inherit

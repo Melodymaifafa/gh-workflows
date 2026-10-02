@@ -324,6 +324,664 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
 }
 
+# ---------- 验证命令跑在哪个用户下（MEL-289） ----------
+
+# 回退路径。bats 自己那个临时目录是 0700，另一个用户连进都进不去，所以不管这台机器
+# 有没有免密 sudo，上面那三条自测必然失败 —— 这一条于是在哪儿跑都是回退路径。
+# 判据问的是验证命令自己（它报出来的用户名就是我们），不是「日志里有没有那句警告」：
+# 静默分离失败和静默不分离长得一模一样，只有问它才分得出。
+# fail closed 不是选项：这一步红了，19 个调用方仓库一起推不出修复（MEL-288 的教训）。
+@test "claude: a runner that cannot build the dedicated account falls back and still pushes" {
+  push_workspace 'id -un >ran-as.txt'
+
+  run_chain
+
+  assert_equal "$status" 0
+  assert_contains "$output" 'falling back to the runner user'
+  assert_equal "$(cat ran-as.txt)" "$(id -un)"
+  assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by claude'
+}
+
+# 逃生阀：哪个仓库的验证命令真离不开 runner 那个用户的 $HOME / 缓存 / 工作区归属，
+# 调用桩里写 verify_isolation: off 就留在原地跑，而且不刷那条「这台机器做不到」的
+# 警告 —— 那条警告要留给真·少了一层防线的情况。
+@test "claude: verify_isolation off keeps the verify command on the runner user" {
+  export VERIFY_ISOLATION=off
+  push_workspace 'id -un >ran-as.txt'
+
+  run_chain
+
+  assert_equal "$status" 0
+  assert_equal "$(cat ran-as.txt)" "$(id -un)"
+  refute_contains "$output" 'cannot run the verify command as a dedicated account'
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" 'verify_isolation: off'
+}
+
+# 开关只从调用方默认分支上的工作流文件来（同 verify_writable_paths）：被审 PR 改不到
+# 它。拼错当场红 —— `of` / `false` / `no` 被当成「不是 off」就还是 auto，反过来
+# 静默少一层防线才是这里最怕的（同模型 / 力度那两条白名单）。
+@test "claude: the dedicated-account switch comes from the caller's workflow file only" {
+  for step in 'Verify the Claude fix' 'Verify the Codex fix'; do
+    assert_contains "$(step_env_keys "$WF" "$step")" 'VERIFY_ISOLATION'
+  done
+  # shellcheck disable=SC2016  # 找的就是字面量 ${{
+  assert_contains "$(cat "$REPO_ROOT/$WF")" 'VERIFY_ISOLATION: ${{ inputs.verify_isolation }}'
+
+  export RUNTIME=shell VERIFY_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh
+  export VERIFY_ISOLATION=sometimes
+  run run_block "$WF" "Resolve runtime defaults"
+  assert_equal "$status" 1
+  assert_contains "$output" 'is not one of auto, off'
+}
+
+# ---------- 真的换了一个用户（只有 Linux runner 上跑得到） ----------
+
+# 工作区和 $RUNNER_TEMP 都搬到「另一个用户走得进去」的地方：bats 给的那个 0700 目录
+# 下面，三条自测必然失败、必然回退（上面第一条测的就是那个），分离路径一个字都跑不到。
+separated_workspace() { # separated_workspace <verify script>
+  command -v useradd >/dev/null 2>&1 ||
+    skip 'no useradd here; the dedicated account only exists on Linux runners'
+  sudo -n true >/dev/null 2>&1 ||
+    skip 'no passwordless sudo here; the dedicated account needs it'
+  SEP_ROOT="$(mktemp -d /tmp/mel289-sep-XXXXXX)"
+  chmod 0711 "$SEP_ROOT"
+  export RUNNER_TEMP="$SEP_ROOT/runner-temp"
+  export GITHUB_WORKSPACE="$SEP_ROOT/work"
+  mkdir -p "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+  cd "$GITHUB_WORKSPACE" || return 1
+  push_workspace "$1"
+}
+
+# 逃出去的进程我们自己 kill 不动，收尾也得借 sudo。
+reap_separated_account() {
+  sudo -n pkill -U ghwf-verify >/dev/null 2>&1 || true
+}
+
+# 本票的那条性质，正面证明：验证命令跑在另一个 uid 下，连「同一个用户」这个读
+# /proc/<pid>/environ 的资格都没有了 —— 它去读我们这一步的进程环境被内核当场拒掉。
+# 回退路径上它读得到（只是那份环境里没有令牌，MEL-254），所以这一条是分离路径独有的。
+# 顺带钉住那两件最容易做坏的事：它照旧写得动工作区（.venv / 锁文件），而它造出来的
+# 目录我们回头删得掉（下一轮交接前要 git clean -fdx）。
+@test "claude: the verify command runs as a dedicated account that cannot read our environ" {
+  export VERIFY_WRITABLE_PATHS=deps.lock
+  separated_workspace 'id -un >ran-as.txt
+if cat "/proc/$PPID/environ" >environ-read.txt 2>environ-err.txt; then echo yes; else echo no; fi >environ-verdict.txt
+if sudo -n true 2>/dev/null; then echo yes; else echo no; fi >sudo-verdict.txt
+mkdir -p .venv && printf x >.venv/marker
+printf "lock v2\n" >deps.lock'
+
+  run verify_and_push
+  reap_separated_account
+
+  assert_equal "$status" 0
+  assert_equal "$(cat ran-as.txt)" 'ghwf-verify'
+  assert_equal "$(cat environ-verdict.txt)" 'no'
+  assert_contains "$(cat environ-err.txt)" 'Permission denied'
+  # 这个账号不在 sudoers 里，所以「验证命令真要动 sudo 就能绕过上面这一整串」那一条
+  # （README 里那句）在这条路上不成立
+  assert_equal "$(cat sudo-verdict.txt)" 'no'
+  # 跑完就把它从工作区那个组里摘出去：排一个「过后再跑」的任务（cron）绕得过
+  # 「此刻名下没人」那道清点，但起来时拿不到这个组，也就动不了这棵树（Codex 2026-10-02
+  # 在 PR #32 上的 P1）。
+  refute_contains " $(id -nG ghwf-verify) " " $(ls -ld "$PWD" | awk '{ print $4 }') "
+  assert_equal "$(git show origin/topic:deps.lock)" 'lock v2'
+  # 它造出来的目录归属对不对，只有真删一次才知道
+  git clean -qfdx
+  [ ! -e .venv ] || { echo '.venv outlived git clean: the ownership grant is wrong' >&2; return 1; }
+}
+
+# 「加进工作区那个组」是它写得动工作区的办法，但那个组自己带权限的时候（自建 runner
+# 上工作区的组正好是 docker = 等于 root 并不罕见），这一步就不是「降权跑」而是「升权跑」。
+# 判据：把工作区的组换成 docker，分离必须拒绝、退回 runner 用户。
+@test "claude: a privileged workspace group is refused instead of handed to the account" {
+  separated_workspace 'id -un >ran-as.txt'
+  chgrp docker "$PWD" 2>/dev/null || skip 'this machine has no docker group to borrow'
+
+  run run_step "$WF" "Verify the Claude fix"
+
+  assert_equal "$status" 0
+  assert_contains "$output" 'cannot run the verify command as a dedicated account'
+  assert_equal "$(cat ran-as.txt)" "$(id -un)"
+}
+
+# 验证命令躲出进程组（setsid）之后，那一步**返回成功的时候**那个账号名下必须一个活
+# 进程都没有 —— 这就是下一步敢导出令牌的全部前提。两种结局都合法，判据是同一条：
+#   ① hosted runner 的 /etc/sudoers 写着 `Defaults use_pty`（2026-10-02 实测），sudo
+#      收尾时连 setsid 出去的那个一起收掉了 —— 这一步照旧绿，而账号名下是空的；
+#   ② 它真活下来了 —— 按 uid 清点把整轮红着停下（回退路径上那条同名测试盯的就是
+#      这一半，两条路跑的是同一段正文）。
+# 不许出现的是第三种：这一步绿了、而它还活着。
+@test "claude: a setsid escapee under the dedicated account never outlives the verify step" {
+  separated_workspace 'setsid sleep 30 >/dev/null 2>&1 &
+echo "$!" >escaped.pid'
+
+  run run_step "$WF" "Verify the Claude fix"
+  alive="$(ps -U ghwf-verify -o pid= 2>/dev/null || true)"
+  reap_separated_account
+
+  if [ "$status" -eq 0 ]; then
+    [ -z "$alive" ] || {
+      echo "the step passed while the account still owned: $alive" >&2
+      return 1
+    }
+  else
+    assert_contains "$output" 'outlived the verify command'
+    assert_contains "$output" 'ghwf-verify'
+    assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  fi
+}
+
+# ---------- 问不出来不等于名下没人（Codex 2026-10-02 在 PR #32 上的两条 P1）----------
+
+# 共用正文里的一个嵌套函数，按 workflow 里写的样子取出来（同 fix_guard_body，再往里
+# 剥一层缩进）。单独跑它是因为这几道判定问的是「问不出来的时候它怎么答」，而真造一台
+# procfs 配了 hidepid 的机器、或者一个 /etc 写不动的 runner，不是测试干得了的事。
+# 整个函数定义原样交出来（连 `name() {` 和收尾那个 `}`），再剥掉一层缩进。
+# 开头那一行用前缀比，不用等号比：定义行后面可能跟着一句行内注释。
+verify_helper() { # verify_helper <嵌套函数名>
+  fix_guard_body verify_the_fix |
+    awk -v fn="$1() {" '
+      index($0, fn) == 1 { f = 1; print; next }
+      f && $0 == "}"     { print; exit }
+      f                  { sub(/^  /, ""); print }
+    '
+}
+
+# 把取出来的函数接上桩跑一遍。PATH 钉死在系统目录：fake-bin 里那个假 sleep 不真睡，
+# 会把下面这几条「轮询到看见」的判定搅成空转。
+run_helper() { # run_helper <桩脚本> <嵌套函数名>...
+  local stub="$1" fn
+  shift
+  { printf 'PATH=/usr/bin:/bin\nset -uo pipefail\n'
+    for fn in "$@"; do verify_helper "$fn"; done
+    cat "$stub"
+  } >"$BATS_TEST_TMPDIR/helper-probe.sh"
+  bash "$BATS_TEST_TMPDIR/helper-probe.sh"
+}
+
+# 专用账号的 uid 不是我们，procfs 配了 hidepid 的机器上普通身份一个也看不见 ——
+# 而「看不见」就是这道清点的放行条件。所以别的 uid 必须借 root 的身份去问；
+# 我们自己那个照旧直接问（回退路径不要求有 sudo）。
+@test "claude: the dedicated account's process sweep is asked with root privilege" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+self_uid=1000
+as_root() { printf 'via-sudo '; "$@"; }
+ps() { printf '%s\n' "ps $*"; }
+printf 'self: %s\n' "$(ps_by_uid 1000 pid=)"
+printf 'other: %s\n' "$(ps_by_uid 4242 pid=)"
+EOS
+
+  run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid
+
+  assert_equal "$status" 0
+  assert_contains "$output" 'other: via-sudo ps -U 4242 -o pid='
+  assert_contains "$output" 'self: ps -U 1000 -o pid='
+  # 整段正文里只有 ps_by_uid 碰得到 `ps -U`：别处再写一条，就又多一个绕开 root 身份
+  # 的入口，而那条入口在 hidepid 的机器上会一路报「名下没人」。
+  assert_equal "$(fix_guard_body verify_the_fix | grep -c 'ps -U "')" 2
+  assert_equal "$(verify_helper ps_by_uid | grep -c 'ps -U "')" 2
+}
+
+# `ps -U` 在「一个进程都没有」的时候退 1 且不输出，在「问不出来」的时候也可以是同一副
+# 长相 —— 前者照旧放行（专用账号名下本来就该是空的），后者必须往上报失败。以前这里
+# 一律 `|| true` 当成空，于是整道清点在问不动的机器上变成一个看不见的空操作。
+@test "claude: a process sweep that cannot be answered is not read as an empty account" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+self_uid=1000
+as_root() { "$@"; }
+ps() { exit "${PS_EXIT:-0}"; }
+if out="$(ps_by_uid 4242 pid=)"; then printf 'answered:[%s]\n' "$out"; else printf 'unanswerable\n'; fi
+EOS
+
+  PS_EXIT=1 run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid
+  assert_equal "$output" 'answered:[]'
+
+  PS_EXIT=2 run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid
+  assert_equal "$output" 'unanswerable'
+
+  # 上面那一层往上报了，user_procs 这一层也不许吞：它才是清点真正调的那个。
+  cat >"$BATS_TEST_TMPDIR/procs.sh" <<'EOS'
+verify_uid=4242
+ps_by_uid() { [ "${PS_OK:-1}" = 1 ] || return 1; printf '%s\n' "${PS_OUT:-}"; }
+if out="$(user_procs)"; then printf 'answered:[%s]\n' "$out"; else printf 'unanswerable\n'; fi
+EOS
+
+  PS_OK=0 run run_helper "$BATS_TEST_TMPDIR/procs.sh" user_procs
+  assert_equal "$output" 'unanswerable'
+
+  PS_OK=1 PS_OUT='111 1 S Thu Oct 2 10:00:00 2026 /bin/sleep 9' \
+    run run_helper "$BATS_TEST_TMPDIR/procs.sh" user_procs
+  assert_equal "$output" 'answered:[111|1|Thu Oct 2 10:00:00 2026|/bin/sleep 9]'
+}
+
+# 验证跑完那道清点同理：问不出来要红，而且报的是「这道门自己坏了」，不是「名下没人」。
+# 放过的后果不是「少一层保险」而是真能漏：一个躲出去的进程手里那把工作区写权限不会
+# 因为我们事后把账号摘出组而消失，它就能在「验证通过」和「提交推送」之间换掉要提交的内容。
+@test "claude: an unanswerable post-verify sweep goes red instead of passing as contained" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+verify_procs_baseline=''
+verify_leftovers=''
+verify_sweep_unanswerable=''
+user_procs() { [ "${PROCS_OK:-1}" = 1 ] || return 1; printf '%s' "${PROCS:-}"; }
+if verify_tree_is_contained; then
+  printf 'contained\n'
+else
+  printf 'red unanswerable=%s leftovers=[%s]\n' "${verify_sweep_unanswerable:-}" "$verify_leftovers"
+fi
+EOS
+
+  # 问得出来、名下没有多余的 → 放行
+  PROCS_OK=1 PROCS='' run run_helper "$BATS_TEST_TMPDIR/stub.sh" unexplained_procs verify_tree_is_contained
+  assert_equal "$output" 'contained'
+
+  # 问不出来 → 红
+  PROCS_OK=0 run run_helper "$BATS_TEST_TMPDIR/stub.sh" unexplained_procs verify_tree_is_contained
+  assert_equal "$output" 'red unanswerable=1 leftovers=[]'
+
+  # 这一步真跑起来确实走这条分支，而且报的那句跟「真有残留」那句分得开
+  assert_contains "$(fix_guard_body verify_the_fix)" 'refusing to read an unanswerable sweep as containment'
+}
+
+# 正面自测：跑验证之前先在那个账号下起一个睡两秒的进程，确认清点真能看见它。
+# 看不见就回退，不声称已经隔离 —— 这是「清点问得出来」唯一的直接证据，光看 `ps` 的
+# 退出码分不出「看不见」和「名下没人」。
+# 真的两个 uid 只有 Linux runner 上有（下面 separated_workspace 那几条测的就是那一半：
+# 分离成功 = 这道自测在真账号上过了）；这里钉的是「看不见的时候它拒绝」。
+@test "claude: isolation is refused unless a probe process under the account is actually seen" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+self_uid=1000
+verify_account=probe-account
+# 迷你 sudo：认 -E 和 -u <用户>，剩下的照原样跑。
+as_root() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -E) shift ;; -u) shift 2 ;; *) break ;; esac
+  done
+  "$@"
+}
+# 第 2 次问的时候报回一个 pid（探针这时候活着），其余报空；blind 一律空手而归 ——
+# 那正是 hidepid 机器上别人的进程的长相。
+ps() {
+  n=$(( $(cat "$BATS_TEST_TMPDIR/ps-calls" 2>/dev/null || echo 0) + 1 ))
+  printf '%s\n' "$n" >"$BATS_TEST_TMPDIR/ps-calls"
+  [ "${BLIND:-0}" = 1 ] && exit 1
+  [ "$n" -ne 2 ] || { printf '4242\n'; exit 0; }
+  exit 1
+}
+if the_sweep_can_see_that_account 4242; then printf 'seen\n'; else printf 'blind\n'; fi
+EOS
+
+  BLIND=0 run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid the_sweep_can_see_that_account
+  assert_equal "$output" 'seen'
+
+  : >"$BATS_TEST_TMPDIR/ps-calls"
+  BLIND=1 run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid the_sweep_can_see_that_account
+  assert_equal "$output" 'blind'
+
+  # 自测证不出来就回退（return 1 一路传到调用处那条 warning），不是只记一笔往下走
+  assert_contains "$(fix_guard_body verify_the_fix)" 'the_sweep_can_see_that_account "$uid" || return 1'
+}
+
+# 「不准排定时任务」那一步失败不许静默跳过：拒绝名单是「排一个任务在清点之后起来」
+# 唯一的拦截点，而那个任务起来时拿到的工作区写权限，事后摘组也收不回来。写不进去
+# 就整条回退到 runner 用户那条路（调用处会刷那条 warning），不再嘴上声称已经隔离。
+@test "claude: failing to deny the account scheduled jobs refuses isolation instead of skipping" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+verify_account=probe-account
+seen="$BATS_TEST_TMPDIR/deny-seen.txt"
+: >"$seen"
+# 名单文件用 root 的身份读写（ubuntu 上 /etc/at.deny 是 0640 root:daemon）。
+as_root() {
+  case "$1" in
+    grep) grep -qxF "$verify_account" "$seen" 2>/dev/null ;;
+    tee) [ "${TEE_OK:-1}" = 1 ] || return 1; cat >>"$seen" ;;
+    *) return 1 ;;
+  esac
+}
+if deny_the_account_scheduled_jobs; then printf 'denied\n'; else printf 'refused\n'; fi
+printf 'lines=%s\n' "$(grep -c . "$seen" 2>/dev/null || echo 0)"
+EOS
+
+  # 写进去了 → 继续走分离这条路；第二个名单文件读到已经有它就跳过，不重复追加
+  TEE_OK=1 run run_helper "$BATS_TEST_TMPDIR/stub.sh" deny_the_account_scheduled_jobs
+  assert_contains "$output" 'denied'
+  assert_contains "$output" 'lines=1'
+
+  # 写不进去 → 拒绝，绝不静默跳过
+  TEE_OK=0 run run_helper "$BATS_TEST_TMPDIR/stub.sh" deny_the_account_scheduled_jobs
+  assert_contains "$output" 'refused'
+
+  # 拒绝要一路传到调用处：以前这里是 `|| true`，写回去这条就红
+  assert_contains "$(fix_guard_body verify_the_fix)" 'deny_the_account_scheduled_jobs || return 1'
+  refute_contains "$(verify_helper deny_the_account_scheduled_jobs)" '|| true'
+}
+
+# ---------- 捡到的账号原本在哪些组里（Codex 2026-10-02 在 PR #32 `69027b4` 上的 P1）----------
+
+# 那个专用账号可能在我们跑之前机器上就已经有了（自建 runner 上有 root 的人提前建好）。
+# 它原本在哪些组里是别人定的，而组自带权限：塞进 docker 就等于能拿 root。原来这里只
+# 查了「它的 uid 不是 0」和「我们要给它加进去的那个工作区组不带权限」—— 漏的正是它
+# 自己原有的组，于是分离这一步会把被审 PR 自己带的命令交到一个等于 root 的身份上去跑，
+# 比压根不分离还糟。
+# 判据必须是白名单（只允许它的主组 + 工作区那个组），不能拿特权组名单去比：名单是
+# 列举、列不全 —— 随便起个名字的组也能在 /etc/sudoers.d 里被写成等于 root。
+#
+# 这两条跑的是 workflow 里那个函数本身，外部命令全接桩：真造一台「账号已经建好并塞进
+# docker」的机器要 root 去改这台机器的 /etc/group，不是测试干得了的事。
+separate_user_stub() { # separate_user_stub >桩脚本
+  cat <<'EOS'
+verify_account=probe-account
+verify_ws="$BATS_TEST_TMPDIR/sep-work"
+RUNNER_TEMP="$BATS_TEST_TMPDIR/sep-temp"
+mkdir -p "$verify_ws" "$RUNNER_TEMP"
+verify_user=''
+verify_sandbox=''
+verify_uid=''
+verify_group=''
+# 标记那一套另有自己的测试（下一条），这里只要让它别在「问不出这是哪一次 run」上回退
+GITHUB_RUN_ID=7
+GITHUB_RUN_ATTEMPT=1
+created="$BATS_TEST_TMPDIR/useradd-ran"
+
+# sudo 一律当成有：本机有没有 sudo 跟这两条要钉的东西无关
+command() { [ "$*" = '-v sudo' ] || { builtin command "$@"; return; }; }
+# 迷你 sudo：认 -E 和 -u <用户>，useradd 记一笔，id 透传给下面那个桩，其余一律成功
+as_root() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -E) shift ;; -u) shift 2 ;; *) break ;; esac
+  done
+  case "$1" in
+    useradd) : >"$created" ;;
+    id) shift; id "$@" ;;
+    *) : ;;
+  esac
+}
+# 这台机器上那个账号长什么样，由四个入参摆出来（run_separate 每次全给，省得上一条
+# 的设定漏到下一条）；没建起来之前 `id -u` 问不到它
+id() {
+  case "$1" in
+    -u) { [ "$ACCOUNT_EXISTS" = 1 ] || [ -e "$created" ]; } && printf '4242\n' ;;
+    -gn) printf '%s\n' "$ACCOUNT_PRIMARY" ;;
+    -g) printf '%s\n' "$ACCOUNT_PRIMARY_GID" ;;
+    -nG) printf '%s\n' "$ACCOUNT_GROUPS" ;;
+    *) return 1 ;;
+  esac
+}
+# 工作区那个组是 ls 的第 4 列（workflow 里就是这么取的）
+ls() { printf 'drwxrwsr-x 2 runner runner 4096 Oct 2 10:00 .\n'; }
+# 这几道判定各有自己的测试，这里一律放行
+deny_the_account_scheduled_jobs() { return 0; }
+ps_by_uid() { printf ''; }
+the_sweep_can_see_that_account() { return 0; }
+the_account_is_ours_from_this_run() { return 0; }
+mark_the_account_as_ours() { return 0; }
+
+if separate_the_verify_user; then
+  printf 'separated group=%s\n' "$verify_group"
+else
+  printf 'fell-back\n'
+fi
+if [ -e "$created" ]; then printf 'useradd=yes\n'; else printf 'useradd=no\n'; fi
+EOS
+}
+
+# 四个入参每次都给齐：bats 的 `run` 是函数，`VAR=x run f` 这种前缀赋值在 bash 里会留
+# 在当前 shell 上，少给一个就会悄悄沿用上一条的设定、把判定做成假绿。
+run_separate() { # run_separate <账号已存在 0|1> <主组名> <主组 gid> <全部组>
+  ACCOUNT_EXISTS="$1" ACCOUNT_PRIMARY="$2" ACCOUNT_PRIMARY_GID="$3" ACCOUNT_GROUPS="$4" \
+    run_helper "$BATS_TEST_TMPDIR/stub.sh" \
+      separate_the_verify_user account_groups_are_unprivileged group_is_privileged
+}
+
+@test "claude: a pre-existing account is refused unless every group it is already in is allow-listed" {
+  separate_user_stub >"$BATS_TEST_TMPDIR/stub.sh"
+
+  # 它原本就在 docker 里 → 回退，不拿来跑
+  run run_separate 1 probe-account 4242 'probe-account docker'
+  assert_equal "$status" 0
+  assert_contains "$output" 'fell-back'
+  assert_contains "$output" 'useradd=no'
+
+  # 名字不在那张特权名单上的组同样不行：判据是白名单，不是拿名单去比
+  run run_separate 1 probe-account 4242 'probe-account ci-helpers'
+  assert_contains "$output" 'fell-back'
+
+  # 主组自己就是特权组 → 回退
+  run run_separate 1 docker 4242 'docker'
+  assert_contains "$output" 'fell-back'
+
+  # 主组的 gid 是 0（换了个不在名单上的名字也一样）→ 回退
+  run run_separate 1 staff 0 'staff'
+  assert_contains "$output" 'fell-back'
+
+  # 组问不出来（id 答不上）不许读成「没有多余的组」
+  run run_separate 1 probe-account 4242 ''
+  assert_contains "$output" 'fell-back'
+
+  # 只在自己的主组里 → 照旧走分离（这一条同时兜住「函数名写错、压根没取到」：取不到
+  # 的话上面那几条会因为「命令不存在」而假绿）
+  run run_separate 1 probe-account 4242 'probe-account'
+  assert_contains "$output" 'separated group=runner'
+
+  # 同一个 job 里第二次复用：它还在工作区那个组里，那是我们上一轮加的，放行
+  run run_separate 1 probe-account 4242 'probe-account runner'
+  assert_contains "$output" 'separated group=runner'
+
+  # 这道检查真的挂在那条主路上（撤掉调用点，上面那几条立刻变红）
+  assert_contains "$(fix_guard_body verify_the_fix)" 'account_groups_are_unprivileged "$group"'
+  # 特权组名单只有一份：两份会各自漂，而漂掉的那份正好是没人看的那份
+  assert_equal "$(fix_guard_body verify_the_fix | grep -c 'root|sudo|wheel|admin|adm|docker')" 1
+}
+
+@test "claude: an account we create ourselves still takes the separation path" {
+  separate_user_stub >"$BATS_TEST_TMPDIR/stub.sh"
+
+  # 机器上原本没有它 → 我们建，建完照旧走分离：useradd --system 只给它一个同名主组，
+  # 没有「别人塞进去的组」这回事，所以上面那道白名单不该拦它
+  run run_separate 0 probe-account 4242 'probe-account'
+
+  assert_equal "$status" 0
+  assert_contains "$output" 'separated group=runner'
+  assert_contains "$output" 'useradd=yes'
+}
+
+# ---------- 这个账号是不是我们这一次 run 建的（Codex 2026-10-03 在 PR #32 `d18d0f9` 上的 P1）----------
+
+# 捡一个机器上本来就有的账号来跑被审 PR 自己带的命令，等于把它身上带着的东西一起接过
+# 来，而那是一整类：已经排好的 crontab、at 队列里等着的任务、cron.allow / at.allow 里的
+# 名字（allow 比 deny 优先，所以写拒绝名单压根没用）、linger 起来的 systemd 用户定时器。
+# 逐条去清永远清不全，所以整类一起关掉：不是这一次 run 里我们建的就不分离、回退原路径。
+# 证据必须是验证命令伪造不了的那种：root 写在 /run/ghwf-verify/ 下（0700 root:root，那个
+# 账号连 cd 都进不去）、文件名带 GITHUB_RUN_ID + GITHUB_RUN_ATTEMPT 的一份标记 —— 上一次
+# run 留下的标记认不了这一次。
+# 这几条跑的是 workflow 里那几个函数本身，碰文件系统的全走 as_root、整段接桩：真造一台
+# 「账号跨 run 留在机器上」的机器要 root 去改这台机器的 /etc/passwd。
+marker_stub() { # marker_stub >桩脚本
+  cat <<'EOS'
+verify_account=probe-account
+verify_ws="$BATS_TEST_TMPDIR/mark-work"
+RUNNER_TEMP="$BATS_TEST_TMPDIR/mark-temp"
+mkdir -p "$verify_ws" "$RUNNER_TEMP"
+verify_user=''
+verify_sandbox=''
+verify_uid=''
+verify_group=''
+verify_bash=''
+# 每一条从零开始：$BATS_TEST_TMPDIR 在同一个 @test 里几次调用之间是共用的，上一条留下的
+# 「建过账号」/「标记落地过」会把下一条判定做成假绿。
+state="$(mktemp -d)"
+created="$state/useradd-ran"
+marked="$state/marker-landed"
+GITHUB_RUN_ID="$RUN_ID"
+GITHUB_RUN_ATTEMPT="$RUN_ATTEMPT"
+if [ "$MARKER_PRESENT" = 1 ]; then : >"$marked"; fi
+
+command() { [ "$*" = '-v sudo' ] || { builtin command "$@"; return; }; }
+# 迷你 sudo。标记那几步都走它：`test ! -L` 按入参答「是不是快捷方式」，`test -O` 答
+# 「在不在 + 是不是 root 的」，`tee` 按 MARKER_WRITE_OK 决定内容落不落地，`cat` 只在真
+# 落地了的时候报回标记里装的 uid。
+as_root() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -E) shift ;; -u) shift 2 ;; *) break ;; esac
+  done
+  case "$1" in
+    useradd) : >"$created" ;;
+    id) shift; id "$@" ;;
+    test)
+      shift
+      case "$1" in
+        '!') [ "$MARKER_SYMLINK" != 1 ] ;;
+        -O)  [ -e "$marked" ] && [ "$MARKER_OWNER" = 0 ] ;;
+        *)   : ;;
+      esac ;;
+    tee)
+      if [ "$MARKER_WRITE_OK" != 1 ]; then return 1; fi
+      : >"$marked" ;;
+    cat)
+      if [ ! -e "$marked" ]; then return 1; fi
+      printf '%s\n' "$MARKED_UID" ;;
+    *) : ;;
+  esac
+}
+# 没建起来之前 `id -u` 问不到它；组那一套另有自己的测试，这里一律给「只在自己主组里」
+id() {
+  case "$1" in
+    -u) { [ "$ACCOUNT_EXISTS" = 1 ] || [ -e "$created" ]; } && printf '4242\n' ;;
+    -gn) printf 'probe-account\n' ;;
+    -g) printf '4242\n' ;;
+    -nG) printf 'probe-account\n' ;;
+    *) return 1 ;;
+  esac
+}
+ls() { printf 'drwxrwsr-x 2 runner runner 4096 Oct 3 10:00 .\n'; }
+deny_the_account_scheduled_jobs() { return 0; }
+ps_by_uid() { printf ''; }
+the_sweep_can_see_that_account() { return 0; }
+
+if separate_the_verify_user; then
+  printf 'separated group=%s\n' "$verify_group"
+else
+  printf 'fell-back\n'
+fi
+if [ -e "$created" ]; then printf 'useradd=yes\n'; else printf 'useradd=no\n'; fi
+if [ -e "$marked" ]; then printf 'marker=yes\n'; else printf 'marker=no\n'; fi
+EOS
+}
+
+# 八个入参每次都给齐，同上面 run_separate：bats 的 `run` 是函数，`VAR=x run f` 这种前缀
+# 赋值在 bash 里会留在当前 shell 上，少给一个就会悄悄沿用上一条的设定、把判定做成假绿。
+run_marker() { # run_marker <账号已存在 0|1> <标记已在 1|0> <标记属主 uid> <标记是快捷方式 0|1> <写标记成功 1|0> <run 号> <重跑次数> <标记里装的 uid>
+  ACCOUNT_EXISTS="$1" MARKER_PRESENT="$2" MARKER_OWNER="$3" MARKER_SYMLINK="$4" \
+    MARKER_WRITE_OK="$5" RUN_ID="$6" RUN_ATTEMPT="$7" MARKED_UID="$8" \
+    run_helper "$BATS_TEST_TMPDIR/stub.sh" \
+      separate_the_verify_user the_account_is_ours_from_this_run \
+      mark_the_account_as_ours account_groups_are_unprivileged group_is_privileged
+}
+
+@test "claude: an account the machine already had is refused unless this run is the one that created it" {
+  marker_stub >"$BATS_TEST_TMPDIR/stub.sh"
+
+  # 账号已经在机器上，而这一次 run 没留下过标记 → 回退，不拿它来跑
+  run run_marker 1 0 0 0 1 7 1 4242
+  assert_equal "$status" 0
+  assert_contains "$output" 'fell-back'
+  assert_contains "$output" 'useradd=no'
+
+  # 同一个 job 里第二次复用：标记是我们这一轮自己写下的 → 照旧分离
+  run run_marker 1 1 0 0 1 7 1 4242
+  assert_contains "$output" 'separated group=runner'
+  assert_contains "$output" 'useradd=no'
+
+  # 标记不是 root 写的 → 回退：/run 要是谁都写得动，那个账号自己就能种一份（run 号在
+  # 它的环境里），而它种出来的属主是它自己
+  run run_marker 1 1 1001 0 1 7 1 4242
+  assert_contains "$output" 'fell-back'
+
+  # 标记是个快捷方式 → 回退：指向别处的链接会让那句 cat 读到别处去
+  run run_marker 1 1 0 1 1 7 1 4242
+  assert_contains "$output" 'fell-back'
+
+  # 问不出这是哪一次 run（run 号或重跑次数少一个）→ 回退
+  run run_marker 1 1 0 0 1 '' 1 4242
+  assert_contains "$output" 'fell-back'
+  run run_marker 1 1 0 0 1 7 '' 4242
+  assert_contains "$output" 'fell-back'
+
+  # 标记在、但装的是别的 uid（账号被人删掉重建过）→ 回退
+  run run_marker 1 1 0 0 1 7 1 9999
+  assert_contains "$output" 'fell-back'
+
+  # 机器上原本没有它 → 我们建，建完留标记，照旧分离
+  run run_marker 0 0 0 0 1 7 1 4242
+  assert_contains "$output" 'separated group=runner'
+  assert_contains "$output" 'useradd=yes'
+  assert_contains "$output" 'marker=yes'
+
+  # 建起来了但标记写不进去 → 回退：写不下证据就证明不了下一次复用的是我们这个账号
+  run run_marker 0 0 0 0 0 7 1 4242
+  assert_contains "$output" 'fell-back'
+  assert_contains "$output" 'marker=no'
+
+  # 这两道真的挂在那条主路上（撤掉调用点，上面那几条立刻变红）
+  assert_contains "$(fix_guard_body verify_the_fix)" \
+    'mark_the_account_as_ours "$uid" "$marker" || return 1'
+  assert_contains "$(fix_guard_body verify_the_fix)" \
+    'the_account_is_ours_from_this_run "$uid" "$marker" || return 1'
+  # 标记放在哪只有一份：两份会各自漂，而漂掉的那份正好是没人看的那份
+  assert_equal "$(fix_guard_body verify_the_fix | grep -c '/run/ghwf-verify\.')" 1
+}
+
+# ---------- 放宽写权限那句 umask 到不到得了验证进程（Codex 2026-10-03 在 `d18d0f9` 上的 P1）----------
+
+# sudo 把 umask 取「调用者的」和 sudoers 里那个（默认 0022）的并集，所以 umask 002 设在
+# sudo 外面到不了验证进程：它造出来的 .venv / node_modules 于是是 0755，组写不动 ——
+# runner 回头 add -u 写不动、git clean -fdx 也删不掉（深层尤其：要删 .venv/a/b 得先写得动
+# .venv/a）。所以那句 umask 要设在 sudo 起的那条命令里面。
+# 这一条不是结构判定：桩只把 sudo 那一层剥掉，正文里那条启动命令原样跑（env + 里面那层
+# shell），外层先把 umask 收成 022（sudo 之后验证进程看到的就是这个），验证命令报回自己
+# 的 umask。设在里面报 0002，挪回外层就报 0022 —— 这一条当场变红。
+launch_stub() { # launch_stub >桩脚本
+  cat <<'EOS'
+verify_user=ghwf-verify
+verify_sandbox="$BATS_TEST_TMPDIR/launch-sandbox"
+decoy="$BATS_TEST_TMPDIR/launch-decoy"
+mkdir -p "$verify_sandbox/home" "$decoy"
+verify_path="$PATH"
+verify_bash=/bin/bash
+[ -x "$verify_bash" ] || verify_bash=/usr/bin/bash
+VERIFY='umask'
+# 迷你 sudo：把 `-E -u <用户>` 剥掉，剩下的原样跑
+as_root() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -E) shift ;; -u) shift 2 ;; *) break ;; esac
+  done
+  "$@"
+}
+umask 022
+launch_the_verify_command
+EOS
+}
+
+@test "claude: the cooperative umask is set inside the sudo command, where the verify process still sees it" {
+  launch_stub >"$BATS_TEST_TMPDIR/stub.sh"
+
+  run run_helper "$BATS_TEST_TMPDIR/stub.sh" launch_the_verify_command
+
+  # 外层是 022，验证命令报回 0002 = 那句 umask 是里面那层设的
+  assert_equal "$status" 0
+  assert_equal "$output" '0002'
+
+  # 外层那句连同它的存档/还原一起没了（留着就是两处管同一件事，而外面那处不生效）
+  refute_contains "$(fix_guard_body verify_the_fix)" 'saved_umask'
+  assert_contains "$(verify_helper launch_the_verify_command)" "-c 'umask 002; exec"
+  # 里面那层 shell 走绝对路径，不靠 PATH 找：PATH 在这条命令里已经换成验证命令自己那一
+  # 份（没过滤），靠它找 bash 等于让被审 PR 自己挑一个（MEL-278）
+  assert_contains "$(verify_helper launch_the_verify_command)" '"$verify_bash" -euo pipefail'
+  assert_contains "$(fix_guard_body verify_the_fix)" 'for candidate in /bin/bash /usr/bin/bash'
+  assert_contains "$(fix_guard_body verify_the_fix)" '[ -n "$verify_bash" ] || return 1'
+  # 回退路径一个字不改：它照旧是原来那一句，没有 umask、也不该有
+  assert_contains "$(verify_helper launch_the_verify_command)" 'bash -euo pipefail -c "$VERIFY"'
+}
+
 # ---------- 两条路共用同一段正文 ----------
 
 # MEL-262 的那条不变量：验证和推送各只有一份正文，两条路都跑它，差别只有 $FIXER

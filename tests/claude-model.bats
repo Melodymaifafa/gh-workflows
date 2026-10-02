@@ -55,7 +55,7 @@ setup() {
 # 白名单，不是黑名单：default（账号默认）和 opusplan（执行时用 Sonnet）名字里都没有
 # Sonnet，黑名单拦不住它们（Codex P2 on PR #18）。
 @test "resolve: anything but an explicit Opus-or-above selector is refused before Claude runs" {
-  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' CLAUDE_EFFORT=xhigh
+  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' CLAUDE_EFFORT=xhigh VERIFY_ISOLATION=auto
   for model in claude-sonnet-5 sonnet claude-haiku-4-5 Haiku default opusplan best gpt-5; do
     export CLAUDE_MODEL="$model"
     run run_block "$WF" "Resolve runtime defaults"
@@ -65,7 +65,7 @@ setup() {
 }
 
 @test "resolve: explicit Opus-or-above selectors pass" {
-  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' CLAUDE_EFFORT=xhigh
+  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' CLAUDE_EFFORT=xhigh VERIFY_ISOLATION=auto
   for model in opus 'opus[1m]' fable claude-opus-5-5 'claude-opus-5-5[1m]' claude-fable-5-1; do
     export CLAUDE_MODEL="$model"
     run run_block "$WF" "Resolve runtime defaults"
@@ -74,7 +74,7 @@ setup() {
 }
 
 @test "resolve: an empty model or an unknown effort level is refused" {
-  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE=''
+  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' VERIFY_ISOLATION=auto
   export CLAUDE_MODEL='' CLAUDE_EFFORT=xhigh
   run run_block "$WF" "Resolve runtime defaults"
   assert_equal "$status" 1
@@ -87,7 +87,7 @@ setup() {
 }
 
 @test "resolve: every documented effort level passes with an Opus model" {
-  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5
+  export RUNTIME=shell VERIFY_OVERRIDE='' TOOLS_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 VERIFY_ISOLATION=auto
   for effort in low medium high xhigh max; do
     export CLAUDE_EFFORT="$effort"
     run run_block "$WF" "Resolve runtime defaults"
