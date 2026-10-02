@@ -16,3 +16,29 @@ jobs:
           persist-credentials: false
       - name: Round 4 - where the cooperative umask lands, and the marker gate
         run: bash .github/mel289-probe-umask.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install actionlint 1.7.12 (the version ci.yml pins)
+        run: |
+          set -euo pipefail
+          curl -sSfL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz |
+            tar xz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+      - name: Run the repo's own lint command, with a timeout so a hang is visible
+        run: |
+          set -uo pipefail
+          printf 'Define block bytes: '
+          awk -v want="      - name: Define the fix verify and push guards" '
+            $0 == want { in_step = 1; next }
+            in_step && !in_run && $0 == "        run: |" { in_run = 1; next }
+            in_run { if ($0 ~ /^[[:space:]]*$/) { print ""; next } if ($0 !~ /^          /) { exit } sub(/^          /, ""); print }
+          ' .github/workflows/claude-codex-iterate.yml | wc -c
+          timeout 300 actionlint -color
+          echo "actionlint exit=$? (124 = it hung and the timeout killed it)"
+          git ls-files "*.sh" | xargs -r shellcheck
+          echo "shellcheck exit=$?"
