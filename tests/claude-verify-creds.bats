@@ -471,6 +471,190 @@ echo "$!" >escaped.pid'
   fi
 }
 
+# ---------- 问不出来不等于名下没人（Codex 2026-10-02 在 PR #32 上的两条 P1）----------
+
+# 共用正文里的一个嵌套函数，按 workflow 里写的样子取出来（同 fix_guard_body，再往里
+# 剥一层缩进）。单独跑它是因为这几道判定问的是「问不出来的时候它怎么答」，而真造一台
+# procfs 配了 hidepid 的机器、或者一个 /etc 写不动的 runner，不是测试干得了的事。
+# 整个函数定义原样交出来（连 `name() {` 和收尾那个 `}`），再剥掉一层缩进。
+# 开头那一行用前缀比，不用等号比：定义行后面可能跟着一句行内注释。
+verify_helper() { # verify_helper <嵌套函数名>
+  fix_guard_body verify_the_fix |
+    awk -v fn="$1() {" '
+      index($0, fn) == 1 { f = 1; print; next }
+      f && $0 == "}"     { print; exit }
+      f                  { sub(/^  /, ""); print }
+    '
+}
+
+# 把取出来的函数接上桩跑一遍。PATH 钉死在系统目录：fake-bin 里那个假 sleep 不真睡，
+# 会把下面这几条「轮询到看见」的判定搅成空转。
+run_helper() { # run_helper <桩脚本> <嵌套函数名>...
+  local stub="$1" fn
+  shift
+  { printf 'PATH=/usr/bin:/bin\nset -uo pipefail\n'
+    for fn in "$@"; do verify_helper "$fn"; done
+    cat "$stub"
+  } >"$BATS_TEST_TMPDIR/helper-probe.sh"
+  bash "$BATS_TEST_TMPDIR/helper-probe.sh"
+}
+
+# 专用账号的 uid 不是我们，procfs 配了 hidepid 的机器上普通身份一个也看不见 ——
+# 而「看不见」就是这道清点的放行条件。所以别的 uid 必须借 root 的身份去问；
+# 我们自己那个照旧直接问（回退路径不要求有 sudo）。
+@test "claude: the dedicated account's process sweep is asked with root privilege" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+self_uid=1000
+as_root() { printf 'via-sudo '; "$@"; }
+ps() { printf '%s\n' "ps $*"; }
+printf 'self: %s\n' "$(ps_by_uid 1000 pid=)"
+printf 'other: %s\n' "$(ps_by_uid 4242 pid=)"
+EOS
+
+  run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid
+
+  assert_equal "$status" 0
+  assert_contains "$output" 'other: via-sudo ps -U 4242 -o pid='
+  assert_contains "$output" 'self: ps -U 1000 -o pid='
+  # 整段正文里只有 ps_by_uid 碰得到 `ps -U`：别处再写一条，就又多一个绕开 root 身份
+  # 的入口，而那条入口在 hidepid 的机器上会一路报「名下没人」。
+  assert_equal "$(fix_guard_body verify_the_fix | grep -c 'ps -U "')" 2
+  assert_equal "$(verify_helper ps_by_uid | grep -c 'ps -U "')" 2
+}
+
+# `ps -U` 在「一个进程都没有」的时候退 1 且不输出，在「问不出来」的时候也可以是同一副
+# 长相 —— 前者照旧放行（专用账号名下本来就该是空的），后者必须往上报失败。以前这里
+# 一律 `|| true` 当成空，于是整道清点在问不动的机器上变成一个看不见的空操作。
+@test "claude: a process sweep that cannot be answered is not read as an empty account" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+self_uid=1000
+as_root() { "$@"; }
+ps() { exit "${PS_EXIT:-0}"; }
+if out="$(ps_by_uid 4242 pid=)"; then printf 'answered:[%s]\n' "$out"; else printf 'unanswerable\n'; fi
+EOS
+
+  PS_EXIT=1 run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid
+  assert_equal "$output" 'answered:[]'
+
+  PS_EXIT=2 run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid
+  assert_equal "$output" 'unanswerable'
+
+  # 上面那一层往上报了，user_procs 这一层也不许吞：它才是清点真正调的那个。
+  cat >"$BATS_TEST_TMPDIR/procs.sh" <<'EOS'
+verify_uid=4242
+ps_by_uid() { [ "${PS_OK:-1}" = 1 ] || return 1; printf '%s\n' "${PS_OUT:-}"; }
+if out="$(user_procs)"; then printf 'answered:[%s]\n' "$out"; else printf 'unanswerable\n'; fi
+EOS
+
+  PS_OK=0 run run_helper "$BATS_TEST_TMPDIR/procs.sh" user_procs
+  assert_equal "$output" 'unanswerable'
+
+  PS_OK=1 PS_OUT='111 1 S Thu Oct 2 10:00:00 2026 /bin/sleep 9' \
+    run run_helper "$BATS_TEST_TMPDIR/procs.sh" user_procs
+  assert_equal "$output" 'answered:[111|1|Thu Oct 2 10:00:00 2026|/bin/sleep 9]'
+}
+
+# 验证跑完那道清点同理：问不出来要红，而且报的是「这道门自己坏了」，不是「名下没人」。
+# 放过的后果不是「少一层保险」而是真能漏：一个躲出去的进程手里那把工作区写权限不会
+# 因为我们事后把账号摘出组而消失，它就能在「验证通过」和「提交推送」之间换掉要提交的内容。
+@test "claude: an unanswerable post-verify sweep goes red instead of passing as contained" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+verify_procs_baseline=''
+verify_leftovers=''
+verify_sweep_unanswerable=''
+user_procs() { [ "${PROCS_OK:-1}" = 1 ] || return 1; printf '%s' "${PROCS:-}"; }
+if verify_tree_is_contained; then
+  printf 'contained\n'
+else
+  printf 'red unanswerable=%s leftovers=[%s]\n' "${verify_sweep_unanswerable:-}" "$verify_leftovers"
+fi
+EOS
+
+  # 问得出来、名下没有多余的 → 放行
+  PROCS_OK=1 PROCS='' run run_helper "$BATS_TEST_TMPDIR/stub.sh" unexplained_procs verify_tree_is_contained
+  assert_equal "$output" 'contained'
+
+  # 问不出来 → 红
+  PROCS_OK=0 run run_helper "$BATS_TEST_TMPDIR/stub.sh" unexplained_procs verify_tree_is_contained
+  assert_equal "$output" 'red unanswerable=1 leftovers=[]'
+
+  # 这一步真跑起来确实走这条分支，而且报的那句跟「真有残留」那句分得开
+  assert_contains "$(fix_guard_body verify_the_fix)" 'refusing to read an unanswerable sweep as containment'
+}
+
+# 正面自测：跑验证之前先在那个账号下起一个睡两秒的进程，确认清点真能看见它。
+# 看不见就回退，不声称已经隔离 —— 这是「清点问得出来」唯一的直接证据，光看 `ps` 的
+# 退出码分不出「看不见」和「名下没人」。
+# 真的两个 uid 只有 Linux runner 上有（下面 separated_workspace 那几条测的就是那一半：
+# 分离成功 = 这道自测在真账号上过了）；这里钉的是「看不见的时候它拒绝」。
+@test "claude: isolation is refused unless a probe process under the account is actually seen" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+self_uid=1000
+verify_account=probe-account
+# 迷你 sudo：认 -E 和 -u <用户>，剩下的照原样跑。
+as_root() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -E) shift ;; -u) shift 2 ;; *) break ;; esac
+  done
+  "$@"
+}
+# 第 2 次问的时候报回一个 pid（探针这时候活着），其余报空；blind 一律空手而归 ——
+# 那正是 hidepid 机器上别人的进程的长相。
+ps() {
+  n=$(( $(cat "$BATS_TEST_TMPDIR/ps-calls" 2>/dev/null || echo 0) + 1 ))
+  printf '%s\n' "$n" >"$BATS_TEST_TMPDIR/ps-calls"
+  [ "${BLIND:-0}" = 1 ] && exit 1
+  [ "$n" -ne 2 ] || { printf '4242\n'; exit 0; }
+  exit 1
+}
+if the_sweep_can_see_that_account 4242; then printf 'seen\n'; else printf 'blind\n'; fi
+EOS
+
+  BLIND=0 run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid the_sweep_can_see_that_account
+  assert_equal "$output" 'seen'
+
+  : >"$BATS_TEST_TMPDIR/ps-calls"
+  BLIND=1 run run_helper "$BATS_TEST_TMPDIR/stub.sh" ps_by_uid the_sweep_can_see_that_account
+  assert_equal "$output" 'blind'
+
+  # 自测证不出来就回退（return 1 一路传到调用处那条 warning），不是只记一笔往下走
+  assert_contains "$(fix_guard_body verify_the_fix)" 'the_sweep_can_see_that_account "$uid" || return 1'
+}
+
+# 「不准排定时任务」那一步失败不许静默跳过：拒绝名单是「排一个任务在清点之后起来」
+# 唯一的拦截点，而那个任务起来时拿到的工作区写权限，事后摘组也收不回来。写不进去
+# 就整条回退到 runner 用户那条路（调用处会刷那条 warning），不再嘴上声称已经隔离。
+@test "claude: failing to deny the account scheduled jobs refuses isolation instead of skipping" {
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+verify_account=probe-account
+seen="$BATS_TEST_TMPDIR/deny-seen.txt"
+: >"$seen"
+# 名单文件用 root 的身份读写（ubuntu 上 /etc/at.deny 是 0640 root:daemon）。
+as_root() {
+  case "$1" in
+    grep) grep -qxF "$verify_account" "$seen" 2>/dev/null ;;
+    tee) [ "${TEE_OK:-1}" = 1 ] || return 1; cat >>"$seen" ;;
+    *) return 1 ;;
+  esac
+}
+if deny_the_account_scheduled_jobs; then printf 'denied\n'; else printf 'refused\n'; fi
+printf 'lines=%s\n' "$(grep -c . "$seen" 2>/dev/null || echo 0)"
+EOS
+
+  # 写进去了 → 继续走分离这条路；第二个名单文件读到已经有它就跳过，不重复追加
+  TEE_OK=1 run run_helper "$BATS_TEST_TMPDIR/stub.sh" deny_the_account_scheduled_jobs
+  assert_contains "$output" 'denied'
+  assert_contains "$output" 'lines=1'
+
+  # 写不进去 → 拒绝，绝不静默跳过
+  TEE_OK=0 run run_helper "$BATS_TEST_TMPDIR/stub.sh" deny_the_account_scheduled_jobs
+  assert_contains "$output" 'refused'
+
+  # 拒绝要一路传到调用处：以前这里是 `|| true`，写回去这条就红
+  assert_contains "$(fix_guard_body verify_the_fix)" 'deny_the_account_scheduled_jobs || return 1'
+  refute_contains "$(verify_helper deny_the_account_scheduled_jobs)" '|| true'
+}
+
 # ---------- 两条路共用同一段正文 ----------
 
 # MEL-262 的那条不变量：验证和推送各只有一份正文，两条路都跑它，差别只有 $FIXER

@@ -49,7 +49,9 @@ on:
           auto | off — auto runs the PR's own verify command as a dedicated unprivileged
           account, so no process it leaves behind can read this job's token out of
           /proc/<pid>/environ; it falls back to the runner user (with the leftover-process
-          sweep) on runners without passwordless sudo. off never leaves the runner user:
+          sweep) whenever that account cannot be proven contained here — no passwordless
+          sudo, a privileged workspace group, cron/at deny lists that cannot be written, or
+          a process sweep that cannot see the account. off never leaves the runner user:
           an escape hatch for a repo whose verify command needs the runner user's own
           $HOME, caches or workspace ownership.
         type: string
@@ -296,15 +298,92 @@ jobs:
             verify_user=''
             verify_sandbox=''
             verify_group=''
-            verify_uid="$(id -u)"
+            self_uid="$(id -u)"
+            verify_uid="$self_uid"
             # 专用账号的名字写死，不收调用方的输入：换个名字等于换一个「名下可能已经
             # 有进程」的账号，而这正是下面要证明不成立的那件事。
             verify_account=ghwf-verify
             # 提权只认免密 sudo。没有它（自建 runner / 容器）就回退 —— 这条判定必须
             # 走过滤之后的 PATH：写得动的目录里放一个假 sudo，这一整段就是它说了算。
             as_root() { sudo -n "$@"; }
+
+            # 一个 uid 名下有哪些进程。**别的用户**那一份必须用 root 的身份去问：
+            # procfs 配了 hidepid 的机器（自建 runner）上，普通身份看不见别人的进程目录，
+            # `ps -U` 于是空手而归 —— 而「空」正是这道清点的放行条件，整道门在专用账号
+            # 这条新路上就变成一个看不见的空操作，一个躲出去的进程手里那把工作区写权限
+            # 也不会因为我们事后把账号摘出组而消失（已经跑起来的进程手里的组不回收），
+            # 它就能在「验证通过」和「提交推送」之间把要提交的内容换掉。root 不受
+            # hidepid 限制。自己那个 uid 照旧直接问：回退路径一个字不变，也不要求有 sudo。
+            # 「名下没人」和「问不出来」必须分开报：`ps -U` 在一个进程都没有的时候退 1
+            # 且不输出，那是前者（专用账号名下正好就是这种情况）；其余非零退出码
+            # （sudo 没了、ps 不在写不动的 PATH 上）是后者，照失败往上报，绝不当成空。
+            # 退出码分不开的那部分（hidepid 下也是「退 1 且不输出」）由
+            # the_sweep_can_see_that_account 在跑验证之前实测掉。
+            ps_by_uid() { # ps_by_uid <uid> <ps -o 格式>
+              local out status=0
+              if [ "$1" = "$self_uid" ]; then
+                out="$(ps -U "$1" -o "$2" 2>/dev/null)" || status=$?
+              else
+                out="$(as_root ps -U "$1" -o "$2" 2>/dev/null)" || status=$?
+              fi
+              [ "$status" -eq 0 ] ||
+                { [ "$status" -eq 1 ] && [ -z "$out" ]; } ||
+                return 1
+              [ -z "$out" ] || printf '%s\n' "$out"
+            }
+
+            # 「此刻名下没人」证明不了「过后没人来」：cron 的守护进程每分钟自己看一遍
+            # 用户的 crontab，不需要这个账号有任何服务管理器（MEL-255 把这一类记成
+            # 已知缺口）。所以从源头堵：把它写进 cron / at 的拒绝名单，`crontab` 和
+            # `at` 这两个装任务的入口当场就不收它的活。
+            # 写不进去就返回失败、整条回退到 runner 用户那条路（调用处会刷一条 warning）——
+            # 以前这里是 best-effort 吞掉失败、嘴上仍然声称已经隔离，而那条被跳过的拒绝
+            # 名单正是「排一个任务在清点之后起来」唯一的拦截点：那个任务起来时拿到的
+            # 工作区写权限，摘组也收不回来。静默跳过比没有更糟。
+            # 名单文件本身要用 root 的身份读：ubuntu 上 /etc/at.deny 是 0640 root:daemon，
+            # 普通身份读不动，拿读不动当成「没写进去」会每轮重复追加一行。
+            deny_the_account_scheduled_jobs() {
+              local deny
+              for deny in /etc/cron.deny /etc/at.deny; do
+                if as_root grep -qxF "$verify_account" "$deny" >/dev/null 2>&1; then continue; fi
+                printf '%s\n' "$verify_account" | as_root tee -a "$deny" >/dev/null 2>&1 ||
+                  return 1
+                # 写进去了要有证据：tee 成功而内容没落地（只读挂载上的覆盖文件系统之类）
+                # 同样是「嘴上说着已经隔离」。
+                as_root grep -qxF "$verify_account" "$deny" >/dev/null 2>&1 || return 1
+              done
+            }
+
+            # 正面自测：在那个账号下真起一个睡两秒的进程，确认上面那道清点真能看见它。
+            # 这是「清点问得出来」唯一的直接证据 —— 看不见和名下没人在 `ps` 的退出码上
+            # 长得一模一样（hidepid=2 的机器上别人的进程目录整个不可见），光看退出码
+            # 分不出来。证不出来就回退，别声称已经隔离。
+            # 后半截是反面那一半：探针退干净之后清点要跟着变空。既是对称的证据，也保证
+            # 下面那份基线不把探针自己带进去。
+            the_sweep_can_see_that_account() { # the_sweep_can_see_that_account <uid>
+              local seen='' waited=0 snapshot probe
+              as_root -E -u "$verify_account" sleep 2 </dev/null >/dev/null 2>&1 &
+              probe=$!
+              while [ "$waited" -lt 50 ]; do
+                snapshot="$(ps_by_uid "$1" pid=)" || break
+                if [ -n "$snapshot" ]; then seen=1; break; fi
+                sleep 0.1
+                waited=$((waited + 1))
+              done
+              wait "$probe" >/dev/null 2>&1 || true
+              [ -n "$seen" ] || return 1
+              waited=0
+              while :; do
+                snapshot="$(ps_by_uid "$1" pid=)" || return 1
+                [ -n "$snapshot" ] || return 0
+                [ "$waited" -lt 50 ] || return 1
+                sleep 0.1
+                waited=$((waited + 1))
+              done
+            }
+
             separate_the_verify_user() {
-              local uid group sandbox
+              local uid group sandbox existing
               command -v sudo >/dev/null 2>&1 || return 1
               as_root true >/dev/null 2>&1 || return 1
               # 同一个 job 里两条路各跑一次验证，第二次复用同一个账号。
@@ -314,19 +393,13 @@ jobs:
                 return 1
               uid="$(id -u "$verify_account" 2>/dev/null)" || return 1
               case "$uid" in ''|0|*[!0-9]*) return 1 ;; esac
-              # 「此刻名下没人」证明不了「过后没人来」：cron 的守护进程每分钟自己看一遍
-              # 用户的 crontab，不需要这个账号有任何服务管理器（MEL-255 把这一类记成
-              # 已知缺口）。所以从源头堵：把它写进 cron / at 的拒绝名单，`crontab` 和
-              # `at` 这两个装任务的入口当场就不收它的活。best-effort —— 装不上只是退回
-              # 到那条已知缺口，而下面还有一道（跑完把它从工作区那个组里摘出去）。
-              for deny in /etc/cron.deny /etc/at.deny; do
-                grep -qxF "$verify_account" "$deny" 2>/dev/null ||
-                  printf '%s\n' "$verify_account" | as_root tee -a "$deny" >/dev/null 2>&1 ||
-                  true
-              done
+              # 排不进定时任务是「过后没人来」的唯一拦截点，写不进去就回退（上面那段）。
+              deny_the_account_scheduled_jobs || return 1
               # 现在就得是空的。名下已经有活进程（自建 runner 上账号跨 job 留着）说明
               # 有人已经在等，那就回退，别带着一份解释不清的基线往下走。
-              [ -z "$(ps -U "$uid" -o pid= 2>/dev/null)" ] || return 1
+              # 问不出来（ps_by_uid 返回失败）同样回退：那时候「空」什么都不证明。
+              existing="$(ps_by_uid "$uid" pid=)" || return 1
+              [ -z "$existing" ] || return 1
               # 工作区归属：它要写得动 .venv / node_modules，而我们回头还要 git add -u、
               # 下一轮交接前还要 git clean -fdx 删得掉它造出来的目录。所有权一个字不改，
               # 走组权限：工作区整个 g+w、目录全部 setgid（它新建的文件和目录跟着继承
@@ -363,6 +436,11 @@ jobs:
               # 自己清 $RUNNER_TEMP 都会撞权限）。
               [ "$(as_root -E -u "$verify_account" id -u 2>/dev/null)" = "$uid" ] || return 1
               as_root -E -u "$verify_account" test -w "$verify_ws" >/dev/null 2>&1 || return 1
+              # 第三条自测，也是这一整道清点唯一的正面证据：在那个账号下真起一个进程，
+              # 确认清点看得见它（上面那段 the_sweep_can_see_that_account）。排在这里是
+              # 因为它要以那个账号的身份启动，而上面那两条刚刚证明了这台机器上
+              # `sudo -E -u` 走得通。看不见就回退，别声称已经隔离。
+              the_sweep_can_see_that_account "$uid" || return 1
               # 它自己的 HOME / 缓存 / 临时目录。沙箱归它，但组仍然是我们的（g+rwX +
               # 目录 setgid，同工作区那一套）—— 不这么做，runner 回头连自己的
               # $RUNNER_TEMP 都删不掉。
@@ -581,11 +659,15 @@ jobs:
             # 僵尸不算：它已经死了，只是还没被收尸，读不了任何东西。
             # 一个进程都没有的时候 `ps -U` 退 1（不是空输出退 0）—— 专用账号名下正好
             # 就是这种情况，而 pipefail 会让这一整条管道失败，拿它赋值的那一行于是在
-            # set -e 下静默打断整步（stderr 已经被吞掉，连一句话都看不到）。所以这里
-            # 把「没人」和「问不出来」分开：没人 = 空输出；问不出来由跑验证之前那条
-            # `ps -p $$` 单独判。
+            # set -e 下静默打断整步（stderr 已经被吞掉，连一句话都看不到）。所以「没人」
+            # 和「问不出来」由上面的 ps_by_uid 分开：没人 = 空输出退 0，问不出来 = 退非零，
+            # 这里照样往上报，调用处每一个都接住（以前是 `|| true` 一律当成空，那会让
+            # 问不出来的机器上整道清点变成一个看不见的空操作）。
+            # 专用账号那个 uid 由 ps_by_uid 用 root 的身份去问，不受 procfs hidepid 影响。
             user_procs() {
-              { ps -U "$verify_uid" -o pid=,ppid=,stat=,lstart=,args= 2>/dev/null || true; } |
+              local raw
+              raw="$(ps_by_uid "$verify_uid" pid=,ppid=,stat=,lstart=,args=)" || return 1
+              printf '%s' "$raw" |
                 awk 'NF >= 8 && $3 !~ /^Z/ {
                   cmd = ""
                   for (i = 9; i <= NF; i++) cmd = cmd (i > 9 ? " " : "") $i
@@ -658,16 +740,22 @@ jobs:
             [ -n "$verify_user" ] || prewarm_socket_activated_services || true
 
             # 清点不出来就等于这一道什么都没做 —— 静默的 no-op 比没有更糟，红着停下。
-            # 分离出去之后反过来：那个账号名下**本来就该是空的**（上面已经证明过一次），
-            # 所以「空」不是清点坏了，正是我们要的基线。`ps` 本身好不好使在跑验证之前
-            # 就单独判过了。
-            if [ -z "$verify_user" ] && [ -z "$(user_procs)" ]; then
+            # 两条路都在这里判「问不出来」：ps_by_uid 失败就红，绝不当成「名下没人」。
+            if ! verify_procs_now="$(user_procs)"; then
+              echo "::error::cannot list the processes owned by uid $verify_uid; cannot prove the verify command leaves nothing alive"
+              exit 1
+            fi
+            # 回退路径上「一个都列不出来」本身就是坏消息：我们自己这个 shell 就在里面。
+            # 分离出去之后反过来：那个账号名下**本来就该是空的**（上面已经证明过一次，
+            # 而且那道正面自测刚刚实测过清点看得见它名下的进程），所以「空」不是清点坏了，
+            # 正是我们要的基线。
+            if [ -z "$verify_user" ] && [ -z "$verify_procs_now" ]; then
               echo '::error::cannot list this user'"'"'s processes; cannot prove the verify command leaves nothing alive'
               exit 1
             fi
             # 基线只留 pid|ppid|启动时刻，不留命令行：拿它喂 awk -v，别让 PR 自己起的
             # 进程名把内容带进去。
-            verify_procs_baseline="$(user_procs | cut -d'|' -f1-3)"
+            verify_procs_baseline="$(printf '%s\n' "$verify_procs_now" | cut -d'|' -f1-3)"
 
             # 验证命令跑在它自己的进程组里：set -m 让后台任务另起一组（组号 = 该任务
             # 的 pid），跑完才能 kill -- -组号 连整组一起收掉。它可以 fork 一个进程再让
@@ -772,10 +860,14 @@ jobs:
             # 它往里补一行自己的 pid 就把自己写成「基线里本来就有的」了。基线只活在
             # 这个 shell 的变量里，验证命令是子进程，改不到。
             verify_leftovers=''
+            verify_sweep_unanswerable=''
             unexplained_procs() {
+              local snapshot
+              # 问不出来就整条返回失败，别让它长得像「名下一个多余的都没有」。
+              snapshot="$(user_procs)" || return 1
               {
                 printf '%s\n' "$verify_procs_baseline" | sed 's/^/B|/'
-                user_procs | sed 's/^/S|/'
+                [ -z "$snapshot" ] || printf '%s\n' "$snapshot" | sed 's/^/S|/'
               } | awk -F'|' -v self="$$" '
                   $1 == "B" { known[$2 "|" $4] = 1; next }
                   $1 == "S" {
@@ -821,7 +913,10 @@ jobs:
             verify_tree_is_contained() {
               local waited=0
               while :; do
-                verify_leftovers="$(unexplained_procs)"
+                if ! verify_leftovers="$(unexplained_procs)"; then
+                  verify_sweep_unanswerable=1
+                  return 1
+                fi
                 [ -n "$verify_leftovers" ] || return 0
                 [ "$waited" -lt 50 ] || return 1
                 sleep 0.1
@@ -830,6 +925,13 @@ jobs:
             }
 
             if ! verify_tree_is_contained; then
+              # 「问不出来」和「真有残留」要分开报：前者是这道门自己坏了（没有 sudo、
+              # ps 不在写不动的 PATH 上），后者是它抓到了东西。两种都红，但诊断不一样。
+              if [ -n "$verify_sweep_unanswerable" ]; then
+                echo '- verification: **rejected**, the leftover-process sweep could not be answered' >>"$GITHUB_STEP_SUMMARY"
+                echo "::error::cannot list the processes owned by uid $verify_uid after the verify command${verify_user:+ (the dedicated account $verify_user)}; refusing to read an unanswerable sweep as containment"
+                exit 1
+              fi
               echo '- verification: **rejected**, a process it started outlived it' >>"$GITHUB_STEP_SUMMARY"
               echo "::error::a process owned by uid $verify_uid (the user the verify command ran as${verify_user:+, the dedicated account $verify_user}) outlived the verify command ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); refusing to trust the post-verify tree"
               echo "::error::nothing is exempt from this gate; each leftover's cgroup, to tell an on-demand service the pre-warm missed (runner-user path only) from a real escapee: $(leftover_origins | tr '\n' ';')"
