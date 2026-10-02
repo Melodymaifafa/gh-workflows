@@ -58,7 +58,6 @@ setup() {
 # Gate 之后的工作区：调用方仓库已经 checkout 好，意见预取在 .review/ 里，
 # 而 .review/ 已写进本地 exclude（Gate 那步干的，iterate-gate.bats 盯着）。
 handover_workspace() {
-  export RUN_SLUG=99-1
   git init -q .
   git config user.email t@e
   git config user.name t
@@ -71,13 +70,16 @@ handover_workspace() {
   printf '## 行内评论\n\n- scripts/x.sh:12 — this swallows the error\n' >.review/findings.md
 }
 
-@test "takeover: Codex is never handed a missing or empty review" {
+# 云端的 Codex 自己从 GitHub 读这批意见，所以预取的那份文件不再交给谁 —— 留着当
+# 哨兵：它空了说明 Gate 这一轮压根没拿到意见，而「没有意见还去请人修」的结局是
+# 补丁无从谈起、job 打绿勾收工、链条静默停住。
+@test "takeover: a round whose review could not be prefetched never reaches Codex" {
   handover_workspace
   mv .review/findings.md .review/gone.md
   run run_block "$WF" "Hand the round over to Codex"
   assert_equal "$status" 1
   assert_contains "$output" '::error::'
-  assert_contains "$output" 'incomplete review'
+  assert_contains "$output" 'a review we could not read'
 
   mv .review/gone.md .review/findings.md
   : >.review/findings.md
@@ -85,38 +87,15 @@ handover_workspace() {
   assert_equal "$status" 1
 }
 
-@test "takeover: the handoff names the excluded prefetch, not a file in the caller's checkout" {
+@test "takeover: the handoff puts the workspace back on the round's starting commit" {
   handover_workspace
 
   run run_block "$WF" "Hand the round over to Codex"
 
   assert_equal "$status" 0
-  assert_equal "$(step_output file)" .review/findings-99-1.md
-  assert_contains "$(cat codex-review-context.md)" 'already tracks'
-  assert_contains "$(cat .review/findings-99-1.md)" 'this swallows the error'
-}
-
-# 预取的正文躺在调用方的工作副本里，而交接前要 git reset --hard 回起点。
-# .git/info/exclude 只挡 git add 和 git clean，挡不住 reset 恢复被跟踪文件：
-# 调用方仓库自己跟踪了一个 .review/findings.md 时，reset 会拿他们那份盖掉预取
-# 的那份，非空检查照样通过，Codex 对着一份跟本 PR 无关的内容改代码。
-@test "takeover: the caller's own tracked .review/findings.md cannot displace the prefetch" {
-  handover_workspace
-  printf 'a file the caller repo tracks under .review\n' >.review/findings.md
-  git add -f .review/findings.md
-  git commit -q -m 'the caller tracks .review/findings.md too'
-  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
-  # Gate 把本轮的意见预取进去，盖在被跟踪的那份上面
-  printf '## 行内评论\n\n- scripts/x.sh:12 — this swallows the error\n' >.review/findings.md
-
-  run run_block "$WF" "Hand the round over to Codex"
-
-  assert_equal "$status" 0
-  handed="$(step_output file)"
-  assert_contains "$(cat "$handed")" 'this swallows the error'
-  refute_contains "$(cat "$handed")" 'the caller repo tracks'
-  # 交出去的那份还必须是 git 看不见的，否则下一步 git add -A 会把它提交进 PR
+  assert_equal "$(git rev-parse HEAD)" "$BASE_SHA"
   assert_equal "$(git status --porcelain)" ''
+  assert_contains "$(cat codex-review-context.md)" 'already tracks'
 }
 
 @test "takeover: Claude's uncommitted leftovers never ship as a Codex fix" {
@@ -131,13 +110,11 @@ handover_workspace() {
   assert_contains "$(cat codex-review-context.md)" 'already tracks'
   refute_contains "$(cat codex-review-context.md)" 'half-finished'
   [ ! -e claude-wip.txt ]
-  [ -s .review/findings-99-1.md ]
 }
 
 # 半成品还能藏在 .gitignore 后面：Claude 撞额度前跑过一半的 uv sync 留下 .venv，
-# 没有 -x 的 git clean 扫不走它，它就跟着进 Codex 这一轮，验证跑在一个被污染的
-# 工作区上。预取的意见在 clean 之前就挪出了工作区，clean 之后才放回去，所以 -x
-# 连它一起扫也不影响。
+# 没有 -x 的 git clean 扫不走它，它就跟着进 Codex 这一轮，补丁和验证都跑在一个
+# 被污染的工作区上。
 @test "takeover: an ignored leftover never survives into the Codex round" {
   handover_workspace
   printf '.venv/\n' >.gitignore
@@ -150,14 +127,13 @@ handover_workspace() {
 
   assert_equal "$status" 0
   [ ! -e .venv/pyvenv.cfg ]
-  assert_contains "$(cat .review/findings-99-1.md)" 'this swallows the error'
 }
 
 # 还有一类残留连 -x 都扫不掉：一个没被跟踪的目录，如果它自己是个 git 仓库（里面
 # 有 .git），单 -f 的 git clean 按设计跳过它、还 exit 0。验证命令 git clone 了点
-# 东西、或者 git init 了个临时目录，就留下这么一个；它活过换人，Codex 和它之后那
-# 轮验证都跑在这堆残留上，而残留不在最后推出去的 commit 里。要第二个 -f 才删得掉。
-# 两种都摆上：被忽略的（-x 的范围）和纯没被跟踪的（-d 的范围）。
+# 东西、或者 git init 了个临时目录，就留下这么一个；它活过换人，Codex 那一轮的
+# 补丁和验证都跑在这堆残留上，而残留不在最后推出去的 commit 里。要第二个 -f 才
+# 删得掉它。两种都摆上：被忽略的（-x 的范围）和纯没被跟踪的（-d 的范围）。
 @test "takeover: an untracked nested git repo never survives into the Codex round" {
   handover_workspace
   printf 'vendored/\n' >.gitignore
@@ -176,7 +152,280 @@ handover_workspace() {
   [ ! -e vendored/dep ]
   [ ! -e scratch-clone ]
   assert_equal "$(git status --porcelain)" ''
-  assert_contains "$(cat .review/findings-99-1.md)" 'this swallows the error'
+}
+
+# ---------- 请 Codex 云端出补丁 ----------
+#
+# 这一步发一句写死的留言，等 Codex 自己回一段 diff，打到工作区里。守三件事：
+#   1. 留言原文和隐藏标记一字不差 —— 措辞是 MEL-266 实测出来的，而标记里不许
+#      出现「@codex review」，否则这句话会被复审链当成召唤。
+#   2. 只认 Codex 在这条请求之后发的第一条新评论，而且里面恰好一个 diff 块。
+#   3. 每一种失败都是同一个处置：红着停下 + 一条告警 + 工作区一个字都不动。
+
+STEP='Ask Codex for the fix as a patch'
+REQUEST='@codex fix the issues from your review, then paste the complete change as one unified diff (the format git apply accepts) in a diff code block in your reply.'
+
+# 一段真能打上的补丁：拿真 git 算，别手写 hunk 头。
+codex_patch() { # codex_patch <文件> <新增的一行>
+  printf '%s\n' "$2" >>"$1"
+  git diff -- "$1"
+  git checkout -q -- "$1"
+}
+
+# Codex 那条回复的样子：总结 + 一个 ```diff 块 + Testing 清单。
+diff_reply() { # diff_reply <补丁正文>
+  # 补丁正文走过 $( ) 会被剥掉末尾换行，收尾围栏前的 \n 必须自己补上。
+  printf '### Summary\n\n* Fixed the swallowed error.\n\n```diff\n%s\n```\n\n**Testing**\n\n* `bats tests/`\n' "$1"
+}
+
+# ask_codex [回复正文]：摆好这一步要的环境和假 GitHub，然后跑它。
+# 不给回复正文 = Codex 一直不回（超时那条路）。
+ask_codex() {
+  export CODEX_PAT=owner-pat GH_TOKEN=write-token
+  export HEAD_SHA="$H" ROUND=2 RUN_ID=777
+  export PATCH_EXTRACTOR; PATCH_EXTRACTOR="$(cat "$SCRIPTS/extract-codex-patch.sh")"
+  export FAKE_NOW=2026-10-02T08:00:00Z
+  fake_route -X POST repos/o/r/issues/7/comments '{"id":5000}'
+  if [ "$#" -ge 1 ]; then
+    fake_route "repos/o/r/issues/7/comments?per_page=100" '[]' 1
+    fake_route "repos/o/r/issues/7/comments?per_page=100" \
+      "$(json_array "$(gh_comment 5001 "$CODEX" NONE "$1")")" 2
+  else
+    fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
+  fi
+  trust_fake_bin
+  run run_block "$WF" "$STEP"
+}
+
+@test "patch: the request is the exact wording MEL-266 proved, plus a marker that is not a summon" {
+  handover_workspace
+  ask_codex "$(diff_reply "$(codex_patch codex-review-context.md 'fixed by codex')")"
+
+  assert_equal "$status" 0
+  body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
+  assert_equal "$body" "$(printf '%s\n\n<!-- codex-fix-request: head=%s round=2 run=777 -->' "$REQUEST" "$H")"
+  # 含 @codex、不含 @codex review：codex-approved-merge 的触发条件和巡检的 M1
+  # 计数都按后者认复审请求（tests/pr-sweep.bats 有一条对着同一段正文判）。
+  assert_contains "$body" '@codex'
+  refute_contains "$body" '@codex review'
+  # 请求必须出自真人账号的 PAT，否则 Codex 不理 bot 的 @ 提及
+  assert_contains "$(fake_calls 'gh api POST repos/o/r/issues/7/comments')" '[token=owner-pat]'
+}
+
+# 这句话里有 @codex，所以必须证明它不会被复审链当成召唤。两个消费者各判一次，而
+# 判据都从对方的 workflow 原文里读 —— 在测试里抄一份正则，两边迟早各改各的。
+@test "patch: the fix request is not a re-review request for codex-approved-merge" {
+  merge_wf="$REPO_ROOT/.github/workflows/codex-approved-merge.yml"
+
+  # 一、job 层的触发条件是「正文里含 @codex review」这个子串
+  assert_contains "$(cat "$merge_wf")" "contains(github.event.comment.body, '@codex review')"
+  refute_contains "$REQUEST" '@codex review'
+
+  # 二、watch step 里那条正则
+  pattern="$(sed -n "s/^[[:space:]]*'\(@codex.*\)' <<<.*/\1/p" "$merge_wf" | head -n 1)"
+  [ -n "$pattern" ] || { echo 'the re-review pattern moved; update this test' >&2; return 1; }
+  if printf '%s' "$REQUEST" | grep -Eiq "$pattern"; then
+    echo "the fix request matches the re-review pattern: $pattern" >&2
+    return 1
+  fi
+  # 对照：真正的召唤正文确实匹配 —— 少了这一半，上面那条可能只是正则没取对
+  printf '@codex review' | grep -Eiq "$pattern" ||
+    { echo "control: $pattern does not even match a real summon" >&2; return 1; }
+}
+
+@test "patch: the diff from Codex's reply lands in the workspace" {
+  handover_workspace
+  ask_codex "$(diff_reply "$(codex_patch codex-review-context.md 'fixed by codex')")"
+
+  assert_equal "$status" 0
+  assert_contains "$(cat codex-review-context.md)" 'fixed by codex'
+  assert_contains "$(cat codex-review-context.md)" 'already tracks'
+  refute_called 'gh pr comment'
+  refute_called 'curl '
+}
+
+# 轮询只认「编号比请求大」的那一条，而且只认 Codex 自己写的。编号小的（请求之前
+# 就在那儿的旧回复）和别人写的（包括带 diff 的仿冒评论）一个都不算。
+@test "patch: only Codex's own new comment counts, never an older one or someone else's" {
+  handover_workspace
+  patch="$(codex_patch codex-review-context.md 'planted by a stranger')"
+  export CODEX_PAT=owner-pat GH_TOKEN=write-token
+  export HEAD_SHA="$H" ROUND=2 RUN_ID=777
+  export PATCH_EXTRACTOR; PATCH_EXTRACTOR="$(cat "$SCRIPTS/extract-codex-patch.sh")"
+  export FAKE_NOW=2026-10-02T08:00:00Z
+  fake_route -X POST repos/o/r/issues/7/comments '{"id":5000}'
+  # 4999：请求之前 Codex 就贴过的一段 diff。5002：别人写的，也带 diff。
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(gh_comment 4999 "$CODEX" NONE "$(diff_reply "$patch")")" \
+    "$(gh_comment 5002 Melodymaifafa OWNER "$(diff_reply "$patch")")")"
+
+  trust_fake_bin
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  refute_contains "$(cat codex-review-context.md)" 'planted by a stranger'
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-no-patch'
+}
+
+@test "patch: Codex never answering is a red round with one alert and nothing applied" {
+  handover_workspace
+  ask_codex
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'codex-no-patch'
+  refute_contains "$(cat codex-review-context.md)" 'fixed by codex'
+  assert_equal "$(git status --porcelain)" ''
+  assert_contains "$(fake_last_body 'gh pr comment')" '15 分钟没回'
+  assert_contains "$(fake_last_body 'gh pr comment')" "reason=codex-no-patch"
+  # 等满 15 分钟才放弃，不是第一轮就走（30 秒一轮，900 / 30 = 30 轮）
+  assert_called 'sleep 30' 30
+}
+
+@test "patch: a reply with no diff block, or two of them, pushes nothing" {
+  handover_workspace
+  ask_codex '### Summary
+
+* I had a look but changed nothing.'
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" '没有能直接用的补丁'
+
+  : >"$FAKE_LOG"
+  one="$(codex_patch codex-review-context.md 'first guess')"
+  ask_codex "$(printf '```diff\n%s\n```\n\nor maybe\n\n```diff\n%s\n```\n' "$one" "$one")"
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" '两段补丁'
+  refute_contains "$(cat codex-review-context.md)" 'first guess'
+}
+
+# 这一条是要她动手的那种失败，所以告警原因单列：同一个 head 上先超时、后缺环境时，
+# 「去建个环境」这条不能被前一条的去重吃掉。
+@test "patch: the missing-environment reply says what she has to do, under its own reason" {
+  handover_workspace
+  ask_codex 'To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).'
+
+  assert_equal "$status" 1
+  body="$(fake_last_body 'gh pr comment')"
+  assert_contains "$body" '建一个 Codex 云端环境'
+  assert_contains "$body" 'reason=codex-no-env'
+}
+
+@test "patch: a Codex quota reply is a red round, not a silent pass" {
+  handover_workspace
+  ask_codex 'You have reached your Codex usage limits. Try again later.'
+
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" '额度上限'
+  assert_equal "$(git status --porcelain)" ''
+}
+
+@test "patch: a patch that does not apply is refused before anything is written" {
+  handover_workspace
+  stale="$(printf 'diff --git a/codex-review-context.md b/codex-review-context.md\n--- a/codex-review-context.md\n+++ b/codex-review-context.md\n@@ -1 +1 @@\n-a line this file never had\n+something else\n')"
+  ask_codex "$(diff_reply "$stale")"
+
+  assert_equal "$status" 1
+  assert_equal "$(git status --porcelain)" ''
+  assert_contains "$(fake_last_body 'gh pr comment')" '打不到这个分支上'
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-patch-rejected'
+}
+
+# 推送用的令牌没有 workflows 权限（gh-workflows PR #18 实测推不上去），而且工作流
+# 文件正是这条流水线自己的防线。两头都要拦：numstat 报的是改动的去处，一次改名把
+# 工作流文件搬走它看不见，所以补丁自己的头行也一起扫。
+@test "patch: a patch that touches .github/workflows is refused, both ways round" {
+  handover_workspace
+  mkdir -p .github/workflows
+  printf 'on: push\n' >.github/workflows/ci.yml
+  git add .github/workflows/ci.yml
+  git commit -q -m 'the caller repo has a workflow'
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+
+  ask_codex "$(diff_reply "$(codex_patch .github/workflows/ci.yml '# tweaked by codex')")"
+  assert_equal "$status" 1
+  assert_equal "$(git status --porcelain)" ''
+  assert_contains "$(fake_last_body 'gh pr comment')" '改到了工作流文件'
+
+  # 改名搬走一个工作流文件：numstat 只报 moved.yml，来源那一侧只在头行里
+  : >"$FAKE_LOG"
+  renamed="$(printf 'diff --git a/.github/workflows/ci.yml b/moved.yml\nsimilarity index 100%%\nrename from .github/workflows/ci.yml\nrename to moved.yml\n')"
+  ask_codex "$(diff_reply "$renamed")"
+  assert_equal "$status" 1
+  [ ! -e moved.yml ]
+  assert_contains "$(fake_last_body 'gh pr comment')" '改到了工作流文件'
+}
+
+@test "patch: without the extractor from the staging step the round goes red, nothing applied" {
+  handover_workspace
+  export CODEX_PAT=owner-pat GH_TOKEN=write-token
+  export HEAD_SHA="$H" ROUND=2 RUN_ID=777 PATCH_EXTRACTOR='' FAKE_NOW=2026-10-02T08:00:00Z
+
+  trust_fake_bin
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" '取补丁的脚本'
+  refute_called 'gh api POST'
+}
+
+@test "patch: a missing CODEX_TRIGGER_TOKEN alerts instead of posting nothing at all" {
+  handover_workspace
+  export CODEX_PAT='' GH_TOKEN=write-token
+  export HEAD_SHA="$H" ROUND=2 RUN_ID=777 FAKE_NOW=2026-10-02T08:00:00Z
+  export PATCH_EXTRACTOR; PATCH_EXTRACTOR="$(cat "$SCRIPTS/extract-codex-patch.sh")"
+
+  trust_fake_bin
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" 'CODEX_TRIGGER_TOKEN'
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=pat-missing'
+}
+
+# 这一步手上是 CODEX_TRIGGER_TOKEN —— 整条链上权限最大的那把钥匙。往一个「我们写得
+# 动」的 PATH 目录里种一个假 gh，它就直接拿到令牌。所以命令只从写不动的目录里找。
+@test "patch: a gh planted on a writable PATH entry never gets the trigger token" {
+  handover_workspace
+  # 只种 gh：令牌是递给它的那一个。git / awk 不种 —— 这套测试的助手自己就用它们，
+  # 种了就在 step 还没开始前先污染战利品日志。
+  plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh
+  export CODEX_PAT=owner-pat GH_TOKEN=write-token GH_HOST=127.0.0.1
+  export HEAD_SHA="$H" ROUND=2 RUN_ID=777 FAKE_NOW=2026-10-02T08:00:00Z
+  export PATCH_EXTRACTOR; PATCH_EXTRACTOR="$(cat "$SCRIPTS/extract-codex-patch.sh")"
+
+  run run_block "$WF" "$STEP"
+
+  refute_planted_ran
+  # 对照：同一批假命令接回 PATH 就真被跑了 —— 上面那条不是因为它压根没种上。
+  trust_fake_bin
+  FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_block "$WF" "$STEP"
+  assert_planted_runs_when_trusted
+}
+
+# 取补丁的判定躺在 $RUNNER_TEMP/fixer-scripts 里，而那个目录验证命令写得动（同
+# 分类脚本那条）。换掉它不光拿得到这一步的 CODEX_TRIGGER_TOKEN，回一句 reason=ok
+# 还能把任意一段补丁送进工作区。这一步跑的是 step output 里那份正文。
+@test "patch: an extractor rewritten after it was staged never runs with the trigger token" {
+  handover_workspace
+  export PLANTED_LOG="$BATS_TEST_TMPDIR/planted-extractor.log"
+  # shellcheck disable=SC2016  # 字面量写进被种的脚本
+  printf '%s\n' 'printf "CODEX_PAT=%s\n" "${CODEX_PAT:-}" >>"$PLANTED_LOG"' \
+    'printf "reason=ok\n"' >"$RUNNER_TEMP/fixer-scripts/extract-codex-patch.sh"
+
+  ask_codex 'nothing usable here'
+
+  assert_equal "$status" 1
+  [ ! -s "$PLANTED_LOG" ] || { echo "the planted extractor ran: $(cat "$PLANTED_LOG")" >&2; return 1; }
+  # 不是靠整步空转通过：真正那份判定照旧下了结论并告警
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-no-patch'
+}
+
+@test "structure: the patch step takes its extractor and alert helpers from step outputs" {
+  block="$(extract_run_block "$REPO_ROOT/$WF" "$STEP")"
+  refute_contains "$block" 'pr-guard.sh'
+  refute_contains "$block" 'fixer-scripts'
+  keys="$(step_env_keys "$WF" "$STEP")"
+  assert_contains "$keys" 'PATCH_EXTRACTOR'
+  assert_contains "$keys" 'PR_GUARD'
 }
 
 # ---------- 验证、提交、推送 ----------
@@ -1376,6 +1625,8 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   export OUTCOME_RESULT=success OUTCOME_FAILED=true
   export OUTCOME_REASON="$3" OUTCOME_UNTIL=1787569200 HEAD_SHA="$H"
   export EXECUTION_FILE=''
+  # 换人的前提是这批意见出自 Codex 自己；测试要验别的性质时就别再改它。
+  export REVIEWER="${REVIEWER:-Codex}"
   if [ -n "${4:-}" ]; then
     EXECUTION_FILE="$BATS_TEST_TMPDIR/exec.json"
     jq -n --arg r "$4" --arg s "${5:-}" \
@@ -1533,7 +1784,7 @@ EOS
   git init -q .
   git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
   export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
-  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true
+  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true REVIEWER=Codex
   export OUTCOME_RESULT=success OUTCOME_FAILED=true
   export OUTCOME_REASON=fix-failed OUTCOME_UNTIL=- HEAD_SHA="$H"
   export EXECUTION_FILE="$BATS_TEST_TMPDIR/exec.json"
@@ -1555,7 +1806,7 @@ EOS
   git init -q .
   git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
   export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
-  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true
+  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true REVIEWER=Codex
   export OUTCOME_RESULT=success OUTCOME_FAILED=true
   export OUTCOME_REASON=fix-failed OUTCOME_UNTIL=- HEAD_SHA="$H"
   export EXECUTION_FILE="$BATS_TEST_TMPDIR/exec.json"
@@ -1571,6 +1822,27 @@ EOS
   assert_equal "$(step_output run_codex)" true
 }
 
+# 请 Codex 出补丁那句留言里写的是「your review」—— 这批意见不是它写的，它就没有
+# 指代对象（Codex 不可用、改由 Claude 代审的那种轮次）。这条路不能走：照业务失败
+# 处置，红着停下 + 告警，巡检之后会再叫 Claude。
+@test "takeover: a Claude stand-in review is never handed to Codex for a patch" {
+  REVIEWER='Claude 代审' decide claude true fix-quota 'API Error: 429 rate_limit_error'
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+  assert_contains "$output" 'did not write'
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-no-review'
+}
+
+# review_fixer=codex 钉死 Codex 的那一半同样要拦：Claude 压根没上，但留言照样
+# 指代不上。
+@test "takeover: review_fixer=codex still refuses a review Codex did not write" {
+  REVIEWER='Claude 代审' decide codex false ''
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+  assert_contains "$output" 'did not write'
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-no-review'
+}
+
 # 正常路径上 Check the fix outcome 会先打红，走不到这一步；这里守的是兜底本身。
 @test "takeover: review_fixer=claude never hands over, even on a real provider limit" {
   decide claude false fix-quota 'API Error: 429 rate_limit_error'
@@ -1580,7 +1852,7 @@ EOS
 }
 
 @test "takeover: review_fixer=codex runs Codex without ever consulting Claude's outcome" {
-  export REVIEW_FIXER=codex FIRST=codex FALLBACK_ALLOWED=false
+  export REVIEW_FIXER=codex FIRST=codex FALLBACK_ALLOWED=false REVIEWER=Codex
   export OUTCOME_RESULT=skipped OUTCOME_FAILED='' OUTCOME_REASON='' OUTCOME_UNTIL=''
   export HEAD_SHA="$H" EXECUTION_FILE=''
   trust_fake_bin
@@ -1592,7 +1864,7 @@ EOS
 
 @test "takeover: an earlier step's failure is not laundered into a handover" {
   git init -q .
-  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true
+  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true REVIEWER=Codex
   export OUTCOME_RESULT=failure OUTCOME_FAILED='' OUTCOME_REASON='' OUTCOME_UNTIL=''
   export HEAD_SHA="$H" EXECUTION_FILE=''
   trust_fake_bin
@@ -1689,7 +1961,7 @@ EOS
 # 我们写不动的目录里找。把那段过滤摘掉，这一条当场变红。
 @test "takeover: a gh planted on a writable PATH entry never gets the decision step's token" {
   plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh git jq sed curl date
-  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true
+  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true REVIEWER=Codex
   export OUTCOME_RESULT=success OUTCOME_FAILED=true
   export OUTCOME_REASON=fix-quota OUTCOME_UNTIL=1787569200 HEAD_SHA="$H"
   export EXECUTION_FILE='' BASE_SHA=''
@@ -1707,24 +1979,38 @@ EOS
   assert_planted_runs_when_trusted
 }
 
-# 发总结这一步手上是 github.token，处置跟 Claude 那条路的同名步骤一样：找不到写保护
-# 目录里的 gh 就只 warning 跳过评论，正文照旧留在这一轮的运行页上。
-@test "takeover: a gh planted on a writable PATH entry never gets the Codex summary token" {
+# Codex 自己那段「修了什么、跳过了什么」已经作为它的回复贴在 PR 上了，这一步不再
+# 转贴，只补一句它说不了的事：改动在沙箱外跑过验证。没推东西就什么也不说。
+@test "takeover: the verification note only claims what actually got pushed" {
+  export PUSHED=true REPO=o/r PR_NUMBER=7 GH_TOKEN=write-token
+  trust_fake_bin
+  run run_step "$WF" "Post the Codex verification note"
+  assert_equal "$status" 0
+  assert_equal "$(fake_last_body 'gh pr comment')" '验证：本仓库的 lint 与测试已在沙箱外跑过，全绿后才推送。'
+
+  : >"$FAKE_LOG"
+  export PUSHED=''
+  run run_step "$WF" "Post the Codex verification note"
+  assert_equal "$status" 0
+  refute_called 'gh pr comment'
+}
+
+# 这一步手上是 github.token，处置跟 Claude 那条路的同名步骤一样：找不到写保护目录
+# 里的 gh 就只 warning 跳过评论，正文照旧留在这一轮的运行页上。
+@test "takeover: a gh planted on a writable PATH entry never gets the verification note's token" {
   plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh
-  export SUMMARY='Codex 修了 2 条，跳过 1 条'
   export PUSHED=true REPO=o/r PR_NUMBER=7 GH_TOKEN=write-token GH_HOST=127.0.0.1
 
-  run run_step "$WF" "Post the Codex summary comment"
+  run run_step "$WF" "Post the Codex verification note"
 
   assert_equal "$status" 0
   refute_planted_ran
   # 不是空转：正文照旧写进了这一轮的运行页
-  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" 'Codex 修了 2 条，跳过 1 条'
   assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" '沙箱外跑过'
 
   # 对照：同一个假 gh，接回 PATH 就真被跑了
   trust_fake_bin
-  FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_step "$WF" "Post the Codex summary comment"
+  FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_step "$WF" "Post the Codex verification note"
   assert_planted_runs_when_trusted
 }
 
@@ -1770,7 +2056,7 @@ codex_mode_context() {
   assert_contains "$(fake_last_body "gh pr comment")" 'Claude 自动修复没跑成'
 }
 
-@test "gating: review_fixer=codex actually reaches all four Codex steps" {
+@test "gating: review_fixer=codex actually reaches every Codex step" {
   codex_mode_context
   gate_trace "$WF"
 
@@ -1778,10 +2064,10 @@ codex_mode_context() {
   gate_skipped 'Check the fix outcome'
   gate_ran 'Decide the takeover'
   gate_ran 'Hand the round over to Codex'
-  gate_ran 'Codex fixes the PR'
+  gate_ran 'Ask Codex for the fix as a patch'
   gate_ran 'Verify the Codex fix'
   gate_ran 'Commit and push the Codex fix'
-  gate_ran 'Post the Codex summary comment'
+  gate_ran 'Post the Codex verification note'
   gate_ran 'Request Codex re-review after a new commit'
 }
 
@@ -1790,7 +2076,7 @@ codex_mode_context() {
 # 召唤排在发总结之前。
 @test "gating: a flaky summary comment cannot stop the re-review summon" {
   codex_mode_context
-  gate_fails 'Post the Codex summary comment'
+  gate_fails 'Post the Codex verification note'
   gate_trace "$WF"
 
   gate_ran 'Verify the Codex fix'
@@ -1810,10 +2096,10 @@ codex_mode_context() {
   gate_ran 'Check the fix outcome'
   gate_ran 'Decide the takeover'
   gate_skipped 'Hand the round over to Codex'
-  gate_skipped 'Codex fixes the PR'
+  gate_skipped 'Ask Codex for the fix as a patch'
   gate_skipped 'Verify the Codex fix'
   gate_skipped 'Commit and push the Codex fix'
-  gate_skipped 'Post the Codex summary comment'
+  gate_skipped 'Post the Codex verification note'
   gate_skipped 'Request Codex re-review after a new commit'
 }
 
@@ -1847,5 +2133,5 @@ codex_mode_context() {
   gate_skipped 'uses: anthropics/claude-code-action@v1'
   gate_skipped 'Check the fix outcome'
   gate_skipped 'Decide the takeover'
-  gate_skipped 'Codex fixes the PR'
+  gate_skipped 'Ask Codex for the fix as a patch'
 }
