@@ -1039,6 +1039,79 @@ EOS
   [ "$contained" -lt "$passed" ] || { echo "containment proof at $contained is not before changed=true at $passed" >&2; return 1; }
 }
 
+# ---------- 按需拉起来的系统服务不算残留 ----------
+#
+# 上面那一道按运行用户正面清点，连「测试自己跑的时候被按需拉起来的系统服务」一起记一笔：
+# 2026-10-02 的实跑就红在 dbus 的会话总线上（MEL-288）—— 补丁改对了、360 条测试全绿、
+# lint 干净，最后一步照样红着停下，什么都没推出去。而两条路共用这一段正文，所以那一轮
+# 之后任何仓库的任何一轮自动修复都推不出去。
+#
+# 放行判据不是进程名（验证命令可以把自己起成任意 argv，按名字放行正是 MEL-255 要挡的
+# 那类伪装），也不是「它自己的可执行文件在不在写不动的目录里」（setsid /usr/bin/python3
+# -c '…' 两条都满足）。判据是「systemd 照一份我们写不动的 unit 文件把它启动的」——
+# 跑哪个程序、带什么参数都写死在那份文件里，验证命令改不动。
+# 下面三条把这个判据一正一反再加源码级地钉住。
+
+# 正面：验证命令顺手把一个打包好的系统服务按需拉起来，这一轮照旧走完。
+@test "takeover: a system service the verify command pulls up on demand does not stop the chain" {
+  [ -r /proc/self/cgroup ] || skip 'no cgroups here; the exemption needs systemd to vouch for the service'
+  command -v systemctl >/dev/null 2>&1 || skip 'no systemctl here'
+  systemctl --user show -p FragmentPath --value dbus.service 2>/dev/null |
+    grep -q '^/usr/' || skip 'no packaged user dbus.service to activate here'
+  # 先停掉，否则它已经在基线里，这一条就只是空转
+  systemctl --user stop dbus.service >/dev/null 2>&1 || true
+
+  push_workspace 'systemctl --user start dbus.service'
+
+  run_chain_trusted_push
+
+  # 服务真的起来过（否则下面的断言什么都没证明）
+  systemctl --user is-active dbus.service >/dev/null 2>&1 ||
+    { echo 'dbus.service never came up; this test proved nothing' >&2; return 1; }
+  refute_contains "$output" 'outlived the verify command'
+  assert_equal "$status" 0
+  assert_equal "$(step_output pushed)" true
+}
+
+# 反面：那一份用户 systemd 也能被验证命令当枪使（`systemd-run --user` 在 runner 上是
+# 通的，实测），所以放行判据必须把「请服务管理器替我跑任意程序」排除掉 —— 它造出来的
+# unit 一律是 transient、定义文件落在 /run/user/<uid>/ 下面，两样都不满足「写不动」。
+# 把 Transient 那一条判据删掉，这一条就变红。
+@test "takeover: a process the verify command launders through the service manager is still caught" {
+  [ -r /proc/self/cgroup ] || skip 'no cgroups here; nothing to launder through'
+  command -v systemd-run >/dev/null 2>&1 || skip 'no systemd-run here'
+  systemd-run --user --unit=mel288probe --collect /bin/true >/dev/null 2>&1 ||
+    skip 'systemd-run --user does not work here'
+  systemctl --user stop mel288laundered.service >/dev/null 2>&1 || true
+
+  # 洗出来的那个 pid 写进 leftover.pid：run_chain 据此认出「这不是机器噪声」，不重跑。
+  push_workspace "systemd-run --user --unit=mel288laundered --collect /bin/sleep 30 &&
+    systemctl --user show -p MainPID --value mel288laundered.service >$BATS_TEST_TMPDIR/leftover.pid"
+
+  run_chain
+  systemctl --user stop mel288laundered.service >/dev/null 2>&1 || true
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'outlived the verify command'
+  assert_contains "$output" "$(cat "$BATS_TEST_TMPDIR/leftover.pid")"
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+}
+
+# 判据的三条缺一不可，少哪一条都等于把 MEL-255 那个洞重新开一半 —— 而上面两条功能测试
+# 在没有 systemd 的机器上（本机 macOS）会跳过，钉不住。所以这一条直接钉源码，到处都跑。
+@test "takeover: the on-demand service exemption still demands all three proofs" {
+  block="$(fix_guard_body verify_the_fix)"
+  # 1. 不在我们这一棵 cgroup 里面（验证命令 fork 出来的都在里面，挪不出去）
+  assert_contains "$block" 'case "$cg" in "$our_cgroup"|"$our_cgroup"/*) return 1 ;; esac'
+  # 2. 那个 unit 不是 transient（挡掉 systemd-run --user 那条路）
+  assert_contains "$block" '-p Transient --value'
+  # 3. unit 文件本身和它每一份 drop-in 都在写不动的地方
+  assert_contains "$block" 'definition_is_protected "$frag"'
+  assert_contains "$block" 'definition_is_protected "$dropin"'
+  # 判据只用在「把候选摘掉」这一层，正面清点本身一点没放宽
+  assert_contains "$block" 'verify_leftovers="$(unexplained_leftovers)"'
+}
+
 # 结构那一半单独立得住：正常一轮跑完，写权限凭据也不回 .git/config —— 带凭据那一步
 # 自己用手上的令牌现造一份，只递给那一条 push。于是凭据在两步之间压根不存在，
 # 任何活着的进程盯着那个文件都等不到东西。
