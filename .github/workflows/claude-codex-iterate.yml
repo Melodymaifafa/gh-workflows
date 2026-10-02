@@ -666,6 +666,11 @@ jobs:
                     bash -euo pipefail -c "$VERIFY"
                 return
               fi
+              # hosted runner 的 /etc/sudoers 写着 `Defaults use_pty`（2026-10-02 实测），
+              # 所以这条命令跑在 sudo 给的伪终端里：验证命令于是看得见一个 TTY（有的工具
+              # 会因此开彩色输出），而 sudo 收尾时把那个会话里剩下的进程一并收掉，连
+              # setsid 躲出去的都没了。这是意外之喜，不是依据 —— 判据始终是下面那道按 uid
+              # 的清点，sudoers 没写 use_pty 的机器上由它兜住。
               # -E 留着整份环境：这一步的 env: 里一个凭据都没有（MEL-254 的前提），而
               # 调用方仓库的测试套件照旧读得到 CI / GITHUB_* 那一堆。只有指向 runner
               # 那个用户私有目录的几个（HOME、XDG_*、uv / npm 的缓存）换成沙箱里的 ——

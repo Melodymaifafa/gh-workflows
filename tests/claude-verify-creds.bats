@@ -426,20 +426,31 @@ printf "lock v2\n" >deps.lock'
   [ ! -e .venv ] || { echo '.venv outlived git clean: the ownership grant is wrong' >&2; return 1; }
 }
 
-# 换了用户之后按 uid 清点仍然是那道正面证据，而且这一次基线本来就是空的：setsid
-# 躲出进程组照样露出来。顺带钉住「我们 kill 不动另一个用户的进程」那条坑 —— 收尾
-# 要借 sudo，不借的话这一条会卡在「收不干净」而不是「清点抓到」。
-@test "claude: a setsid escapee under the dedicated account still stops the round" {
+# 验证命令躲出进程组（setsid）之后，那一步**返回成功的时候**那个账号名下必须一个活
+# 进程都没有 —— 这就是下一步敢导出令牌的全部前提。两种结局都合法，判据是同一条：
+#   ① hosted runner 的 /etc/sudoers 写着 `Defaults use_pty`（2026-10-02 实测），sudo
+#      收尾时连 setsid 出去的那个一起收掉了 —— 这一步照旧绿，而账号名下是空的；
+#   ② 它真活下来了 —— 按 uid 清点把整轮红着停下（回退路径上那条同名测试盯的就是
+#      这一半，两条路跑的是同一段正文）。
+# 不许出现的是第三种：这一步绿了、而它还活着。
+@test "claude: a setsid escapee under the dedicated account never outlives the verify step" {
   separated_workspace 'setsid sleep 30 >/dev/null 2>&1 &
 echo "$!" >escaped.pid'
 
   run run_step "$WF" "Verify the Claude fix"
+  alive="$(ps -U ghwf-verify -o pid= 2>/dev/null || true)"
   reap_separated_account
 
-  [ "$status" -ne 0 ]
-  assert_contains "$output" 'outlived the verify command'
-  assert_contains "$output" 'ghwf-verify'
-  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  if [ "$status" -eq 0 ]; then
+    [ -z "$alive" ] || {
+      echo "the step passed while the account still owned: $alive" >&2
+      return 1
+    }
+  else
+    assert_contains "$output" 'outlived the verify command'
+    assert_contains "$output" 'ghwf-verify'
+    assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+  fi
 }
 
 # ---------- 两条路共用同一段正文 ----------
