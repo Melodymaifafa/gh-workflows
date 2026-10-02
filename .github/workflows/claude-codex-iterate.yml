@@ -329,13 +329,22 @@ jobs:
               as_root usermod -aG "$group" "$verify_account" >/dev/null 2>&1 || return 1
               as_root chmod -R g+w "$verify_ws" >/dev/null 2>&1 || return 1
               as_root find "$verify_ws" -type d -exec chmod g+s {} + >/dev/null 2>&1 || return 1
-              # 它自己的 HOME / 缓存 / 临时目录。runner 那个用户的 $HOME（0750）和
-              # $RUNNER_TEMP（0755）它一个字节都写不动，所以凡是指向那里的变量都要换成
-              # 沙箱里的 —— 缓存因此是冷的，这是本票预告过的代价。
-              # 沙箱开在 $RUNNER_TEMP 底下（job 收尾 runner 自己清掉）、整个 chown 给它：
+              # runner 那个用户的 $HOME（0750）和 $RUNNER_TEMP（0755）它一个字节都写不动，
+              # 所以凡是指向那里的变量都要换成下面这个沙箱里的 —— 缓存因此是冷的，这是
+              # 本票预告过的代价。沙箱开在 $RUNNER_TEMP 底下（job 收尾 runner 自己清掉）：
               # $RUNNER_TEMP 本身它照旧写不动，所以我们放在那儿的空钩子目录和临时索引
               # 它碰不到（mktemp -d 是 0700，而且属于我们）——「它能改写我们给 git 备的
               # 那份空设置」那一类（MEL-256）在这条路上从结构上就没有了。
+              # 正面自测，先两条不留痕迹的：真以它的身份跑起来了（顺带证明这台机器的
+              # sudoers 给 -E 放行 —— 不然下面那条启动会当场失败，而那时候回退已经来不及），
+              # 以及它写得动工作区。排在建沙箱之前：自建 runner / 容器里目录归属千奇百怪，
+              # 证不出来就回退，而回退的时候最好一个归它的文件都没留下（留了的话 runner
+              # 自己清 $RUNNER_TEMP 都会撞权限）。
+              [ "$(as_root -E -u "$verify_account" id -u 2>/dev/null)" = "$uid" ] || return 1
+              as_root -E -u "$verify_account" test -w "$verify_ws" >/dev/null 2>&1 || return 1
+              # 它自己的 HOME / 缓存 / 临时目录。沙箱归它，但组仍然是我们的（g+rwX +
+              # 目录 setgid，同工作区那一套）—— 不这么做，runner 回头连自己的
+              # $RUNNER_TEMP 都删不掉。
               sandbox="$(mktemp -d "$RUNNER_TEMP/verify-user-XXXXXX")" || return 1
               mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cache" "$sandbox/run" \
                        "$sandbox/decoy" || return 1
@@ -345,12 +354,9 @@ jobs:
               # 作用域指到 /dev/null。
               printf '[safe]\n\tdirectory = *\n' >"$sandbox/home/.gitconfig" || return 1
               as_root chown -R "$uid" "$sandbox" || return 1
-              # 正面自测，三条：真以它的身份跑起来了（顺带证明这台机器的 sudoers 给
-              # -E 放行，不然下面那条启动会当场失败、而那时候回退已经来不及）、它写得动
-              # 工作区、它那一侧的 git 认这个仓库。自建 runner / 容器里目录归属千奇百怪，
-              # 猜不如试 —— 证不出来就回退，别等被审 PR 的命令跑到一半才发现写不进去。
-              [ "$(as_root -E -u "$verify_account" id -u 2>/dev/null)" = "$uid" ] || return 1
-              as_root -E -u "$verify_account" test -w "$verify_ws" >/dev/null 2>&1 || return 1
+              as_root chmod -R g+rwX "$sandbox" || return 1
+              as_root find "$sandbox" -type d -exec chmod g+s {} + || return 1
+              # 第三条自测：它那一侧的 git 认这个仓库（上面那份 safe.directory 生效了）。
               as_root -E -u "$verify_account" env HOME="$sandbox/home" \
                 git -C "$verify_ws" rev-parse --git-dir >/dev/null 2>&1 || return 1
               verify_user="$verify_account"
