@@ -1146,6 +1146,10 @@ settle_touched_units() {
 # 这一条不光断言「红了」，还把当时查到的那份定义一起捞出来断言它确实是干净的 —— 否则红得
 # 可能只是因为攻击压根没搭起来。
 @test "takeover: a payload started from a drop-in the verify command then deletes is still caught" {
+  # 这一条要真的把攻击搭起来：停掉机器上一个打包好的用户服务，而且不能再把它启动回来
+  # （新 pid 不在最外层那次清点的基线里）。在一次性的 runner 上这没代价，在谁的 Linux
+  # 桌面上跑就会把会话总线 / GPG / SSH agent 停在那儿。所以只在 CI 上跑。
+  [ -n "${CI:-}" ] || skip 'this one leaves packaged user services stopped; CI-only'
   command -v systemctl >/dev/null 2>&1 || skip 'no systemctl here; no unit to hijack'
   local units hijacked
   units="$(packaged_user_services | tr '\n' ' ')"
@@ -1197,6 +1201,8 @@ settle_touched_units() {
 # 伪造成不成功这一条都该红（这道门压根不拿 cgroup 做判断），所以伪造那几步是 best-effort；
 # pid 最后落到哪一棵 cgroup 里会打印出来，顺带把「委派子树到底可不可写」这件事探明。
 @test "takeover: a process the verify command hides in a cgroup it names itself is still caught" {
+  # 同上：它会在委派给本用户的 cgroup 子树里留下一个造出来的目录，别留在人家桌面上。
+  [ -n "${CI:-}" ] || skip 'this one leaves a forged cgroup behind; CI-only'
   command -v systemd-run >/dev/null 2>&1 || skip 'no systemd-run here; nothing to launder through'
   systemd-run --user --unit=mel288probe --collect /bin/true >/dev/null 2>&1 ||
     skip 'systemd-run --user does not work here'
