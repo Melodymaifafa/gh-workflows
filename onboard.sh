@@ -125,7 +125,7 @@ if [ -f "$SECRETS_FILE" ]; then
   set +a
   for name in CLAUDE_CODE_OAUTH_TOKEN CODEX_API_KEY CODEX_TRIGGER_TOKEN PUSHOVER_TOKEN PUSHOVER_USER; do
     if [ -z "${!name:-}" ]; then
-      gh secret set "$name" --repo "$slug" --body "${!name}" >/dev/null
+      gh secret set "$name" --body "${!name}" >/dev/null
       echo "    密钥 $name 已设置"
     else
       echo "    密钥 $name 缺失，跳过（该功能在此仓库暂不可用）"
