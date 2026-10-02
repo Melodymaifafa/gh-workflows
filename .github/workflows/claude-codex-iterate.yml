@@ -560,8 +560,13 @@ jobs:
             # ps -U 选「真实用户」，GNU 和 BSD 都是这个意思（别写 -u：BSD 上它是格式
             # 选项）。字段按 -o 给的顺序来：pid ppid stat lstart（固定 5 段）args…。
             # 僵尸不算：它已经死了，只是还没被收尸，读不了任何东西。
+            # 一个进程都没有的时候 `ps -U` 退 1（不是空输出退 0）—— 专用账号名下正好
+            # 就是这种情况，而 pipefail 会让这一整条管道失败，拿它赋值的那一行于是在
+            # set -e 下静默打断整步（stderr 已经被吞掉，连一句话都看不到）。所以这里
+            # 把「没人」和「问不出来」分开：没人 = 空输出；问不出来由跑验证之前那条
+            # `ps -p $$` 单独判。
             user_procs() {
-              ps -U "$verify_uid" -o pid=,ppid=,stat=,lstart=,args= 2>/dev/null |
+              { ps -U "$verify_uid" -o pid=,ppid=,stat=,lstart=,args= 2>/dev/null || true; } |
                 awk 'NF >= 8 && $3 !~ /^Z/ {
                   cmd = ""
                   for (i = 9; i <= NF; i++) cmd = cmd (i > 9 ? " " : "") $i
