@@ -417,9 +417,10 @@ jobs:
             # 没有任何进程能把它拉起来）。一直不空就红着停下。
             verify_uid="$(id -u)"
 
-            # 跑验证的这一步自己在哪一棵 cgroup 里。cgroup v2 只有 `0::<路径>` 这一行，
-            # v1 的 name=systemd 那一行留着兜底；两样都读不到（macOS、没挂 cgroup 的
-            # 容器）就取到空字符串，下面放行按需服务那一段会因此一律不放行。
+            # 一个进程落在哪一棵 cgroup 里。只在红着停下的时候用来报信（这一条残留是
+            # 「又一个没预热到的按需服务」还是「真逃出去的后代」），不参与任何放不放行
+            # 的判断 —— 这道门没有放行。
+            # cgroup v2 只有 `0::<路径>` 这一行，v1 的 name=systemd 那一行留着兜底。
             # 读不到就交出空字符串、而且不许失败：没有 /proc 的平台（本机 macOS）和
             # 刚好在这一瞬退掉的进程都会走到这里，让它红 = 整步在正常情况下挂掉。
             proc_cgroup() {
@@ -428,8 +429,6 @@ jobs:
               sed -n -e 's/^0:://p' -e 's/^[0-9]*:name=systemd://p' "$f" 2>/dev/null |
                 sed -n '1p' || true
             }
-            # 现在就取，不等验证跑完：验证命令挪不动我们这一棵（理由见下面放行那一段）。
-            our_cgroup="$(proc_cgroup "$$")"
 
             # 身份 = pid + 启动时刻，光看 pid 会被 pid 复用骗过（Linux 的 pid_max 默认
             # 四百万，想撞上一个已经死掉的基线 pid 还得同一秒启动，跑不出来）。
@@ -445,89 +444,64 @@ jobs:
                 }'
             }
 
-            # 「不是基线里的、也不是我们后代的」里面还有一类根本不是谁留下的：runner 上
-            # 按需拉起来的系统服务。2026-10-02 的实跑里 dbus 的会话总线就是这样被记了
-            # 一笔、整轮红着停下（MEL-288）—— 那一份用户 systemd 通过 dbus.socket 按需
-            # 把它启动，它跟我们同一个用户、又活过验证命令，按上面的判据必然中。实测
-            # 开工时它压根没起来，是验证命令跑的过程中才被拉起来的，所以进不了基线。
+            # runner 上有一类进程不是谁留下的：按需拉起来的用户服务。2026-10-02 的实跑
+            # 里 dbus 的会话总线就是这样 —— 开工时它压根没起来，验证命令跑的过程中才被
+            # dbus.socket 按需激活，于是进不了基线；它跟我们同一个用户、又活过验证命令，
+            # 按上面那条判据必然被记一笔，整轮红着停下、什么都没推（MEL-288）。两条路
+            # 共用这一段，所以那一轮之后任何仓库的任何一轮自动修复都推不出去。
             #
-            # 放行不能按进程名：验证命令可以把自己的进程起成任意 argv，按名字放行正是
-            # MEL-255 要挡的那类伪装。按「进程自己的可执行文件在不在写不动的目录里」也
-            # 不行 —— setsid /usr/bin/python3 -c '…' 的可执行文件就是 /usr/bin/python3、
-            # 父进程就是 pid 1，这两条它都满足，照样溜过去。
-            # 能证明的是「这个程序是谁挑的」：按需服务由 systemd 照一份我们写不动的 unit
-            # 文件启动，跑哪个程序、带什么参数全写死在那份文件里，验证命令改不动。所以
-            # 按**定义它的那份文件的路径**放行，三条缺一不可：
-            #   1. 它的 cgroup 不在我们这一棵里面。验证命令 fork 出来的进程继承我们这一
-            #      棵，想挪出去得同时写得动目标和「共同祖先」的 cgroup.procs，而共同祖先
-            #      是 root 名下的根 cgroup —— 挪不动。（实测：我们在
-            #      /system.slice/hosted-compute-agent.service，用户服务在
-            #      /user.slice/…/user@<uid>.service/… 下面。）
-            #   2. 那个 unit 不是 transient。systemd-run --user 在 runner 上是通的（实测），
-            #      那条路就是「请 systemd 替我跑任意程序」；它造出来的 unit 一律
-            #      Transient=yes，定义文件落在 /run/user/<uid>/systemd/transient/ 下面。
-            #   3. unit 文件本身、以及它每一份 drop-in，都在我们写不动的地方。否则往
-            #      ~/.config/systemd/user/<unit>.d/ 丢一行 ExecStartPre，就等于改写了那份
-            #      「程序写死在里面」的文件。
-            # 三条里任何一条证不出来（没有 systemd、读不到 cgroup、systemctl 不在写不动的
-            # PATH 上、systemctl 老得不认 --value）都不放行 —— 失败方向是「照旧红着停下」，
-            # 不是「放过」。
+            # 修法不是给清点开一个「什么情况可以放过」的口子。只要有口子，被审 PR 自己
+            # 的代码就会去满足它。第一版按「systemd 照一份我们写不动的 unit 文件启动」
+            # 放行，审核当天就找到两条满足它的路：
+            #   ① 往 ~/.config/systemd/user/<某个打包好的 unit>.d/ 塞一份覆盖 ExecStart
+            #      的 drop-in，daemon-reload + start 把载荷跑起来，再把 drop-in 删掉
+            #      daemon-reload 一次 —— reload 不重启已经在跑的 unit，载荷活着，而查到
+            #      的 DropInPaths 已经空了、FragmentPath 还指着那份写不动的文件；
+            #   ② cgroup 路径里最后一段服务名被当成 unit 名，而 user@<uid>.service 那棵
+            #      子树是委派给本用户的 —— 在里面 mkdir 一个叫 dbus.service 的 cgroup、
+            #      把自己的 pid 写进 cgroup.procs，三条判据就全都在替真正的 dbus.service
+            #      作答。
+            # 根因是同一个：证据绑在「清点那一刻的定义」上，而不是「当初真正启动这个进程
+            # 的那份定义」—— 后者事后根本读不回来。
             #
-            # 剩下的那条口子记在 MEL-288 上：验证命令请那一份用户 systemd 跑一个**非**
-            # transient、而且定义在写不动目录里的 unit —— 它拿到的仍然是 unit 文件里写死
-            # 的那个程序，不是它自己的代码。要连「请服务管理器代跑」这条路一起断掉，得把
-            # 验证命令整个挪到另一个用户下去跑（MEL-255 当时点名的根治办法）。
-
-            # 一份定义文件在不在「我们写不动的地方」：文件自己写不动，而且它所在的目录
-            # 连同每一级父目录都写不动 —— 目录写得动，整个文件就能被换掉。
-            definition_is_protected() {
-              local f="$1"
-              case "$f" in /*) ;; *) return 1 ;; esac
-              [ -f "$f" ] || return 1
-              [ ! -w "$f" ] || return 1
-              path_is_protected "${f%/*}"
-            }
-
-            # cgroup 路径里最后一段 .service / .scope / .socket / .mount 就是它所属的
-            # unit。路径里出现 /user@<uid>.service/ 说明这一段归「用户那一份 systemd」管，
-            # 要用 --user 去问；否则归系统那一份。
-            systemd_unit_of() {
-              local cg="$1" scope=--system unit='' part saved
-              case "$cg" in */user@[0-9]*.service/*) scope=--user ;; esac
-              saved="${IFS-}"
-              IFS=/
-              # shellcheck disable=SC2086  # 就是要按 IFS=/ 拆开 cgroup 路径
-              set -- $cg
-              IFS="$saved"
-              for part in "$@"; do
-                case "$part" in *.service|*.scope|*.socket|*.mount) unit="$part" ;; esac
-              done
-              [ -n "$unit" ] || return 1
-              printf '%s %s\n' "$scope" "$unit"
-            }
-
-            # 这个 pid 是不是「systemd 照一份我们写不动的 unit 文件拉起来的按需服务」。
-            started_by_a_protected_unit() {
-              local pid="$1" cg where frag dropin
-              command -v systemctl >/dev/null 2>&1 || return 1
-              [ -n "$our_cgroup" ] || return 1
-              cg="$(proc_cgroup "$pid")"
-              [ -n "$cg" ] || return 1
-              # 在我们这一棵里面 = 验证命令自己 fork 出来的，绝不放行。
-              case "$cg" in "$our_cgroup"|"$our_cgroup"/*) return 1 ;; esac
-              where="$(systemd_unit_of "$cg")" || return 1
-              # shellcheck disable=SC2086  # 就是要拆成 <--user|--system> <unit>
-              set -- $where
-              [ "$(systemctl "$1" show -p Transient --value "$2" 2>/dev/null)" = no ] || return 1
-              frag="$(systemctl "$1" show -p FragmentPath --value "$2" 2>/dev/null)"
-              definition_is_protected "$frag" || return 1
-              # DropInPaths 是空格分隔的一串路径，空着就是一份 drop-in 都没有。
-              # shellcheck disable=SC2046  # 就是要按空格拆成多条路径
-              for dropin in $(systemctl "$1" show -p DropInPaths --value "$2" 2>/dev/null); do
-                definition_is_protected "$dropin" || return 1
-              done
+            # 所以反过来做：拍基线之前先把这些按需服务**正正经经地拉起来**，让它们进
+            # 基线。清点那一边一个字不改，判据仍然是「除了基线里那些和我们自己的后代，
+            # 一个都不许有」。上面两条绕法因此同时失效：载荷无论是从一份 drop-in 跑起来
+            # 的、还是搬进了一个伪造的 cgroup，它的 pid + 启动时刻都不在基线里，照红。
+            #
+            # 拉哪些不写死名字，运行时枚举：用户那一份 systemd 名下所有正在监听的
+            # socket，问它各自触发哪个 service，挨个 start。（系统那一份 systemd 起的
+            # 服务跑在 root 名下，按 uid 清点本来就看不见，不用也不该去动。）
+            # 全程 best-effort：没有 systemd、systemctl 不在写不动的 PATH 上、某个
+            # service 起不来，都只是「基线少一个」—— 后果是照旧红着停下，不是放过。
+            # 代价是脆：换一种触发方式（path unit、timer、会话总线自己的 activation），
+            # 或者 runner 镜像以后多一个按需服务，这道门会再红一次。那是**可用性**的失败
+            # 方向，看得见、好诊断（红的时候每条残留的 cgroup 会一起报出来，落在
+            # /user.slice/…/user@<uid>.service/ 下面的就是没预热到的那一类）；放行判据
+            # 被绕过是**安全**的失败方向，看不见。宁可要前者。
+            # 要把「同一个用户下谁都能请服务管理器代跑」这一整类清零，只能把验证命令挪到
+            # 另一个用户下跑 —— MEL-289。
+            prewarm_socket_activated_services() {
+              command -v systemctl >/dev/null 2>&1 || return 0
+              local sockets socket services service
+              sockets="$(systemctl --user list-units --type=socket --state=active \
+                           --no-legend --plain 2>/dev/null | awk '{ print $1 }')" || sockets=''
+              [ -n "$sockets" ] || return 0
+              while IFS= read -r socket; do
+                [ -n "$socket" ] || continue
+                services="$(systemctl --user show -p Triggers --value "$socket" 2>/dev/null)" ||
+                  services=''
+                # Triggers 是空格分隔的一串 unit 名，空着就是这个 socket 不触发任何东西。
+                # shellcheck disable=SC2086  # 就是要按空格拆成多个 unit 名
+                set -- $services
+                for service in "$@"; do
+                  case "$service" in *.service) ;; *) continue ;; esac
+                  systemctl --user start "$service" >/dev/null 2>&1 || true
+                done
+              done <<<"$sockets"
               return 0
             }
+            prewarm_socket_activated_services || true
 
             # 清点不出来就等于这一道什么都没做 —— 静默的 no-op 比没有更糟，红着停下。
             if [ -z "$(user_procs)" ]; then
@@ -630,16 +604,18 @@ jobs:
                   }'
             }
 
-            # 把「按需拉起来的系统服务」从清单里摘掉（判据见上面那一大段）。摘不掉的原样
-            # 留下，所以这一层只会让清单变短，不会让它变长。
-            unexplained_leftovers() {
-              local line pid
+            # 红着停下的时候顺手报信：每条残留落在哪一棵 cgroup 里。这是「又一个没预热到
+            # 的按需服务」（路径在 /user.slice/…/user@<uid>.service/ 下面，修法是让上面
+            # 那段预热覆盖到它）和「真逃出去的后代」唯一一眼看得出区别的地方。纯报信，
+            # 不参与放不放行 —— 这道门没有放行。
+            leftover_origins() {
+              local line pid cg
               while IFS= read -r line; do
                 [ -n "$line" ] || continue
                 pid="${line%% *}"
-                if started_by_a_protected_unit "$pid"; then continue; fi
-                printf '%s\n' "$line"
-              done <<<"$(unexplained_procs)"
+                cg="$(proc_cgroup "$pid")"
+                printf '%s cgroup=%s\n' "$line" "${cg:-unknown}"
+              done <<<"$verify_leftovers"
             }
 
             # 清点到「某一刻干净」就算过，不要求次次干净：机器上别的进程刚好在这一瞬
@@ -651,7 +627,7 @@ jobs:
             verify_tree_is_contained() {
               local waited=0
               while :; do
-                verify_leftovers="$(unexplained_leftovers)"
+                verify_leftovers="$(unexplained_procs)"
                 [ -n "$verify_leftovers" ] || return 0
                 [ "$waited" -lt 50 ] || return 1
                 sleep 0.1
@@ -662,7 +638,7 @@ jobs:
             if ! verify_tree_is_contained; then
               echo '- verification: **rejected**, a process it started outlived it' >>"$GITHUB_STEP_SUMMARY"
               echo "::error::a process owned by this runner user outlived the verify command ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); refusing to trust the post-verify tree"
-              echo '::error::an on-demand system service is only tolerated here when systemd started it from a unit file this checkout cannot write; see the comment above this gate'
+              echo "::error::nothing is exempt from this gate; each leftover's cgroup, to tell an on-demand service the pre-warm missed from a real escapee: $(leftover_origins | tr '\n' ';')"
               exit 1
             fi
 
