@@ -295,6 +295,7 @@ jobs:
             verify_ws="$PWD"
             verify_user=''
             verify_sandbox=''
+            verify_group=''
             verify_uid="$(id -u)"
             # 专用账号的名字写死，不收调用方的输入：换个名字等于换一个「名下可能已经
             # 有进程」的账号，而这正是下面要证明不成立的那件事。
@@ -313,6 +314,16 @@ jobs:
                 return 1
               uid="$(id -u "$verify_account" 2>/dev/null)" || return 1
               case "$uid" in ''|0|*[!0-9]*) return 1 ;; esac
+              # 「此刻名下没人」证明不了「过后没人来」：cron 的守护进程每分钟自己看一遍
+              # 用户的 crontab，不需要这个账号有任何服务管理器（MEL-255 把这一类记成
+              # 已知缺口）。所以从源头堵：把它写进 cron / at 的拒绝名单，`crontab` 和
+              # `at` 这两个装任务的入口当场就不收它的活。best-effort —— 装不上只是退回
+              # 到那条已知缺口，而下面还有一道（跑完把它从工作区那个组里摘出去）。
+              for deny in /etc/cron.deny /etc/at.deny; do
+                grep -qxF "$verify_account" "$deny" 2>/dev/null ||
+                  printf '%s\n' "$verify_account" | as_root tee -a "$deny" >/dev/null 2>&1 ||
+                  true
+              done
               # 现在就得是空的。名下已经有活进程（自建 runner 上账号跨 job 留着）说明
               # 有人已经在等，那就回退，别带着一份解释不清的基线往下走。
               [ -z "$(ps -U "$uid" -o pid= 2>/dev/null)" ] || return 1
@@ -372,6 +383,7 @@ jobs:
               verify_user="$verify_account"
               verify_sandbox="$sandbox"
               verify_uid="$uid"
+              verify_group="$group"
             }
             # 调用方关掉是明说的，和「这台机器做不到」要分开报：前者不该每轮刷一条
             # warning，后者必须刷 —— 它是「少了一层防线」的唯一可见信号。
@@ -822,6 +834,18 @@ jobs:
               echo "::error::a process owned by uid $verify_uid (the user the verify command ran as${verify_user:+, the dedicated account $verify_user}) outlived the verify command ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); refusing to trust the post-verify tree"
               echo "::error::nothing is exempt from this gate; each leftover's cgroup, to tell an on-demand service the pre-warm missed (runner-user path only) from a real escapee: $(leftover_origins | tr '\n' ';')"
               exit 1
+            fi
+
+            # 清点证明「此刻它名下没人」之后，立刻把写工作区的能力也收回：把账号从工作区
+            # 那个组里摘出去。这一道专治「过后有人来」—— 一个排好的 cron 任务起来时
+            # initgroups 拿的是当下的组，摘出去之后它既走不进 $HOME 下那条路（0750），
+            # 也写不动工作区里任何东西，于是动不了「验证之后、提交之前」那棵树。
+            # 同一个 job 里第二条路再跑验证时上面那段会重新加回来。
+            # 摘不掉只告警不红：那时候的处境正好等于摘之前的今天（已知缺口，MEL-255），
+            # 而红着停下会把 19 个调用方仓库一起卡住。
+            if [ -n "$verify_user" ] && [ -n "$verify_group" ]; then
+              as_root gpasswd -d "$verify_user" "$verify_group" >/dev/null 2>&1 ||
+                echo "::warning::could not drop $verify_user out of the $verify_group group; a job scheduled for later under that account could still write this workspace"
             fi
 
             # 收干净了才换钩子目录：验证命令看得见开头那个（$RUNNER_TEMP 下、名字前缀

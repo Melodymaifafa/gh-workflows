@@ -420,6 +420,10 @@ printf "lock v2\n" >deps.lock'
   # 这个账号不在 sudoers 里，所以「验证命令真要动 sudo 就能绕过上面这一整串」那一条
   # （README 里那句）在这条路上不成立
   assert_equal "$(cat sudo-verdict.txt)" 'no'
+  # 跑完就把它从工作区那个组里摘出去：排一个「过后再跑」的任务（cron）绕得过
+  # 「此刻名下没人」那道清点，但起来时拿不到这个组，也就动不了这棵树（Codex 2026-10-02
+  # 在 PR #32 上的 P1）。
+  refute_contains " $(id -nG ghwf-verify) " " $(ls -ld "$PWD" | awk '{ print $4 }') "
   assert_equal "$(git show origin/topic:deps.lock)" 'lock v2'
   # 它造出来的目录归属对不对，只有真删一次才知道
   git clean -qfdx
