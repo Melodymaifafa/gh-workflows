@@ -382,15 +382,57 @@ jobs:
               done
             }
 
+            # 组名自带权限的那几个：sudo / wheel / admin / adm 直接就是 root，
+            # docker / lxd / kvm 能挂宿主的根文件系统（等于 root），disk / shadow 读得
+            # 到整块盘和影子口令。下面两处问的是同一个问题（工作区那个组能不能加、
+            # 捡到的账号原本在不在这种组里），所以名单只写一份：两份会各自漂。
+            group_is_privileged() { # group_is_privileged <组名>
+              case "$1" in
+                root|sudo|wheel|admin|adm|docker|lxd|kvm|disk|shadow) return 0 ;;
+              esac
+              return 1
+            }
+
+            # 账号不是我们建的（跑之前机器上就有）：它原本在哪些组里是别人定的，而组
+            # 自带权限 —— 有人用 root 预先建好一个 ghwf-verify 再塞进 docker，我们这一步
+            # 就会把被审 PR 自己带的命令交到一个等于 root 的身份上去跑，比压根不分离还糟。
+            # 判据只能是白名单。拿上面那张特权组名单去比不够：名单是列举，列不全
+            # （/etc/sudoers.d 里加一行就能让任意一个组等于 root，而组名随便起）。
+            # 所以反过来问 —— 它现有的每一个组只允许是这两个之一：
+            #   ① 它自己的主组（名字不在那张名单里、gid 也不是 0）；
+            #   ② 工作区那个组（同一个 job 里第二次复用时它还在里面，是我们上一轮加的）。
+            # 多一个就回退。
+            # 问不出来（id 失败、或者一行都没有）同样回退：那时候「没有多余的组」什么
+            # 都不证明 —— 同 ps_by_uid，把「问不出来」读成「干净」正是这一整段反复堵的
+            # 那个毛病。
+            account_groups_are_unprivileged() { # account_groups_are_unprivileged <工作区组名>
+              local primary primary_gid all g names
+              primary="$(id -gn "$verify_account" 2>/dev/null)" || return 1
+              [ -n "$primary" ] || return 1
+              primary_gid="$(id -g "$verify_account" 2>/dev/null)" || return 1
+              case "$primary_gid" in ''|0|*[!0-9]*) return 1 ;; esac
+              ! group_is_privileged "$primary" || return 1
+              all="$(id -nG "$verify_account" 2>/dev/null)" || return 1
+              [ -n "$all" ] || return 1
+              read -ra names <<<"$all"
+              for g in "${names[@]}"; do
+                [ "$g" = "$primary" ] || [ "$g" = "$1" ] || return 1
+              done
+            }
+
             separate_the_verify_user() {
-              local uid group sandbox existing
+              local uid group sandbox existing preexisting=''
               command -v sudo >/dev/null 2>&1 || return 1
               as_root true >/dev/null 2>&1 || return 1
               # 同一个 job 里两条路各跑一次验证，第二次复用同一个账号。
-              id -u "$verify_account" >/dev/null 2>&1 ||
+              # 「我们刚建的」和「机器上本来就有的」要分开记：后者原本在哪些组里是别人
+              # 定的，下面要连主组一起过一遍白名单。
+              if id -u "$verify_account" >/dev/null 2>&1; then
+                preexisting=1
+              else
                 as_root useradd --system --no-create-home --shell /usr/sbin/nologin \
-                  "$verify_account" >/dev/null 2>&1 ||
-                return 1
+                  "$verify_account" >/dev/null 2>&1 || return 1
+              fi
               uid="$(id -u "$verify_account" 2>/dev/null)" || return 1
               case "$uid" in ''|0|*[!0-9]*) return 1 ;; esac
               # 排不进定时任务是「过后没人来」的唯一拦截点，写不进去就回退（上面那段）。
@@ -417,9 +459,17 @@ jobs:
               # 上它是 runner，没问题；自建 runner 上工作区的组可能正好是 docker（等于
               # root）、sudo、wheel 这一类 —— 那就等于我们亲手给被审 PR 的命令发了一把
               # 比原来更大的钥匙，比不分离还糟。碰上就回退。
-              case "$group" in
-                root|sudo|wheel|admin|adm|docker|lxd|kvm|disk|shadow) return 1 ;;
-              esac
+              ! group_is_privileged "$group" || return 1
+              # 捡到的账号：它现有的全部组（含主组）得先过白名单（上面那段
+              # account_groups_are_unprivileged），不合格就回退。排在这里是因为白名单
+              # 的第二项就是工作区那个组，而它刚刚才算出来、也刚刚证明了自己不带权限。
+              # 回退回去的是「跟我们同一个用户」那条路：防线少一层，但不会把被审 PR 的
+              # 命令交到一个比 runner 用户权限还大的身份上。
+              # 我们自己刚建的那个不查：useradd --system 只给它一个同名主组，而工作区
+              # 那个组是下一行才加的。
+              [ -z "$preexisting" ] ||
+                account_groups_are_unprivileged "$group" ||
+                return 1
               as_root usermod -aG "$group" "$verify_account" >/dev/null 2>&1 || return 1
               as_root chmod -R g+w "$verify_ws" >/dev/null 2>&1 || return 1
               as_root find "$verify_ws" -type d -exec chmod g+s {} + >/dev/null 2>&1 || return 1

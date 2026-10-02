@@ -655,6 +655,130 @@ EOS
   refute_contains "$(verify_helper deny_the_account_scheduled_jobs)" '|| true'
 }
 
+# ---------- 捡到的账号原本在哪些组里（Codex 2026-10-02 在 PR #32 `69027b4` 上的 P1）----------
+
+# 那个专用账号可能在我们跑之前机器上就已经有了（自建 runner 上有 root 的人提前建好）。
+# 它原本在哪些组里是别人定的，而组自带权限：塞进 docker 就等于能拿 root。原来这里只
+# 查了「它的 uid 不是 0」和「我们要给它加进去的那个工作区组不带权限」—— 漏的正是它
+# 自己原有的组，于是分离这一步会把被审 PR 自己带的命令交到一个等于 root 的身份上去跑，
+# 比压根不分离还糟。
+# 判据必须是白名单（只允许它的主组 + 工作区那个组），不能拿特权组名单去比：名单是
+# 列举、列不全 —— 随便起个名字的组也能在 /etc/sudoers.d 里被写成等于 root。
+#
+# 这两条跑的是 workflow 里那个函数本身，外部命令全接桩：真造一台「账号已经建好并塞进
+# docker」的机器要 root 去改这台机器的 /etc/group，不是测试干得了的事。
+separate_user_stub() { # separate_user_stub >桩脚本
+  cat <<'EOS'
+verify_account=probe-account
+verify_ws="$BATS_TEST_TMPDIR/sep-work"
+RUNNER_TEMP="$BATS_TEST_TMPDIR/sep-temp"
+mkdir -p "$verify_ws" "$RUNNER_TEMP"
+verify_user=''
+verify_sandbox=''
+verify_uid=''
+verify_group=''
+created="$BATS_TEST_TMPDIR/useradd-ran"
+
+# sudo 一律当成有：本机有没有 sudo 跟这两条要钉的东西无关
+command() { [ "$*" = '-v sudo' ] || { builtin command "$@"; return; }; }
+# 迷你 sudo：认 -E 和 -u <用户>，useradd 记一笔，id 透传给下面那个桩，其余一律成功
+as_root() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -E) shift ;; -u) shift 2 ;; *) break ;; esac
+  done
+  case "$1" in
+    useradd) : >"$created" ;;
+    id) shift; id "$@" ;;
+    *) : ;;
+  esac
+}
+# 这台机器上那个账号长什么样，由四个入参摆出来（run_separate 每次全给，省得上一条
+# 的设定漏到下一条）；没建起来之前 `id -u` 问不到它
+id() {
+  case "$1" in
+    -u) { [ "$ACCOUNT_EXISTS" = 1 ] || [ -e "$created" ]; } && printf '4242\n' ;;
+    -gn) printf '%s\n' "$ACCOUNT_PRIMARY" ;;
+    -g) printf '%s\n' "$ACCOUNT_PRIMARY_GID" ;;
+    -nG) printf '%s\n' "$ACCOUNT_GROUPS" ;;
+    *) return 1 ;;
+  esac
+}
+# 工作区那个组是 ls 的第 4 列（workflow 里就是这么取的）
+ls() { printf 'drwxrwsr-x 2 runner runner 4096 Oct 2 10:00 .\n'; }
+# 这几道判定各有自己的测试，这里一律放行
+deny_the_account_scheduled_jobs() { return 0; }
+ps_by_uid() { printf ''; }
+the_sweep_can_see_that_account() { return 0; }
+
+if separate_the_verify_user; then
+  printf 'separated group=%s\n' "$verify_group"
+else
+  printf 'fell-back\n'
+fi
+if [ -e "$created" ]; then printf 'useradd=yes\n'; else printf 'useradd=no\n'; fi
+EOS
+}
+
+# 四个入参每次都给齐：bats 的 `run` 是函数，`VAR=x run f` 这种前缀赋值在 bash 里会留
+# 在当前 shell 上，少给一个就会悄悄沿用上一条的设定、把判定做成假绿。
+run_separate() { # run_separate <账号已存在 0|1> <主组名> <主组 gid> <全部组>
+  ACCOUNT_EXISTS="$1" ACCOUNT_PRIMARY="$2" ACCOUNT_PRIMARY_GID="$3" ACCOUNT_GROUPS="$4" \
+    run_helper "$BATS_TEST_TMPDIR/stub.sh" \
+      separate_the_verify_user account_groups_are_unprivileged group_is_privileged
+}
+
+@test "claude: a pre-existing account is refused unless every group it is already in is allow-listed" {
+  separate_user_stub >"$BATS_TEST_TMPDIR/stub.sh"
+
+  # 它原本就在 docker 里 → 回退，不拿来跑
+  run run_separate 1 probe-account 4242 'probe-account docker'
+  assert_equal "$status" 0
+  assert_contains "$output" 'fell-back'
+  assert_contains "$output" 'useradd=no'
+
+  # 名字不在那张特权名单上的组同样不行：判据是白名单，不是拿名单去比
+  run run_separate 1 probe-account 4242 'probe-account ci-helpers'
+  assert_contains "$output" 'fell-back'
+
+  # 主组自己就是特权组 → 回退
+  run run_separate 1 docker 4242 'docker'
+  assert_contains "$output" 'fell-back'
+
+  # 主组的 gid 是 0（换了个不在名单上的名字也一样）→ 回退
+  run run_separate 1 staff 0 'staff'
+  assert_contains "$output" 'fell-back'
+
+  # 组问不出来（id 答不上）不许读成「没有多余的组」
+  run run_separate 1 probe-account 4242 ''
+  assert_contains "$output" 'fell-back'
+
+  # 只在自己的主组里 → 照旧走分离（这一条同时兜住「函数名写错、压根没取到」：取不到
+  # 的话上面那几条会因为「命令不存在」而假绿）
+  run run_separate 1 probe-account 4242 'probe-account'
+  assert_contains "$output" 'separated group=runner'
+
+  # 同一个 job 里第二次复用：它还在工作区那个组里，那是我们上一轮加的，放行
+  run run_separate 1 probe-account 4242 'probe-account runner'
+  assert_contains "$output" 'separated group=runner'
+
+  # 这道检查真的挂在那条主路上（撤掉调用点，上面那几条立刻变红）
+  assert_contains "$(fix_guard_body verify_the_fix)" 'account_groups_are_unprivileged "$group"'
+  # 特权组名单只有一份：两份会各自漂，而漂掉的那份正好是没人看的那份
+  assert_equal "$(fix_guard_body verify_the_fix | grep -c 'root|sudo|wheel|admin|adm|docker')" 1
+}
+
+@test "claude: an account we create ourselves still takes the separation path" {
+  separate_user_stub >"$BATS_TEST_TMPDIR/stub.sh"
+
+  # 机器上原本没有它 → 我们建，建完照旧走分离：useradd --system 只给它一个同名主组，
+  # 没有「别人塞进去的组」这回事，所以上面那道白名单不该拦它
+  run run_separate 0 probe-account 4242 'probe-account'
+
+  assert_equal "$status" 0
+  assert_contains "$output" 'separated group=runner'
+  assert_contains "$output" 'useradd=yes'
+}
+
 # ---------- 两条路共用同一段正文 ----------
 
 # MEL-262 的那条不变量：验证和推送各只有一份正文，两条路都跑它，差别只有 $FIXER
