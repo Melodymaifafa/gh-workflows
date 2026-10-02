@@ -871,10 +871,51 @@ jobs:
             echo "reviewer=$reviewer"
           } >>"$GITHUB_OUTPUT"
           echo "fix round $round for review $target ($reviewer) on $H"
-      # 可复用工作流只把「调用方的 PR 分支」checkout 进工作区，本仓库的
-      # scripts/ 不在里面。job_workflow_sha 就是本次实际运行的这份 workflow
-      # 文件所在的 commit，按它取脚本，脚本和 workflow 永远同一个版本。
+      # 可复用工作流只把「调用方的 PR 分支」checkout 进工作区，本仓库的 scripts/
+      # 不在里面，所以下面要单独取一次。取哪个版本必须是「本次实际运行的这份
+      # workflow 文件所在的那个版本」，脚本和 workflow 才永远同一个版本。
       #
+      # 版本不能用 github.job_workflow_sha 取：那个值在实跑里是空的（2026-10-02
+      # 实测两次，调用桩分别钉分支和钉 tag，checkout 的 `with:` 里连 ref 这一项
+      # 都没出现）。而 ref 为空时 checkout 不报错，它静默退回事件自己的 ref ——
+      # 本仓库自己的 PR 上那就是**被审 PR 的合并树**，于是被审 PR 自己提供了我们
+      # 用来判它的那几个脚本（换掉分类脚本就能买一次换人）；别的调用方仓库上，那
+      # 个 ref 在本仓库里压根不存在，整轮以一句看不懂的 checkout 错误收场。
+      #
+      # 改从本次 run 自己的记录里读：run 的 referenced_workflows 按路径列出这次
+      # 用到的每一份可复用工作流，带 ref 和 sha。这是 GitHub 自己记下来的事实，
+      # 调用方和被审 PR 都改不了它。读不出来就红着停下，绝不让 checkout 自己挑。
+      # 这一步排在 Gate 之后、被审 PR 的代码跑起来之前，所以不需要那道 PATH 过滤
+      # （理由同 Gate 自己：那时候还没有谁能往 PATH 上放东西）。
+      - name: Resolve which version of the shared fixer scripts to take
+        id: scripts_ref
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_PATH: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml
+        run: |
+          set -euo pipefail
+
+          sha="$(gh api "repos/$REPO/actions/runs/$RUN_ID" |
+            jq -r --arg w "$WORKFLOW_PATH" '
+              .referenced_workflows // []
+              | map(select((.path | split("@")[0]) == $w)) | first | .sha // empty')" ||
+            sha=''
+          # 必须是一个完整的 commit：短 sha、ref 名、空串一概不收 —— 收了就等于
+          # 让 checkout 去猜，而猜错的那一下是静默的。
+          case "$sha" in
+            *[!0-9a-f]* | '') sha='' ;;
+            *) [ "${#sha}" -eq 40 ] || sha='' ;;
+          esac
+          if [ -z "$sha" ]; then
+            echo "::error::this run's record does not say which commit of $WORKFLOW_PATH is running; refusing to fetch the shared fixer scripts from an unpinned ref"
+            exit 1
+          fi
+          printf 'ref=%s\n' "$sha" >>"$GITHUB_OUTPUT"
+          echo "taking the shared fixer scripts from $sha"
+
       # 落点必须带 run id：actions/checkout 只能写进工作区，而工作区是调用方的
       # 仓库。用固定名字的话，调用方只要自己跟踪了一个同名目录，就会先被这次
       # checkout 盖掉、再被下面清理掉，然后这次删除被 fixer 的 git add -A 当成
@@ -884,7 +925,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Melodymaifafa/gh-workflows
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ steps.scripts_ref.outputs.ref }}
           path: .gh-workflows-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Move the fixer scripts out of the workspace
@@ -892,11 +933,21 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         env:
           CHECKOUT_DIR: .gh-workflows-${{ github.run_id }}-${{ github.run_attempt }}
+          SCRIPTS_REF: ${{ steps.scripts_ref.outputs.ref }}
         run: |
           set -euo pipefail
           # 留在工作区里，fixer 会把它当成本 PR 的改动一并 commit 出去。
           mv "$CHECKOUT_DIR/scripts" "$RUNNER_TEMP/fixer-scripts"
           rm -rf -- "$CHECKOUT_DIR"
+
+          # 每一个脚本都必须真的在手上。少一个就红着停下，别让一份空正文流到后面 ——
+          # 上一步取错了版本（旧版本里还没有这个文件）正是这么一个长相，而「正文是空
+          # 的」在用它的那一步看起来跟「验证命令把它掏空了」一模一样。
+          for script in classify-claude-failure.sh select-review-fixer.sh extract-codex-patch.sh; do
+            [ -s "$RUNNER_TEMP/fixer-scripts/$script" ] && continue
+            echo "::error::$script is missing from the shared fixer scripts taken from $SCRIPTS_REF; refusing to run this round on a half-staged set"
+            exit 1
+          done
           # 分类脚本要到验证命令跑完之后才被用到（Decide the takeover），而 $RUNNER_TEMP 验证
           # 命令写得动。正文现在就交一份给 step output，那一步跑 output 里的文本，不执行这里
           # 的文件 —— 理由同 Define pr-guard helpers。
