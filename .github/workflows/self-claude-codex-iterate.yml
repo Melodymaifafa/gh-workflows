@@ -18,7 +18,7 @@ jobs:
     # forced onto the Codex fixer ON PURPOSE, so this PR exercises the new cloud
     # patch path before the v1 tag moves. This whole branch is deleted afterwards.
     # Reviewers: this is the test harness, not a change to review. Leave it alone.
-    uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@users/melody/mel-272-codex-cloud-patch
+    uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@mel-272-e2e-pin
     with:
       runtime: shell
       review_fixer: codex
