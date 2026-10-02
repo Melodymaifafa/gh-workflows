@@ -426,6 +426,20 @@ printf "lock v2\n" >deps.lock'
   [ ! -e .venv ] || { echo '.venv outlived git clean: the ownership grant is wrong' >&2; return 1; }
 }
 
+# 「加进工作区那个组」是它写得动工作区的办法，但那个组自己带权限的时候（自建 runner
+# 上工作区的组正好是 docker = 等于 root 并不罕见），这一步就不是「降权跑」而是「升权跑」。
+# 判据：把工作区的组换成 docker，分离必须拒绝、退回 runner 用户。
+@test "claude: a privileged workspace group is refused instead of handed to the account" {
+  separated_workspace 'id -un >ran-as.txt'
+  chgrp docker "$PWD" 2>/dev/null || skip 'this machine has no docker group to borrow'
+
+  run run_step "$WF" "Verify the Claude fix"
+
+  assert_equal "$status" 0
+  assert_contains "$output" 'cannot run the verify command as a dedicated account'
+  assert_equal "$(cat ran-as.txt)" "$(id -un)"
+}
+
 # 验证命令躲出进程组（setsid）之后，那一步**返回成功的时候**那个账号名下必须一个活
 # 进程都没有 —— 这就是下一步敢导出令牌的全部前提。两种结局都合法，判据是同一条：
 #   ① hosted runner 的 /etc/sudoers 写着 `Defaults use_pty`（2026-10-02 实测），sudo

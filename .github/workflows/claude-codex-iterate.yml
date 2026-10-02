@@ -329,6 +329,13 @@ jobs:
               # 的 macOS 是 BSD），ls -ld | awk 两边都是同一列，同上面的 file_ident。
               group="$(ls -ld "$verify_ws" | awk '{ print $4 }')" || return 1
               [ -n "$group" ] || return 1
+              # 「加进工作区那个组」只有在那个组本身不带权限的时候才成立。hosted runner
+              # 上它是 runner，没问题；自建 runner 上工作区的组可能正好是 docker（等于
+              # root）、sudo、wheel 这一类 —— 那就等于我们亲手给被审 PR 的命令发了一把
+              # 比原来更大的钥匙，比不分离还糟。碰上就回退。
+              case "$group" in
+                root|sudo|wheel|admin|adm|docker|lxd|kvm|disk|shadow) return 1 ;;
+              esac
               as_root usermod -aG "$group" "$verify_account" >/dev/null 2>&1 || return 1
               as_root chmod -R g+w "$verify_ws" >/dev/null 2>&1 || return 1
               as_root find "$verify_ws" -type d -exec chmod g+s {} + >/dev/null 2>&1 || return 1
