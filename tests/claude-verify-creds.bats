@@ -476,16 +476,16 @@ echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
 }
 
 # 跑验证那两步的块里多一行 verify_path="$PATH"（原样那份要留给验证命令自己用），
-# 所以整块比不了；能比的是判定本身 —— 九步都得是同一个 path_is_protected。
+# 所以整块比不了；能比的是判定本身 —— 十步都得是同一个 path_is_protected。
 # 少了这一条，新加一步时照抄漏一行（比如漏掉「相对项不认」那句）没人拦。
-@test "claude: all nine credentialed steps run one and the same path guard" {
+@test "claude: all ten credentialed steps run one and the same path guard" {
   guard=''
   for step in 'Verify the Claude fix' 'Commit and push the Claude fix' \
               'Post the Claude summary comment' 'Check the fix outcome' \
-              'Decide the takeover' 'Verify the Codex fix' \
-              'Commit and push the Codex fix' \
+              'Decide the takeover' 'Ask Codex for the fix as a patch' \
+              'Verify the Codex fix' 'Commit and push the Codex fix' \
               'Request Codex re-review after a new commit' \
-              'Post the Codex summary comment'; do
+              'Post the Codex verification note'; do
     this="$(step_path_guard "$step")"
     [ -n "$this" ] || { echo "no PATH filter in: $step" >&2; return 1; }
     if [ -z "$guard" ]; then guard="$this"; continue; fi

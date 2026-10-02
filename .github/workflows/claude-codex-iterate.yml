@@ -17,7 +17,10 @@ on:
         type: string
         default: auto
       codex_model:
-        description: Model id for the Codex fixer. Empty keeps the action's own default; pin one to freeze the cost.
+        description: >-
+          Unused since MEL-272 — Codex no longer runs on the runner. It is asked in a PR
+          comment to post the fix as a diff, and the model is whatever its cloud
+          environment uses. Kept so existing caller stubs keep validating.
         type: string
         default: ''
       claude_model:
@@ -93,8 +96,9 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    # 默认 360 分钟太长；Claude 最多 80 轮，45 分钟足够
-    timeout-minutes: 45
+    # 默认 360 分钟太长。Claude 最多 80 轮；换人那条路还要等 Codex 云端回补丁
+    # （最多 15 分钟）和召唤复审的冷却（最多 6 分钟），所以留 60 分钟。
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -901,6 +905,14 @@ jobs:
             printf '%s\n' "$(cat "$RUNNER_TEMP/fixer-scripts/classify-claude-failure.sh")"
             echo '__CLASSIFIER_EOF__'
           } >>"$GITHUB_OUTPUT"
+          # 取补丁的脚本同样走 output。它用在 Ask Codex for the fix as a patch 里，
+          # 而那一步手上是真人账号的触发令牌 —— 「哪些步骤排在验证命令之后」是会
+          # 随版本漂的性质，不拿它当安全前提，一律走改不动的 output。
+          {
+            echo 'patch_extractor<<__PATCH_EXTRACTOR_EOF__'
+            printf '%s\n' "$(cat "$RUNNER_TEMP/fixer-scripts/extract-codex-patch.sh")"
+            echo '__PATCH_EXTRACTOR_EOF__'
+          } >>"$GITHUB_OUTPUT"
           # 起点 commit。Claude 若在失败前已经提交过，这一轮就不能再让 Codex
           # 接手写第二笔（一轮只允许一个 fixer 写 PR）。
           echo "BASE_SHA=$(git rev-parse HEAD)" >>"$GITHUB_ENV"
@@ -1139,7 +1151,7 @@ jobs:
       # 写权限令牌。文本走结构化输出（summary），不是 schema 必填项 —— 模型漏了就
       # 只跳过这条评论，不把整轮判红。gh 一次偶发失败也只是 warning：这一步排在
       # 判定结局的 Check the fix outcome 之前，它一红，M7 标记和召唤复审会跟着被
-      # 跳过，链条就静默停住（同 Post the Codex summary comment 那条的教训）。
+      # 跳过，链条就静默停住（同 Post the Codex verification note 那条的教训）。
       - name: Post the Claude summary comment
         if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude' && steps.fix.outcome == 'success'
         env:
@@ -1411,6 +1423,7 @@ jobs:
           REVIEW_FIXER: ${{ inputs.review_fixer }}
           FIRST: ${{ steps.select.outputs.first }}
           FALLBACK_ALLOWED: ${{ steps.select.outputs.fallback_allowed }}
+          REVIEWER: ${{ steps.gate.outputs.reviewer }}
           EXECUTION_FILE: ${{ steps.fix.outputs.execution_file }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -1478,7 +1491,20 @@ jobs:
           alert_reason=fix-failed
           alert_until=-
 
-          if [ "$FIRST" = codex ]; then
+          # Codex 接手那条路是「请它把自己 review 里提的问题改出一段补丁」，留言里
+          # 那句「your review」只在这批意见真是 Codex 自己写的时候指代得上。Codex
+          # 这次不可用、意见由 Claude 代审写的那种轮次，不能走这条路：Codex 会对着
+          # 一批不是它提的意见乱改，或者压根不接。照业务失败处置 —— 红着停下、发
+          # 告警、什么都不推，巡检之后会再叫 Claude 修一次。
+          codex_wrote_the_review() { [ "${REVIEWER:-}" = Codex ]; }
+
+          if [ "$FIRST" = codex ] && ! codex_wrote_the_review; then
+            fixer=codex
+            why="review_fixer=$REVIEW_FIXER pins Codex, but the findings came from ${REVIEWER:-an unknown reviewer}; Codex cannot be asked to patch a review it did not write"
+            fatal="$why"
+            alert_reason=codex-no-review
+            alert='这一轮的意见是 Claude 代审写的，没法请 Codex 云端出补丁；请看 Actions 日志，巡检稍后会再修一次。'
+          elif [ "$FIRST" = codex ]; then
             fixer=codex
             run_codex=true
             why='caller pinned the Codex fixer; Claude was skipped'
@@ -1570,6 +1596,14 @@ jobs:
               why="Claude left uncommitted edits before failing ($failure_reason); a second fixer must not write the same round"
               fatal="$why"
               alert='Claude 改了几个文件就断了、没提交；这一轮没让 Codex 接手，巡检稍后会再修一次。'
+            elif ! codex_wrote_the_review; then
+              # 同上面 FIRST=codex 那一半：意见不是 Codex 自己写的，请它出补丁没有
+              # 指代对象。换人这条路就此封掉，照业务失败处置。
+              fixer=claude
+              why="Claude hit a provider limit ($failure_reason) but the findings came from ${REVIEWER:-an unknown reviewer}; Codex cannot be asked to patch a review it did not write"
+              fatal="$why"
+              alert_reason=codex-no-review
+              alert='Claude 撞额度了，而这一轮的意见是 Claude 代审写的，没法改请 Codex 出补丁；巡检稍后会再修一次。'
             else
               fixer=codex
               run_codex=true
@@ -1612,39 +1646,26 @@ jobs:
             exit 1
           fi
 
-      # 以下四步是 Codex 接管路径。Codex 的沙箱既没有网络也不让写 .git
-      # （MEL-197 实测），所以它只负责「读 review → 改文件 → 写中文总结」；
-      # 取评论、装依赖、验证、commit/push、发评论全部由外层步骤做。
+      # 以下几步是 Codex 接管路径。Codex 不在 runner 上跑：我们在 PR 上留一句话
+      # 请它在云端出一段补丁，等它回 diff，打到交接后的工作区里（MEL-272）。
+      # 之后的验证、commit/push、召唤复审跟 Claude 那条路共用同一段正文。
       - name: Hand the round over to Codex
-        id: context
         if: steps.decide.outputs.run_codex == 'true'
-        env:
-          RUN_SLUG: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
-          # 不再自己拉一遍 review：Gate 那步已经把目标 review（正文 + 行内评论，
-          # HTML 注释已剥掉）预取进 .review/findings.md。重复拉还会用错 review ——
-          # 巡检的重修请求指向的是另一条 review，事件里的 id 不是要修的那条。
-          #
-          # 拿不到这份文件就红着停下。给 Codex 一份空 review 的后果是：它不改
-          # 任何文件、job 打绿勾收工、链条静默停住，正是「不许把失败伪装成成功」
-          # 要挡的东西。
+          # Gate 那步已经把目标 review（正文 + 行内评论）预取进 .review/findings.md。
+          # 云端的 Codex 自己从 GitHub 上读这批意见，所以这份文件不再交给谁 ——
+          # 留着当一道哨兵：它空了说明 Gate 这一轮压根没拿到意见，而「没有意见还
+          # 去请人修」的结局是补丁无从谈起、链条静默停住。拿不到就红着停下。
           if [ ! -s .review/findings.md ]; then
-            echo "::error::.review/findings.md is missing or empty; refusing to hand Codex an incomplete review"
+            echo "::error::.review/findings.md is missing or empty; refusing to ask Codex to patch a review we could not read"
             exit 1
           fi
 
-          # 预取的正文先挪出工作区。.git/info/exclude 只挡 git add 和 git clean，
-          # 挡不住 git reset --hard 恢复被跟踪文件：调用方仓库自己跟踪了一个
-          # .review/findings.md 时，下面这一下 reset 会拿他们那份盖掉预取的那份，
-          # 非空检查照样通过，Codex 拿到的是跟本 PR 无关的内容。
-          saved="$RUNNER_TEMP/codex-findings.md"
-          cp .review/findings.md "$saved"
-
           # 一轮只允许一个 fixer 写 PR。Claude 可能在撞额度前已经改了工作区却
           # 没提交（提交过的那种在上一步就拒绝换人了）。不清掉的话，下面的
-          # git add -A 会把它没验证完的半成品和 Codex 的改动一起当成「Codex 修
+          # git add -A 会把它没验证完的半成品和 Codex 的补丁一起当成「Codex 修
           # 好了」推出去。`-x` 不能省：被 .gitignore 挡住的半成品（.venv、
           # node_modules、build 产物）没有 -x 就留在原地，跟着进 Codex 这一轮。
           # 第二个 `-f` 也不能省：一个没被跟踪的目录，如果它自己是个 git 仓库
@@ -1653,56 +1674,200 @@ jobs:
           # 它活过换人，Codex 和它之后那轮验证都跑在这堆不在推出去的 commit 里的
           # 残留上。`-ff` 删得掉它，又动不了调用方已登记的 submodule —— submodule
           # 是被跟踪的 gitlink，不属于「没被跟踪的目录」。
+          # 补丁必须打在干净的起点上，否则 git apply 的上下文对不上、整轮红。
           git reset --quiet --hard "$BASE_SHA"
           git clean -qffdx
 
-          # 交给 Codex 的那份换成带 run id 的名字再放回去，理由同「取脚本的落点
-          # 必须带 run id」：这个路径不可能是调用方已跟踪的文件，所以 reset 恢复
-          # 不了它、也没有同名文件被它顶掉。它落在 clean 之后，所以 -x 也扫不到它；
-          # `.review/` 在 .git/info/exclude 里，后面的 git add 同样看不见它。
-          mkdir -p .review
-          findings=".review/findings-$RUN_SLUG.md"
-          cp "$saved" "$findings"
-          printf 'file=%s\n' "$findings" >>"$GITHUB_OUTPUT"
-
-      - name: Codex fixes the PR
+      # 这一步只是发一条评论再等回复 —— 普通 shell，一个模型都不调。所以
+      # 「Claude 没额度」的那一轮它照样跑得动，这正是换人要的东西。
+      #
+      # 为什么不再用 openai/codex-action：那条路要一把 platform.openai.com 的
+      # API key（按用量付费）。走云端 Codex 用的是仓库主人自己的 ChatGPT 订阅，
+      # 不另花钱，而且不必把一把密钥复制进每个仓库（CODEX_API_KEY 本轮退役）。
+      # 代价：每个仓库都要在 chatgpt.com/codex/cloud/settings/environments 建一个
+      # 环境，没建的话 Codex 只回一句「先建环境」—— 那种回复在下面算失败。
+      # MEL-266 实测：75 秒回了完整 diff，git apply 干净打上。
+      - name: Ask Codex for the fix as a patch
         id: codex
         if: steps.decide.outputs.run_codex == 'true'
-        uses: openai/codex-action@v1
-        with:
-          # 左边是 action 的参数名（不能改），右边是仓库 secret 名。CLI 真正读
-          # 的环境变量也叫 CODEX_API_KEY，OPENAI_API_KEY 读不到（MEL-197 实测）。
-          # 别设成 job 层 env：本 job 会 checkout PR 分支并执行其中的验证命令，
-          # 那等于把密钥和外部可控代码放进同一个环境。
-          openai-api-key: ${{ secrets.CODEX_API_KEY }}
-          # CLI 版本钉死，同 ci.yml 钉 actionlint / bats 的理由。
-          codex-version: '0.149.1'
-          model: ${{ inputs.codex_model }}
-          # 最小沙箱：工作区可写、无网络、.git 只读。review 正文是外部输入，
-          # 不给更大权限（同「别放宽 --allowedTools」那条规矩）。
-          permission-profile: ':workspace'
-          # action 默认拦 bot 发起的触发；本工作流的触发者恰恰是 Codex bot。
-          allow-bot-users: 'chatgpt-codex-connector[bot]'
-          # safety-strategy 保持默认 drop-sudo：本 job 后续步骤都不需要 sudo。
-          prompt: |
-            ${{ steps.context.outputs.file }} 是别人对本 PR 提的 review：
-            正文加行内评论。请据它迭代当前分支的代码。
+        env:
+          # 请求那一条评论必须出自真人账号：Codex 不理 bot 发的 @ 提及（同「召唤
+          # 复审」那一步）。只有那一条 POST 用这把 PAT，轮询和告警标记仍走
+          # github.token —— 标记于是照旧由 github-actions[bot] 署名，可信作者
+          # 这件事上游那些 jq 判据认得。
+          CODEX_PAT: ${{ secrets.CODEX_TRIGGER_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.gate.outputs.head }}
+          ROUND: ${{ steps.gate.outputs.round }}
+          RUN_ID: ${{ github.run_id }}
+          PATCH_EXTRACTOR: ${{ steps.fixer_scripts.outputs.patch_extractor }}
+          PR_GUARD: ${{ steps.helpers.outputs.script }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+        run: |
+          set -euo pipefail
 
-            1. 逐条判断建议：真 bug 或明确改进 → 改文件；纯风格偏好、误报、
-               或之前轮次已经处理过的 → 跳过并记录理由。
-            2. 只改文件。不要跑 git 命令、不要装依赖、不要联网 —— 沙箱里这些
-               都做不到（.git 只读、无网络）。验证、commit、push、发评论由外层
-               步骤负责。
-            3. 最后输出一段简体中文总结。读者是非程序员的仓库主人，手机上扫一眼
-               用，必须短、大白话：
-               - 第一行就是结论：「修了 N 条，跳过 M 条」。
-               - 之后每条建议单独一个 Markdown 列表项（必须 `- ` 开头——相邻
-                 裸行会被 GitHub 渲染合并成一段，用列表才能一条占一行）：
-                 - ✅ 修：<一句话：原来会出什么问题 → 改后行为怎么变>
-                 - ⏭️ 跳过：<一句话理由（如：纯风格偏好 / 上轮已处理过）>
-               - 不写实现细节、不贴代码、不复述 diff；函数名/变量名尽量不出现，
-                 非提不可就放句尾括号，去掉括号后句子仍要通顺。
-            4. 如果没有任何可采纳的建议，不要改文件，只输出一两句话说明原因。
+          # 这一步手上同时有 CODEX_TRIGGER_TOKEN（真人账号的 fine-grained PAT）和
+          # github.token，所以命令只从「我们写不动的目录」里找，这一段跟其余九处
+          # 逐字节相同（tests/claude-verify-creds.bats 有一条判定盯着）。
+          path_is_protected() {
+            local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+          # 少了哪一样，「Codex 回的是不是一段能用的补丁」就没人判了 —— 红着停下，
+          # 别静默空转。取补丁的脚本跟这一步同一份 PATH，它要的 awk / cat / mv 也在里面。
+          for tool in git gh jq awk sed cat cut grep mktemp mv date sleep bash; do
+            command -v "$tool" >/dev/null 2>&1 && continue
+            echo "::error::$tool is not available from a write-protected PATH entry; cannot request the Codex patch safely"
+            exit 1
+          done
+
+          # 告警函数从 Define pr-guard helpers 的 output 取，不读 $RUNNER_TEMP 里那份
+          # 文件（理由同 Decide the takeover）。没拿到就红着停下。
+          eval "${PR_GUARD:-}"
+          declare -F pushover trusted_comments alert_once >/dev/null || {
+            echo '::error::the pr-guard helpers did not arrive from the Define step; cannot request the Codex patch safely'
+            exit 1
+          }
+
+          # 这一步的每一个失败出口都是同一个处置：job 红着停下、发一条告警（同一个
+          # head、同一个原因只发一次）、什么都不推。巡检之后照旧会再叫 Claude。
+          give_up() { # give_up <告警原因> <给主人看的一句话>
+            alert_once "$HEAD_SHA" "$1" - "$2"
+            echo "::error::the Codex cloud patch round failed ($1)"
+            exit 1
+          }
+
+          [ -n "${PATCH_EXTRACTOR:-}" ] ||
+            give_up codex-no-patch '取补丁的脚本没交到这一步手上（流水线自己的问题），这一轮什么都没推。'
+          [ -n "${CODEX_PAT:-}" ] ||
+            give_up pat-missing '请 Codex 出补丁得用你本人的令牌，仓库 secret CODEX_TRIGGER_TOKEN 现在是空的；这一轮什么都没推。'
+
+          # 留言原文写死，别改措辞：MEL-266 实测就是这一句让 Codex 回了一整段能直接
+          # git apply 的 diff（只说 `@codex fix` 它会修好却不推回 PR，要人去点一下）。
+          # 句子里有 @codex、但没有「@codex review」—— codex-approved-merge 的触发条件
+          # 和巡检的 M1 计数都按「@codex review」认复审请求，所以这句既不会被当成复审，
+          # 也不计进召唤次数（tests/pr-sweep.bats、tests/codex-takeover.bats 各有判定）。
+          request='@codex fix the issues from your review, then paste the complete change as one unified diff (the format git apply accepts) in a diff code block in your reply.'
+          printf -v request_body '%s\n\n<!-- codex-fix-request: head=%s round=%s run=%s -->' \
+            "$request" "$HEAD_SHA" "$ROUND" "$RUN_ID"
+
+          request_id="$(GH_TOKEN="$CODEX_PAT" gh api -X POST \
+            "repos/$REPO/issues/$PR_NUMBER/comments" -f "body=$request_body" --jq .id)" ||
+            give_up codex-no-patch '请 Codex 出补丁的留言没发出去（令牌可能过期或被撤销了），这一轮什么都没推。'
+          case "$request_id" in
+            '' | *[!0-9]*)
+              give_up codex-no-patch '留言发出去了但读不回它的编号，没法确认 Codex 回的是哪一条，这一轮什么都没推。'
+              ;;
+          esac
+          echo "asked Codex for a patch on $HEAD_SHA (round $ROUND, request comment $request_id)"
+
+          # 只认 Codex 自己在这条请求之后发的第一条新评论。评论编号单调递增，所以
+          # 「编号比请求大」就等于「在请求之后发的」；改写一条旧评论不会改它的编号，
+          # 顶不到这个位置上来。等 15 分钟（实测 75 秒），到点就按失败收口。
+          codex_bot='chatgpt-codex-connector[bot]'
+          reply="$RUNNER_TEMP/codex-reply.md"
+          deadline="$(($(date +%s) + 900))"
+          while :; do
+            sleep 30
+            # gh 偶发失败就当这一轮还没回，接着等；超时那条出口自然会收口。
+            if ! gh api --paginate --slurp "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" |
+              jq -r --argjson since "$request_id" --arg bot "$codex_bot" '
+                add // [] | map(select(.user.login == $bot and .id > $since))
+                | sort_by(.id) | first | .body // empty' >"$reply"; then
+              : >"$reply"
+            fi
+            if [ -s "$reply" ]; then break; fi
+            [ "$(date +%s)" -lt "$deadline" ] ||
+              give_up codex-no-patch 'Codex 15 分钟没回补丁，这一轮什么都没推；过一会儿巡检会再修一次。'
+          done
+
+          # 回复是外部输入。取补丁的判定走 Move the fixer scripts 交过来的正文，
+          # 不执行 $RUNNER_TEMP 里那份文件。
+          patch="$RUNNER_TEMP/codex-patch.diff"
+          verdict="$(bash -c "$PATCH_EXTRACTOR" extract-codex-patch "$reply" "$patch")" || true
+          reason="$(printf '%s\n' "$verdict" | sed -n 's/^reason=//p')"
+          case "$reason" in
+            ok) ;;
+            no-environment)
+              give_up codex-no-env '要先在 ChatGPT 里给这个仓库建一个 Codex 云端环境（默认设置即可，地址 chatgpt.com/codex/cloud/settings/environments），Codex 才接得了活；这一轮什么都没推。'
+              ;;
+            codex-quota)
+              give_up codex-no-patch 'Codex 这会儿也到额度上限了，这一轮什么都没推；过一会儿巡检会再修一次。'
+              ;;
+            many-diffs)
+              give_up codex-no-patch 'Codex 一条回复里贴了两段补丁，分不清该用哪一段，这一轮什么都没推。'
+              ;;
+            truncated)
+              give_up codex-no-patch 'Codex 回的补丁像是被截断了（GitHub 的评论有长度上限），不敢往上打，这一轮什么都没推。'
+              ;;
+            *)
+              give_up codex-no-patch 'Codex 回了话，但回复里没有能直接用的补丁，这一轮什么都没推。'
+              ;;
+          esac
+
+          # 打补丁跟后面两步同一个规矩：机器上任何一份 git 配置文件都不作数，钩子
+          # 目录指到一个空目录（为什么不是逐条堵键名，见那两步同名的 sealed_git）。
+          # 补丁正文是外部输入，别让它顺手把配置或钩子带进来。
+          empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
+          sealed_git() {
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              git -c "core.hooksPath=$empty_hooks" \
+                  -c protocol.ext.allow=never \
+                  -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
+          }
+
+          sealed_git apply --check -- "$patch" ||
+            give_up codex-patch-rejected 'Codex 给的补丁打不到这个分支上（它那边看到的代码跟 PR 对不上），这一轮什么都没推。'
+
+          # 碰 .github/workflows/ 就拒：推送用的令牌没有 workflows 权限（gh-workflows
+          # PR #18 实测推不上去），而且工作流文件正是这条流水线自己的防线 —— 让一段
+          # 外部回复改它，等于请它改自己的看门人。.git/ 一起拒。
+          # 路径两头都看：numstat 报的是去处（改名把一个工作流文件搬走它看不见），
+          # 补丁自己的头行带着来源那一侧。头行只认顶格的那几种前缀，补丁正文里的每
+          # 一行都带 ` / + / - 前缀，所以混不进来。
+          paths="$RUNNER_TEMP/codex-patch-paths.txt"
+          sealed_git apply --numstat -- "$patch" | cut -f3- >"$paths"
+          scan="$RUNNER_TEMP/codex-patch-pathscan.txt"
+          {
+            cat -- "$paths"
+            grep -E '^(diff --git |--- |\+\+\+ |rename (from|to) |copy (from|to) )' "$patch" || true
+          } >"$scan"
+          if grep -qF -e '.github/workflows/' -e '.git/' "$scan"; then
+            give_up codex-patch-rejected 'Codex 的补丁改到了工作流文件，这类改动机器人推不上去，这一轮什么都没推。'
+          fi
+
+          sealed_git apply -- "$patch"
+
+          {
+            echo '### Codex cloud patch'
+            echo ''
+            echo "- asked on \`$HEAD_SHA\` (round $ROUND), request comment \`$request_id\`"
+            echo '- the patch applied cleanly; it touches:'
+            sed -e 's/^/  - `/' -e 's/$/`/' <"$paths"
+          } >>"$GITHUB_STEP_SUMMARY"
 
       # 验证跑的是被审 PR 自己带的命令，所以它自成一步，而且这一步不挂任何令牌。
       # 把令牌挂在 step 级 env 再用 `env -u` 在子进程里抹掉是不够的：父 shell 那份
@@ -1884,13 +2049,15 @@ jobs:
           comment_url="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$request_body")"
           echo "summoned round $FIX_ROUND ($comment_url)"
 
-      - name: Post the Codex summary comment
+      # Codex 自己那段「修了什么、跳过了什么」已经作为它的回复贴在这个 PR 上了，
+      # 这里不再整段转贴（以前要转贴，是因为 Codex 跑在 runner 的沙箱里、说的话
+      # 没有别的出口）。只补一句它自己说不了的事：这些改动在沙箱外跑过验证。
+      - name: Post the Codex verification note
         if: steps.decide.outputs.run_codex == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          SUMMARY: ${{ steps.codex.outputs['final-message'] }}
           PUSHED: ${{ steps.codex_push.outputs.pushed }}
         run: |
           set -euo pipefail
@@ -1923,19 +2090,13 @@ jobs:
           done
           PATH="$trusted_path"
 
-          if [ -z "${SUMMARY//[[:space:]]/}" ]; then
-            echo '::warning::Codex returned no summary; skipping the PR comment'
+          # 没推东西就没什么要说的：Codex 的回复已经在 PR 上，再补一句只会误导。
+          if [ "${PUSHED:-}" != true ]; then
+            echo 'nothing was pushed this round; skipping the verification note'
             exit 0
           fi
 
-          # 正文先落进 run summary 再发：评论没发出去（gh 偶发失败，或者它不在写不动的
-          # 目录里）时，总结至少还留在这一轮的运行页上，不至于连文本一起丢。
-          body="$(
-            printf '%s\n' "$SUMMARY"
-            if [ "$PUSHED" = true ]; then
-              printf '\n验证：本仓库的 lint 与测试已在沙箱外跑过，全绿后才推送。\n'
-            fi
-          )"
+          body='验证：本仓库的 lint 与测试已在沙箱外跑过，全绿后才推送。'
           printf '%s\n' "$body" >>"$GITHUB_STEP_SUMMARY"
 
           # 少了就不发这条评论，而不是红着停下：它是链条最后一步，发不出去顶多少一条
@@ -1946,4 +2107,4 @@ jobs:
           fi
           printf '%s\n' "$body" |
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - >/dev/null ||
-            echo '::warning::the Codex summary comment was not posted'
+            echo '::warning::the Codex verification note was not posted'

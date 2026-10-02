@@ -684,7 +684,7 @@ summon_env() {
   assert_contains "$wf" "contains(github.event.review.body, 'claude-review-findings:')"
   assert_contains "$wf" "contains(github.event.review.body, 'fix-retry:')"
   assert_contains "$wf" 'allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"'
-  assert_contains "$wf" "timeout-minutes: 45"
+  assert_contains "$wf" "timeout-minutes: 60"
   assert_contains "$wf" "continue-on-error: true"
   assert_contains "$wf" "show_full_output: \${{ github.event.repository.private }}"
   assert_contains "$wf" '"required":["pushed","fixed","skipped"]'

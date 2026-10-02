@@ -15,7 +15,7 @@
 #   gate_fails 'Check the fix outcome'          # 声明哪一步跑起来会失败
 #   gate_if 'Check the fix outcome' "<expr>"    # 覆写某一步的 if（造回归场景用）
 #   gate_trace "$WF"
-#   gate_ran 'Codex fixes the PR'               # 断言
+#   gate_ran 'Ask Codex for the fix as a patch' # 断言
 #   gate_skipped 'Check the fix outcome'
 #
 # 看不懂的 `if` 表达式一律报错退出，绝不当成真 —— 否则以后有人写了新写法，

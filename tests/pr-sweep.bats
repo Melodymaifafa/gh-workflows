@@ -146,6 +146,21 @@ refute_writes() {
   refute_writes
 }
 
+# iterate 请 Codex 出补丁的那句留言含 @codex、但不含「@codex review」，而且标记名
+# 也不是 codex-review-head —— 巡检的召唤计数（M1）一次都不许算它，否则换人那几轮
+# 会把每个 head 的 3 次召唤额度白白吃掉。
+@test "the Codex fix request is not a summon: it never counts toward the 3 kicks" {
+  one_pr clean 300
+  request="$(printf '@codex fix the issues from your review, then paste the complete change as one unified diff (the format git apply accepts) in a diff code block in your reply.\n\n<!-- codex-fix-request: head=%s round=2 run=777 -->' "$H")"
+  comments "$(kick_comment 1 200)" "$(kick_comment 2 130)" "$(owner_comment 3 "$request" 70)"
+
+  sweep
+
+  # 第 3 次召唤照旧发得出去 —— 上面那条请求没被算成第 3 次
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_equal "$(fake_last_body "gh api POST")" "$KICK_BODY"
+}
+
 @test "markers for another head do not make this head referenced" {
   one_pr clean 200
   comments "$(owner_comment 1 "$(m4_body "$OTHER")" 45)"
