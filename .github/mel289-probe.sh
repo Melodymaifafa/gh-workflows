@@ -148,5 +148,32 @@ run_verify_and_push 'hidepid=2'
 round2=$?
 evidence 'hidepid=2'
 
+# ---------- 对照 + 第三轮：hidepid=2，而且那个账号名下已经有一个活进程 ----------
+# 这才是复审那条 P1 的正核：hidepid=2 下普通身份看不见那个进程，root 看得见。
+# 旧代码用普通身份问 → 看不见 → 当成「名下没人」→ 照旧声称已经隔离。
+# 新代码借 root 问 → 看得见 → 拒绝隔离、回退到 runner 用户并刷一条 warning。
+say 'control (hidepid=2): who can see a live process owned by the account?'
+sudo -n -u ghwf-verify sleep 45 </dev/null >/dev/null 2>&1 &
+planted=$!
+sleep 2
+printf 'as the runner user: [%s]\n' "$(ps -U ghwf-verify -o pid=,args= 2>/dev/null | tr '\n' ';')"
+printf 'as root:            [%s]\n' "$(sudo -n ps -U ghwf-verify -o pid=,args= 2>/dev/null | tr '\n' ';')"
+
+make_workspace || exit 1
+: >"$GITHUB_OUTPUT"; : >"$GITHUB_ENV"; : >"$GITHUB_STEP_SUMMARY"
+say 'step 3/4  Verify the Claude fix  (hidepid=2, the account already owns a live process)'
+FIXER=Claude VERIFY="${PROBE_MARKERS}true" VERIFY_WRITABLE_PATHS='' VERIFY_ISOLATION=auto \
+  run_block 'Verify the Claude fix' 2>&1 | tee "$RUNNER_TEMP/round3.out"
+round3=${PIPESTATUS[0]}
+printf 'verify exit=%s\n' "$round3"
+printf 'the verify command reported it ran as: %s (we are %s)\n' \
+  "$(cat ran-as.txt 2>/dev/null || echo '<no marker>')" "$(id -un)"
+printf 'fell back with a warning: %s\n' \
+  "$(grep -c 'cannot run the verify command as a dedicated account' "$RUNNER_TEMP/round3.out" || echo 0)"
+sudo -n pkill -U ghwf-verify >/dev/null 2>&1 || true
+wait "$planted" >/dev/null 2>&1 || true
+
 say 'verdict'
-printf 'round 1 (normal /proc) exit=%s\nround 2 (hidepid=2)  exit=%s\n' "$round1" "$round2"
+printf 'round 1 (normal /proc)                      exit=%s\n' "$round1"
+printf 'round 2 (hidepid=2, account idle)           exit=%s\n' "$round2"
+printf 'round 3 (hidepid=2, account owns a process) exit=%s\n' "$round3"
