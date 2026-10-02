@@ -124,7 +124,7 @@ if [ -f "$SECRETS_FILE" ]; then
   source "$SECRETS_FILE"
   set +a
   for name in CLAUDE_CODE_OAUTH_TOKEN CODEX_API_KEY CODEX_TRIGGER_TOKEN PUSHOVER_TOKEN PUSHOVER_USER; do
-    if [ -n "${!name:-}" ]; then
+    if [ -z "${!name:-}" ]; then
       gh secret set "$name" --repo "$slug" --body "${!name}" >/dev/null
       echo "    密钥 $name 已设置"
     else
