@@ -14,7 +14,12 @@ permissions:
 
 jobs:
   iterate:
-    uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1
+    # TEMPORARY — MEL-272 end-to-end rehearsal. Pinned to a throwaway tag and
+    # forced onto the Codex fixer ON PURPOSE, so this PR exercises the new cloud
+    # patch path before the v1 tag moves. This whole branch is deleted afterwards.
+    # Reviewers: this is the test harness, not a change to review. Leave it alone.
+    uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@mel-272-e2e-pin
     with:
       runtime: shell
+      review_fixer: codex
     secrets: inherit
