@@ -1056,6 +1056,21 @@ EOS
 # 最外层那次清点的基线里 —— 外层当场红。所以正面那条用自己造的探针 unit，反面那条收尾时
 # 连「会把它重新拉起来的 socket」一起停掉。
 
+# 探针 unit 收尾。写出 unit 文件之后的每一条出口都得走到这儿 —— 包括中途 skip 的那几条，
+# 不然 ~/.config/systemd/user/mel288probe.* 和一个活着的 socket 会留在人家机器上（Codex 在
+# PR #29 上标的 P2）。bats 的 teardown 在 skip 之后照样跑，所以挂在这里最稳。
+drop_probe_units() {
+  local ud="$HOME/.config/systemd/user"
+  systemctl --user stop mel288probe.service mel288probe.socket >/dev/null 2>&1 || true
+  unlink "$ud/mel288probe.socket" 2>/dev/null || true
+  unlink "$ud/mel288probe.service" 2>/dev/null || true
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+}
+
+teardown() {
+  [ -z "${MEL288_PROBE_UNITS:-}" ] || drop_probe_units
+}
+
 # 两条反面测试种出来的那个载荷：收掉它，别让它活到后面几条测试里去。
 # pid 为 0 / 1 / 空的时候绝不 kill —— kill 0 会打到我们自己这一整个进程组。
 reap_planted_pid() {
@@ -1111,6 +1126,8 @@ settle_touched_units() {
   command -v systemctl >/dev/null 2>&1 || skip 'no systemctl here; nothing gets socket-activated'
   local ud="$HOME/.config/systemd/user" came_up=1
   mkdir -p "$ud"
+  # 从这一行起，teardown 负责把探针收干净 —— 下面每一条 skip 之后它照样跑
+  MEL288_PROBE_UNITS=1
   printf '[Unit]\nDescription=MEL-288 probe socket\n[Socket]\nListenStream=%%t/mel288probe.sock\n' \
     >"$ud/mel288probe.socket"
   printf '[Unit]\nDescription=MEL-288 probe service\n[Service]\nType=simple\nExecStart=/bin/sleep 300\n' \
@@ -1126,10 +1143,6 @@ settle_touched_units() {
   run_chain_trusted_push
 
   systemctl --user is-active --quiet mel288probe.service || came_up=0
-  systemctl --user stop mel288probe.service mel288probe.socket >/dev/null 2>&1 || true
-  unlink "$ud/mel288probe.socket" 2>/dev/null || true
-  unlink "$ud/mel288probe.service" 2>/dev/null || true
-  systemctl --user daemon-reload >/dev/null 2>&1 || true
 
   # 服务真的起来过，否则下面的断言什么都没证明
   [ "$came_up" = 1 ] ||
