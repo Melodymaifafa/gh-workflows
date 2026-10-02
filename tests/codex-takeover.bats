@@ -1252,9 +1252,11 @@ settle_touched_units() {
   assert_contains "$block" 'verify_leftovers="$(unexplained_procs)"'
   refute_contains "$block" 'unexplained_leftovers'
   refute_contains "$block" 'started_by_a_protected_unit'
-  # 预热拉不起来只是「基线少一个」，不许把整步弄红 —— 失败方向是照旧红着停下，不是放过
-  assert_contains "$block" 'prewarm_socket_activated_services || true'
-  prewarm="$(printf '%s\n' "$block" | grep -n '^prewarm_socket_activated_services || true$' | head -n 1 | cut -d: -f1)"
+  # 预热只在「回退到 runner 用户」那条路上跑（专用账号名下没有任何按需服务，
+  # MEL-289）；拉不起来仍然只是「基线少一个」，不许把整步弄红 —— 失败方向是照旧
+  # 红着停下，不是放过。
+  assert_contains "$block" '[ -n "$verify_user" ] || prewarm_socket_activated_services || true'
+  prewarm="$(printf '%s\n' "$block" | grep -n 'prewarm_socket_activated_services || true$' | head -n 1 | cut -d: -f1)"
   baseline="$(printf '%s\n' "$block" | grep -n '^verify_procs_baseline=' | head -n 1 | cut -d: -f1)"
   [ -n "$prewarm" ] && [ -n "$baseline" ] ||
     { echo 'pre-warm or baseline line is missing from the verify body' >&2; return 1; }
