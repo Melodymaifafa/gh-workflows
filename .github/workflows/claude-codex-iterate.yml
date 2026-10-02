@@ -413,19 +413,28 @@ jobs:
               printf '/run/ghwf-verify/%s.%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
             }
 
-            # 标记在不在。放标记那个目录本身也要查：别人写得动的目录里「有一份标记」什么
-            # 都不证明。模式串第一个字母不是 d 的（symlink）一起挡掉；`ls -l` 尾巴上那个
-            # . / +（SELinux / ACL）两种都认。问不出来一律当成「不是我们的」—— 把「问不
-            # 出来」读成「干净」正是这一整段反复堵的那个毛病。
-            the_account_is_ours_from_this_run() { # the_account_is_ours_from_this_run <uid>
-              local marker line cols
-              marker="$(verify_marker_path)" || return 1
-              line="$(as_root ls -ldn "${marker%/*}" 2>/dev/null)" || return 1
+            # 放标记那个目录得是 root 自己的、只有 root 进得去，而且是个真目录：别人
+            # 写得动的目录里「有一份标记」什么都不证明，而一个指向别处的快捷方式会让
+            # 我们把东西写到那个别处去。`ls -ldn` 不跟着快捷方式走（真是 symlink 的话
+            # 模式串第一个字母是 l，下面那个 case 就不认它），而且它前几列 GNU 和 BSD
+            # 一样 —— 同下面 file_ident 不用 stat 的理由（stat 的格式串两边不一样，本机
+            # 跑测试的 macOS 是 BSD）。`ls -l` 尾巴上那个 . / +（SELinux / ACL）两种都认。
+            # 问不出来一律不合格：把「问不出来」读成「干净」正是这一整段反复堵的毛病。
+            marker_dir_is_root_only() { # marker_dir_is_root_only <目录>
+              local line cols
+              line="$(as_root ls -ldn "$1" 2>/dev/null)" || return 1
               [ -n "$line" ] || return 1
               read -ra cols <<<"$line"
               [ "${#cols[@]}" -ge 3 ] || return 1
               case "${cols[0]}" in drwx------|drwx------.|drwx------+) ;; *) return 1 ;; esac
               [ "${cols[2]}" = 0 ] || return 1
+            }
+
+            # 标记在不在。
+            the_account_is_ours_from_this_run() { # the_account_is_ours_from_this_run <uid>
+              local marker
+              marker="$(verify_marker_path)" || return 1
+              marker_dir_is_root_only "${marker%/*}" || return 1
               # 标记里装的是建号那一刻那个账号的 uid，不是写死的账号名（名字是常量，
               # 证明不了任何事）。同一个 job 里第二次复用时对得上 = 还是同一个账号。
               # 诚实地说清它管不到的那一格：有 root 的人在同一次 run 里把账号删掉重建，
@@ -442,9 +451,13 @@ jobs:
               local marker dir
               marker="$(verify_marker_path)" || return 1
               dir="${marker%/*}"
-              as_root mkdir -p "$dir" >/dev/null 2>&1 || return 1
-              as_root chown root:root "$dir" >/dev/null 2>&1 || return 1
-              as_root chmod 700 "$dir" >/dev/null 2>&1 || return 1
+              # 建的时候就把模式定死，不事后 chown / chmod：那两条跟着快捷方式走 ——
+              # /run 下这个名字要是已经被做成一个指向别处的快捷方式，我们就替他改了那个
+              # 别处的归属和权限。目录已经在而模式不对的，mkdir -m 不会去改它，紧接着
+              # 那道检查据此拒绝：方向是「回退」，不是「先动了手再发现」。
+              as_root mkdir -m 700 -p "$dir" >/dev/null 2>&1 || return 1
+              # 先确认它就是我们要的那种目录，再往里写：下面那句 tee 也跟着快捷方式走。
+              marker_dir_is_root_only "$dir" || return 1
               printf '%s\n' "$1" | as_root tee "$marker" >/dev/null 2>&1 || return 1
               the_account_is_ours_from_this_run "$1"
             }
