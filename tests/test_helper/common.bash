@@ -367,12 +367,15 @@ trust_patch() {
 # step_env_keys <workflow-file> <step-name>：打印这一步 `env:` 块里声明的变量名，
 # 一行一个。守「这一步不许拿到某个变量」这类性质要靠它：run_block 只抽 run: 块，
 # 环境是测试自己喂的，光看块里写了什么看不出 step 真跑起来手上有哪些值。
+# 块里的注释行和空行要跳过、不能当成「env 到这儿结束」：停在第一条注释上的话，
+# 注释后面声明的变量这个助手压根看不见 —— 那种「某一步不许有令牌」的判定于是假绿。
 step_env_keys() {
   local wf="$1"
   case "$wf" in /*) ;; *) wf="$REPO_ROOT/$wf" ;; esac
   awk -v want="      - name: $2" '
     $0 == want                                       { in_step = 1; next }
     in_step && !in_env && $0 == "        env:"        { in_env = 1; next }
+    in_env && $0 ~ /^ *(#|$)/                         { next }
     in_env && $0 ~ /^          [A-Za-z_][A-Za-z0-9_]*:/ {
       sub(/^ +/, ""); sub(/:.*$/, ""); print; next
     }
@@ -390,6 +393,7 @@ step_env_literals() {
   awk -v want="      - name: $2" '
     $0 == want                                       { in_step = 1; next }
     in_step && !in_env && $0 == "        env:"        { in_env = 1; next }
+    in_env && $0 ~ /^ *(#|$)/                         { next }
     in_env && $0 ~ /^          [A-Za-z_][A-Za-z0-9_]*:/ {
       line = $0; sub(/^ +/, "", line)
       k = line; sub(/:.*$/, "", k)
