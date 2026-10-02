@@ -176,19 +176,27 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       # 两条路（Claude / Codex）的「验证」和「提交并推送」跑的是同一段正文 —— 下面
-      # 这两个函数。以前它们是两份逐行副本（约 590 行安全 shell），加固票必须同时改
-      # 两处，漏一处就在一条路上留个洞（MEL-262）。两条路现在唯一的差别是 $FIXER：
-      # 只进日志、job summary 和提交信息，一道判定都不碰。
+      # 这两步各一个函数。以前它们是两份逐行副本（约 590 行安全 shell），加固票必须
+      # 同时改两处，漏一处就在一条路上留个洞（MEL-262）。两条路现在唯一的差别是
+      # $FIXER：只进日志、job summary 和提交信息，一道判定都不碰。
       #
       # 正文走 step output 交出去，不落 $RUNNER_TEMP 下的共享脚本文件：那个目录验证
       # 命令写得动，落成文件等于请被审 PR 改写我们自己的防线（理由同 Define pr-guard
-      # helpers / Move the fixer scripts，也同下面 sealed_git 那段）。这一步排在最前面，
-      # 被审 PR 的代码一行都还没跑起来，正文在那之前就定死了。
+      # helpers / Move the fixer scripts，也同下面 sealed_git 那段）。这两步排在最前
+      # 面，被审 PR 的代码一行都还没跑起来，正文在那之前就定死了。
       #
-      # 验证和推送分成两个 output：带写权限凭据的那两步只拿得到 push 那一份，验证命令
-      # 的正文一个字都不进它们的环境。
-      - name: Define the fix verify and push guards
-        id: fix_guards
+      # 验证和推送分成两步、两个 output：带写权限凭据的那两步只拿得到 push 那一份，
+      # 验证命令的正文一个字都不进它们的环境。
+      #
+      # 分成两步还有一条硬理由：actionlint 把每个 run: 块写进 shellcheck 的 stdin，块
+      # 一超过 64 KiB（65,536 字节）就填满管道缓冲、两头互等 —— actionlint 既不报错
+      # 也不退出，CI 一声不响挂到 GitHub 的 360 分钟上限（MEL-291 实测：72 KB 的块挂
+      # 满 3 分钟只烧掉 0.9 秒 CPU，是死锁不是慢）。两个函数合在一步时整块 65,028
+      # 字节，离那条线只剩几百字节 —— 下一个往里加三行注释的人就踩到。所以别把这两
+      # 步合回去，也别让其中任何一步长回 64 KiB：tests/ci-resolve-commands.bats 里那
+      # 条尺寸断言会在本机先红，ci.yml 的 lint 那一步另有 timeout-minutes 兜底。
+      - name: Define the fix verify guard
+        id: verify_guard
         run: |
           set -euo pipefail
 
@@ -1140,6 +1148,19 @@ jobs:
             echo 'changed=true' >>"$GITHUB_OUTPUT"
           }
 
+          {
+            echo 'verify<<__FIX_VERIFY_GUARD_EOF__'
+            declare -f verify_the_fix
+            echo '__FIX_VERIFY_GUARD_EOF__'
+          } >>"$GITHUB_OUTPUT"
+
+      # 推送正文同样只有这一份，两条路都从这一步的 output 取（MEL-262）。上面那段注
+      # 释里的两条理由对这一步一字不改地成立。
+      - name: Define the fix push guard
+        id: push_guard
+        run: |
+          set -euo pipefail
+
           commit_and_push_the_fix() {
             set -euo pipefail
 
@@ -1243,9 +1264,6 @@ jobs:
           }
 
           {
-            echo 'verify<<__FIX_VERIFY_GUARD_EOF__'
-            declare -f verify_the_fix
-            echo '__FIX_VERIFY_GUARD_EOF__'
             echo 'push<<__FIX_PUSH_GUARD_EOF__'
             declare -f commit_and_push_the_fix
             echo '__FIX_PUSH_GUARD_EOF__'
@@ -1575,7 +1593,7 @@ jobs:
         if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude' && steps.fix.outcome == 'success'
         env:
           FIXER: Claude
-          FIX_VERIFY_GUARD: ${{ steps.fix_guards.outputs.verify }}
+          FIX_VERIFY_GUARD: ${{ steps.verify_guard.outputs.verify }}
           VERIFY: ${{ env.VERIFY_CMD }}
           # 「允许验证命令改写哪些被跟踪的文件」只能来自调用方默认分支上的工作流
           # 文件（workflow_call 的 input）—— 被审 PR 改不到它。这是它能当信任边界
@@ -1587,7 +1605,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 正文从 Define the fix verify and push guards 的 output 取，两条路共用同一
+          # 正文从 Define the fix verify guard 的 output 取，两条路共用同一
           # 份（MEL-262）；不读 $RUNNER_TEMP 里的文件 —— 那个目录验证命令写得动，往里
           # 塞一行就在这一步里跑起来。没拿到就红着停下，别带着半截防线去跑被审 PR 自己
           # 带的命令。
@@ -1617,7 +1635,7 @@ jobs:
         if: steps.claude_verify.outputs.changed == 'true'
         env:
           FIXER: Claude
-          FIX_PUSH_GUARD: ${{ steps.fix_guards.outputs.push }}
+          FIX_PUSH_GUARD: ${{ steps.push_guard.outputs.push }}
           REPO: ${{ github.repository }}
           ROUND: ${{ steps.gate.outputs.round }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -1626,7 +1644,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 同上一步：正文从 Define the fix verify and push guards 的 output 取，两条路
+          # 同上一步：正文从 Define the fix push guard 的 output 取，两条路
           # 共用同一份（MEL-262）。这一步手上有写权限令牌，所以没拿到正文就红着停下。
           eval "${FIX_PUSH_GUARD:-}"
           declare -F commit_and_push_the_fix >/dev/null || {
@@ -2214,7 +2232,7 @@ jobs:
         if: steps.decide.outputs.run_codex == 'true'
         env:
           FIXER: Codex
-          FIX_VERIFY_GUARD: ${{ steps.fix_guards.outputs.verify }}
+          FIX_VERIFY_GUARD: ${{ steps.verify_guard.outputs.verify }}
           VERIFY: ${{ env.VERIFY_CMD }}
           # 「允许验证命令改写哪些被跟踪的文件」只能来自调用方默认分支上的工作流
           # 文件（workflow_call 的 input）—— 被审 PR 改不到它。这是它能当信任边界
@@ -2226,7 +2244,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 正文从 Define the fix verify and push guards 的 output 取，两条路共用同一
+          # 正文从 Define the fix verify guard 的 output 取，两条路共用同一
           # 份（MEL-262）；不读 $RUNNER_TEMP 里的文件 —— 那个目录验证命令写得动，往里
           # 塞一行就在这一步里跑起来。没拿到就红着停下，别带着半截防线去跑被审 PR 自己
           # 带的命令。
@@ -2256,7 +2274,7 @@ jobs:
         if: steps.codex_verify.outputs.changed == 'true'
         env:
           FIXER: Codex
-          FIX_PUSH_GUARD: ${{ steps.fix_guards.outputs.push }}
+          FIX_PUSH_GUARD: ${{ steps.push_guard.outputs.push }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
@@ -2265,7 +2283,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 同上一步：正文从 Define the fix verify and push guards 的 output 取，两条路
+          # 同上一步：正文从 Define the fix push guard 的 output 取，两条路
           # 共用同一份（MEL-262）。这一步手上有写权限令牌，所以没拿到正文就红着停下。
           eval "${FIX_PUSH_GUARD:-}"
           declare -F commit_and_push_the_fix >/dev/null || {
