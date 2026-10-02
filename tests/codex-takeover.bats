@@ -30,8 +30,9 @@ setup() {
   run_block "$WF" "Define pr-guard helpers" >/dev/null
   # 验证命令之后的两步从这一步的 output 拿告警函数（真跑时由 env: 接过去），不读文件。
   export PR_GUARD; PR_GUARD="$(step_output script)"
-  run_block "$WF" "Define the fix verify and push guards" >/dev/null
-  # 两条路的验证 / 推送跑的是同一段正文，由那一步的 output 交出来（真跑时由 env: 接
+  run_block "$WF" "Define the fix verify guard" >/dev/null
+  run_block "$WF" "Define the fix push guard" >/dev/null
+  # 两条路的验证 / 推送跑的是同一段正文，由这两步的 output 交出来（真跑时由 env: 接
   # 过去），不读 $RUNNER_TEMP 里的文件。
   export FIX_VERIFY_GUARD; FIX_VERIFY_GUARD="$(step_output verify)"
   export FIX_PUSH_GUARD; FIX_PUSH_GUARD="$(step_output push)"

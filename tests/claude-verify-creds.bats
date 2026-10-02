@@ -8,8 +8,8 @@
 #      里那份。
 #   3. 验证动过 .git、改过不许它改的文件、或留下活进程，就红着停下，绝不 commit / push。
 # Codex 那条路的同名判定在 codex-takeover.bats。两条路跑的已经是同一段正文
-# （Define the fix verify and push guards 里那两个函数，MEL-262），差别只有 $FIXER
-# 一个名字 —— 所以这里改一道防线，Codex 那条路同时也改了。
+# （Define the fix verify guard / Define the fix push guard 两步各一个函数，MEL-262），
+# 差别只有 $FIXER 一个名字 —— 所以这里改一道防线，Codex 那条路同时也改了。
 
 load test_helper/common
 load test_helper/step_gate
@@ -24,8 +24,9 @@ setup() {
   # 噪声重跑时要用的 git：在测试往 PATH 上种任何东西之前先认下来
   REAL_GIT="$(command -v git)"
   export REAL_GIT
-  run_block "$WF" "Define the fix verify and push guards" >/dev/null
-  # 两条路的验证 / 推送跑的是同一段正文，由那一步的 output 交出来（真跑时由 env: 接
+  run_block "$WF" "Define the fix verify guard" >/dev/null
+  run_block "$WF" "Define the fix push guard" >/dev/null
+  # 两条路的验证 / 推送跑的是同一段正文，由这两步的 output 交出来（真跑时由 env: 接
   # 过去），不读 $RUNNER_TEMP 里的文件。
   export FIX_VERIFY_GUARD; FIX_VERIFY_GUARD="$(step_output verify)"
   export FIX_PUSH_GUARD; FIX_PUSH_GUARD="$(step_output push)"

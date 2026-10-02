@@ -104,7 +104,12 @@ jobs:
           fi
           eval "$INSTALL_CMD"
 
+      # 超时不是防慢，是防「挂住」：actionlint 把每个 run: 块写进 shellcheck 的 stdin，
+      # 块超过 64 KiB 管道缓冲就两头互等 —— 不报错、不退出（MEL-291）。没有这一行时
+      # GitHub 要到 360 分钟的 job 上限才收，19 个调用方仓库看到的是「CI 一直转」而不是
+      # 红叉，没人会去点开看。10 分钟对任何一条 lint 都绰绰有余，挂住的那种一定超。
       - name: Lint
+        timeout-minutes: 10
         run: |
           if [ "$LINT_CMD" = skip ]; then
             echo "::notice::lint skipped by caller"

@@ -22,6 +22,36 @@ extract_run_block() {
   ' "$workflow"
 }
 
+# step_key <workflow-file> <step-name> <key>：打印这一步自己那一级的某个键的值
+# （timeout-minutes、continue-on-error 之类）。没写就什么都不打印。
+step_key() {
+  local wf="$1"
+  case "$wf" in /*) ;; *) wf="$REPO_ROOT/$wf" ;; esac
+  awk -v want="      - name: $2" -v key="        $3:" '
+    $0 == want                  { in_step = 1; next }
+    in_step && index($0, key) == 1 { sub(/^[^:]*: ?/, ""); print; exit }
+    in_step && $0 ~ /^      - / { exit }
+  ' "$wf"
+}
+
+# run_block_sizes：把所有 workflow 里每个 `run: |` 块的大小打出来，一行一个
+# `<字节数> <文件名>:<步骤名>`。actionlint 会把每个块原样写进 shellcheck 的 stdin，
+# 块一超过 64 KiB 管道缓冲就两头互等、整个 lint 死锁（MEL-291），所以这是硬约束，
+# 不是排版偏好。字节而不是字符：注释是中文，一个字三字节，按字符数会低估三倍。
+run_block_sizes() {
+  local wf
+  for wf in "$REPO_ROOT"/.github/workflows/*.yml; do
+    LC_ALL=C awk -v f="${wf##*/}" '
+      in_run && $0 ~ /^[[:space:]]*$/ { n += 1; next }
+      in_run && $0 ~ /^          /    { n += length($0) - 10 + 1; next }
+      in_run                          { print n, f ":" step; in_run = 0 }
+      $0 ~ /^      - name: /          { step = substr($0, 15); next }
+      $0 == "        run: |"          { in_run = 1; n = 0 }
+      END { if (in_run) print n, f ":" step }
+    ' "$wf"
+  done
+}
+
 # 用指定 runtime 跑一遍 Resolve commands，结果落到 $GITHUB_ENV 指向的文件。
 # 三个 *_OVERRIDE 默认空串，对应调用方没传 install_cmd / lint_cmd / test_cmd。
 resolve_commands() {
@@ -227,11 +257,19 @@ fake_now_epoch() {
 # 了关掉，就是假绿，看不见。
 trust_fake_bin() { FAKE_BIN_TRUSTED=1; }
 
-# 两条路的验证 / 推送跑的是同一段正文：Define the fix verify and push guards 里那两个
-# 函数（MEL-262）。fix_guard_body 把其中一个的函数体按 workflow 里写的样子取出来 ——
-# 真跑时它走 declare -f 出去，排版会变，所以结构判定一律比这份源文本。
+# 两条路的验证 / 推送跑的是同一段正文：Define the fix verify guard 和 Define the fix
+# push guard 两步各一个函数（MEL-262）。两步各自是一个 run: 块，是因为合成一块就超过
+# actionlint 喂 shellcheck 那条管道的 64 KiB 缓冲、整个 lint 死锁（MEL-291）。
+# fix_guard_body 把其中一个的函数体按 workflow 里写的样子取出来 —— 真跑时它走
+# declare -f 出去，排版会变，所以结构判定一律比这份源文本。
 fix_guard_body() { # fix_guard_body <verify_the_fix|commit_and_push_the_fix>
-  extract_run_block "$ITERATE_WORKFLOW" 'Define the fix verify and push guards' |
+  local step
+  case "$1" in
+    verify_the_fix)          step='Define the fix verify guard' ;;
+    commit_and_push_the_fix) step='Define the fix push guard' ;;
+    *) echo "fix_guard_body: no step owns $1" >&2; return 1 ;;
+  esac
+  extract_run_block "$ITERATE_WORKFLOW" "$step" |
     awk -v fn="$1() {" '$0 == fn { f = 1; next } f && $0 == "}" { exit } f { sub(/^  /, ""); print }'
 }
 
@@ -246,7 +284,7 @@ trusted_path_block() { # trusted_path_block <step>
 }
 
 # step_path_guard <step>：这一步真正跑的那份 path_is_protected。验证 / 推送那四步跑的
-# 是共用正文里的函数，所以先看它 eval 的是哪一个，再去 Define 那一步里取；其余几步
+# 是共用正文里的函数，所以先看它 eval 的是哪一个，再去定义它的那一步里取；其余几步
 # 正文就写在自己的 run 块里。九个带凭据的步骤靠这个助手比成同一份。
 step_path_guard() { # step_path_guard <step>
   local block fn
