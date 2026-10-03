@@ -42,11 +42,12 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `pr-guard: fallback head=H` | GITHUB_TOKEN | Codex 这次不行，换 Claude |
 | `claude-review-findings: H` | PAT | Claude 代审有意见（一条 COMMENT review） |
 | `claude-review-clean: H` | PAT | Claude 代审无意见，CI 绿就合 |
+| `codex-fix-request: head=H round=N run=ID` | PAT（iterate） | 请 Codex 云端出一段补丁（句子里没有「@codex review」，不算复审请求） |
 | `fix-retry: head=H review=ID` | PAT（巡检） | 上次修复没完成，再修一次 |
 | `pr-guard: fix-round head=H round=N` | GITHUB_TOKEN | 第 N 轮修复已推送（轮数不靠召唤是否成功） |
 | `pr-guard: alert head=H reason=R until=T` | 各环节 | 已告警 R，同一 head 同一原因只推一次 |
 
-告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `round-cap` `retry-exhausted` `stalled` `unwatched`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
+告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
 
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
 
@@ -86,6 +87,8 @@ INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip ./onboard.sh <repo> node
 
 Codex connector 是账号级授权，新仓库无需单独授权（2026-07-29 在 learn-api-integrations 实测：新开的 PR 2 分钟内就被自动 review 并 👍）。
 
+**接完还要手动做一件事**：到 [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments) 给这个仓库建一个环境，默认设置即可。*review* 不需要它，Claude 撞额度时**请 Codex 出补丁**需要 —— 没建的话 Codex 只回一句「先建环境」，那一轮红着停下并告警 `codex-no-env`。
+
 ## 调用桩长什么样
 
 `stubs/` 里三个文件就是全部。每个仓库只放这三个，逻辑全在本仓库。例如：
@@ -101,6 +104,8 @@ jobs:
 `runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm + npm test`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。
 
 `claude-codex-iterate.yml` 另收一个 `review_fixer`：`auto`（默认，Claude 先上，只有额度耗尽 / 限流 / 认证失效 / 服务不可用才换 Codex）、`claude`（现有行为，永不换人）、`codex`（跳过 Claude）。**拼错直接红**，不会静默按 `auto` 跑掉一整轮。测试没修好、构建挂了这类业务失败**不换人**：换个模型一样挂，job 该红就红。谁上、有没有换人、为什么，三件事都写在那次 run 的 summary 里。换人成功的那一轮照样记轮数、照样召唤复审，链条不会停在这里；令牌失效这种不会自己恢复的原因，即使换人成功也推一条通知。
+
+**Codex 接手不跑在 runner 上，也不要 OpenAI 的 API key（2026-10-02）。** 流水线用主人的 PAT 在 PR 上留一句写死的话（`@codex fix … paste the complete change as one unified diff …`），等 `chatgpt-codex-connector[bot]` 回复，取出回复里**恰好一个** diff 代码块、`git apply` 打到工作区，之后的验证 / 推送 / 召唤复审原样复用。Codex 走的是主人自己的 ChatGPT 订阅，所以**每个仓库都要在 [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments) 建一个环境**（默认设置即可），没建它只回一句「先建环境」。下面任一情况这一轮红着停下、发一次告警、什么都不推（巡检之后会再叫 Claude）：15 分钟没回（`codex-no-patch`）、回的是「先建环境」（`codex-no-env`）、额度 / 限流提示、没有 diff 块、贴了两段、回复被截断、补丁打不上或碰到 `.github/workflows/`（`codex-patch-rejected`）。**只有 Codex 自己写的 review 走这条路**：Claude 代审写的意见里没有「your review」的指代对象，那种轮次直接红（`codex-no-review`）。
 
 `claude-codex-iterate.yml` 和 `codex-approved-merge.yml` 都收 `claude_model`（默认 `claude-opus-5-5`）和 `claude_effort`（默认 `xhigh`）。**默认值永远钉死，永远是 Opus 及以上**：不钉，action 就用 Claude Code 的账号默认模型 —— 2026-09 之前那是 Sonnet，静静跑了几周没人发现（PR #17 两轮修复都是它做的）。只认明确写出的 Opus 及以上（`opus` / `fable` 别名或 `claude-opus-*` 这类 id）；Sonnet、Haiku、`default`、`opusplan` 整轮直接红。Opus 5.5 自带的思考力度是 medium，所以钉 xhigh。每条 Claude 总结评论末尾写出实际跑的模型名（从 SDK 执行记录里读，不是配置里抄的）—— 哪天默认值悄悄变了，PR 上一眼看得到。换新模型：改这两个默认值 → 合入 → 移 `v1` 标签。
 
@@ -118,13 +123,12 @@ jobs:
 
 ## 密钥
 
-五个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
+四个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
 
 | 密钥 | 缺了会怎样 |
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude 修复和 Claude 代审都不跑（`claude setup-token` 生成，`sk-ant-oat01-` 开头）。和本人的订阅共用每周额度 |
-| `CODEX_TRIGGER_TOKEN` | 无法召唤 Codex 复审；Claude 代审结论发不出（告警 `pat-missing`）；巡检不能动手 |
-| `CODEX_API_KEY` | Claude 撞额度时换不了人，`review_fixer: codex` 也跑不了（platform.openai.com 建的 API key，不是 ChatGPT 订阅） |
+| `CODEX_TRIGGER_TOKEN` | 无法召唤 Codex 复审；Claude 撞额度时请不动 Codex 出补丁；Claude 代审结论发不出（告警 `pat-missing`）；巡检不能动手 |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
 
 `CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write —— 覆盖全部仓库，接新仓库不用回去改 PAT。
@@ -152,8 +156,10 @@ git tag -f v1 && git push -f origin v1
 ## 踩过的坑
 
 - **顶层 `concurrency` 只能声明一次**：调用桩和被调用的可复用工作流若都在顶层声明同名 group，GitHub 判定「top level workflow」与该 job 死锁，run 立刻失败、零 job、无日志，只有一句 "This run likely failed because of a workflow file issue"。排队逻辑写在被调用方的 **job 层**，调用桩不要写 `concurrency`。`claude-codex-iterate` 踩了这个坑，2026-07-29 起 9 个仓库共 11 次触发全部空跑，直到 2026-08-20 才发现 —— 整条 Codex→Claude 迭代链从来没运行过。
-- **Codex 沙箱没网、`.git` 只读**：`codex exec` 在 `:workspace` 档下改得动工作区文件，但连不上网，也写不了 `.git`（MEL-197 实测，带对照组）。所以 Codex 接管那条路里，取评论、装依赖、跑验证、commit/push、发评论全部由外层 step 做，Codex 只负责改文件和写总结 —— 把给 Claude 的那套 prompt 照搬过去必炸。
-- **actionlint 内置的 action 输入清单会过期**：它报 `openai/codex-action@v1` 没有 `permission-profile` / `allow-bot-users`，实际 v1 tag 有。这类「工具数据旧了、事实是对的」的例外写在 `.github/actionlint.yaml`，每条都附核对依据；不写理由的忽略规则没人敢删，迟早掩盖真错。
+- **云端的 Codex 修得好，但不会自己把改动推回 PR**：只发 `@codex fix`，它走订阅修好了（1 分 42 秒），然后停在它自己的任务页上等人点「更新分支」，设置里也没有自动推送的开关（MEL-266 实测，盯满 30 分钟）。能全自动的写法是**让它把改动贴成一段 diff**：同一句留言加上「paste the complete change as one unified diff」，75 秒就回了完整补丁，`git apply` 干净打上。所以留言原文写死，别改措辞。另外每个仓库都要先建 Codex 云端环境，否则它只回一句「先建环境」。
+- **一条回复里有几个 diff 块就只能是一个**：零个、两个、开了没合上（GitHub 评论有长度上限，回复会被截断）一律当失败，宁可红着停下也不猜 —— 猜错就是把一段外部回复直接改进仓库，而下一步带着写权限令牌推出去。截断尤其阴：截在 hunk 中间 `git apply` 会拒，截在 hunk 边界上的却打得上，推出去就是半截修复。
+- **补丁碰 `.github/workflows/` 一律拒**：推送用的令牌没有 workflows 权限（PR #18 实测推不上去），而且工作流文件正是这条流水线自己的防线。路径两头都要看 —— `git apply --numstat` 只报改动的去处，一次改名把工作流文件搬走它看不见，所以补丁自己的头行（`diff --git` / `---` / `+++` / `rename from|to`）也一起扫。
+- **`github.job_workflow_sha` 实跑是空的，而空 `ref` 会让 `actions/checkout` 静默换一个**：取本仓库 `scripts/` 的那一步原来按它定版本。2026-10-02 实测两次（调用桩分别钉分支、钉 tag），checkout 的 `with:` 里连 `ref` 这一项都没出现 —— 值是空串。空 `ref` 不报错，checkout 退回事件自己的 ref：**在本仓库自己的 PR 上那就是被审 PR 的合并树**，于是被审 PR 自己提供了我们用来判它的脚本（换掉分类脚本就能买一次换人）；别的调用方仓库上那个 ref 在本仓库里不存在，整轮以一句看不懂的 checkout 错误收场。`v1` 标签还没移过，所以这一条从 PR #17 合入起一直没被跑到。改从本次 run 自己的记录里读：`GET /repos/{repo}/actions/runs/{id}` 的 `referenced_workflows` 按路径列出这次用到的每一份可复用工作流，带 `ref` 和 `sha`，是 GitHub 自己记下的事实，调用方和被审 PR 都改不动。读不出 40 位 commit 就红着停下，按路径筛出来的 commit 去重后不是恰好一个也红 —— 两个不同 sha 时挑一个（`first`）跟填空一样是在猜，只是这次猜的是版本（MEL-272）。**凡是「填空了会被某个 action 悄悄换成别的」的输入，都要先在 shell 里解析并验证，再交给它。**
 - **不要放宽 `--allowedTools`**：Codex 的 review 正文是外部输入，直接进 Claude 的 prompt，而那个 token 有写权限。只放行具体命令，别用 `Bash(git:*)`。
 - **`--allowedTools` 是全量清单**：`Edit,MultiEdit,Write` 不列出来 Claude 就改不了任何文件，只会干烧轮数。
 - **绿勾 ≠ 有产出**：确认 Claude 真干了活要看 PR 时间线有没有评论和 commit。`claude-codex-iterate` 现在只在「推了新提交」和「看完觉得不用改」两种结局下报绿，缺凭证、额度耗尽、令牌失效、说推了却没推一律报红 —— 之前这些全被咽成 success，douyin-grabber 的自动修复因此一次都没跑起来还天天绿（MEL-236）。红的是 iterate 这条 run，`codex-approved-merge` 按名字把它排除在合并门槛外，不会因此卡住合并。
@@ -174,7 +180,7 @@ git tag -f v1 && git push -f origin v1
 - **「凭据在 step 的 `env:` 里」不是靠挪位置能修好的**：Linux 上同一个 uid 的活进程从 `/proc/<pid>/environ` 就把它读回去了，放文件更糟（谁都能轮询），上命令行也一样（`argv` 公开），`unset` 改不掉 `/proc` 里那份初始环境。上一轮的验收记录写成「躲开之后它找不到任何可轮询的凭据」，这句话是错的 —— 凭据只是从文件挪进了进程环境。正确的说法是**不许有人等**：每个 step 是各自一个进程，验证那一步早已退出（死进程没有 environ），带凭据那一步在验证跑的时候还不存在，所以唯一的风险就是「验证留下了活进程」，上一条那道清点把它堵掉、清不干净就红着停下，带凭据那一步压根不会开始。想让 environ 连同一个用户也读不到，只有把验证命令换到另一个用户下跑 —— 2026-10-02 起默认就是这样（`verify_isolation`，MEL-289），于是「有人在等」这件事连资格都没有了；那个账号建不起来的 runner 上回退回同一个用户，上面这段仍然是回退路径的全部依据（MEL-255）。工作区归属走组权限（整个 `g+w` + 目录 setgid + 它那头 `umask 002`），所有权一个字不改，所以验证跑完我们照旧 `git add -u` / `git clean -fdx` 得动它造出来的 `.venv` / `node_modules`。
 - **「令牌只在那一步里」这条对 Claude 那一步同样成立，而它没法靠挪令牌满足**：`anthropics/claude-code-action` 那一步必须握着写权限令牌（action 自己要用），所以唯一的办法是**让被审 PR 的代码进不来**：清单里删掉整条 runtime 工具链（`Bash(uv:*)` / `Bash(npm:*)` / `Bash(bats:*)`…，也就是 `extra_tools` / `EXTRA_TOOLS` 不再拼进 `--allowedTools`），删掉 `git add` / `commit` / `push` 和 `gh pr comment`，提示词里也不再让它自己跑验证 —— 它只改文件。验证、commit、push、发总结挪成后面四步，形状和判定跟 Codex 那条路逐行一致；总结文本走结构化输出的 `summary` 字段带出来发。顺带把 `actions/checkout` 的 `persist-credentials` 关掉：那份凭据躺在 `.git/config` 里，读个文件就换来仓库写权限，连种钩子都不用，而本 job 没有一步依赖它（两条路的 push 都自己现造一份）。代价是 Claude 不再能「跑测试 → 看见红 → 自己再修一轮」：验证红了这一轮就红着停下，跟 Codex 那条路一样等巡检重修（MEL-254）。
 - **两份防线现在是逐行副本，改一份必须改另一份**：`Verify / Commit and push the Claude fix` 是 `... the Codex fix` 那两步的复制品。之所以不共用一份：Codex 那两步排在「换不换人」的裁决之后，Claude 那条路走不到它们那儿；而把判定抽成 `$RUNNER_TEMP` 下的共享脚本，等于请验证命令改写我们自己的防线。合成一份是单独一张票的事（MEL-254）。
-- **PATH 前几项在 `$HOME` 下，验证命令写得动 —— 它能换掉我们后面要跑的命令本身**：`ubuntu-latest` 的 PATH 第一项就是 `/home/runner/.local/bin`（还有 `.cargo/bin`、`.dotnet/tools` 之类），验证命令跟我们同一个用户，往那儿放一个假 `ps` 就把自己从清点里隐掉、放一个假 `git` 就报一棵假的树、放一个假 `gh` 就在下一步直接拿到令牌 —— 指纹、白名单、清点全部变成空转，而 `.git` 一个字没动。**两步（验证、带凭据那一步）各自把 PATH 过滤成「我们写不动的目录」**：目录本身不可写还不够，上一级可写就能把整个目录换掉，所以连父目录一起看；原来那份 PATH 只交给验证命令自己（它要 `uv` / `npm` / `node` 那些装在 `$HOME` 下的工具）。过滤完少了 `git` / `ps` / `awk` 就红着停下 —— 这一道要是静默空转，比没有更糟。新加的「发总结评论」那一步照同一段过滤（它手上是 `github.token`）；少了 `gh` / `jq` 它只 warning 跳过评论，不红 —— 它排在判定结局那步之前，一红整条链就静默停住。凡是手上有凭据的步骤都照同一段过滤，一共九步（两条路各自的验证、提交推送、发总结评论，加上 `Check the fix outcome` 和 `Decide the takeover`、「召唤复审」）—— 「召唤复审」手上是 `CODEX_TRIGGER_TOKEN`，是这一串里最该收紧的一步。少了工具红不红按「它一红会不会把链条静默停住」分：判定结局、裁决那两步红着停下，两条发总结评论和召唤复审只 warning 跳过。过滤那段判定**只认绝对路径**：相对项按 cwd 解析，而 cwd 就是被审 PR 的工作副本，而且「逐级往上剥父目录」碰到不带 `/` 的相对项会原地打转，整步挂到超时（MEL-260）。**测试怎么共存**：`tests/test_helper/fake-bin` 在仓库里、谁都写得动，过滤之后必然被滤掉。行为判定调 `trust_fake_bin` 把假命令接回去，安全判定（种一个假 `gh` 看它跑不跑）跑原样的块 —— opt-in 不是默认，忘了加是红，忘了关才是假绿。
+- **PATH 前几项在 `$HOME` 下，验证命令写得动 —— 它能换掉我们后面要跑的命令本身**：`ubuntu-latest` 的 PATH 第一项就是 `/home/runner/.local/bin`（还有 `.cargo/bin`、`.dotnet/tools` 之类），验证命令跟我们同一个用户，往那儿放一个假 `ps` 就把自己从清点里隐掉、放一个假 `git` 就报一棵假的树、放一个假 `gh` 就在下一步直接拿到令牌 —— 指纹、白名单、清点全部变成空转，而 `.git` 一个字没动。**两步（验证、带凭据那一步）各自把 PATH 过滤成「我们写不动的目录」**：目录本身不可写还不够，上一级可写就能把整个目录换掉，所以连父目录一起看；原来那份 PATH 只交给验证命令自己（它要 `uv` / `npm` / `node` 那些装在 `$HOME` 下的工具）。过滤完少了 `git` / `ps` / `awk` 就红着停下 —— 这一道要是静默空转，比没有更糟。新加的「发总结评论」那一步照同一段过滤（它手上是 `github.token`）；少了 `gh` / `jq` 它只 warning 跳过评论，不红 —— 它排在判定结局那步之前，一红整条链就静默停住。凡是手上有凭据的步骤都照同一段过滤，一共十步（两条路各自的验证、提交推送、发评论，加上 `Check the fix outcome`、`Decide the takeover`、「请 Codex 出补丁」和「召唤复审」）—— 「召唤复审」和「请 Codex 出补丁」手上都是 `CODEX_TRIGGER_TOKEN`，是这一串里最该收紧的两步。少了工具红不红按「它一红会不会把链条静默停住」分：判定结局、裁决那两步红着停下，两条发总结评论和召唤复审只 warning 跳过。过滤那段判定**只认绝对路径**：相对项按 cwd 解析，而 cwd 就是被审 PR 的工作副本，而且「逐级往上剥父目录」碰到不带 `/` 的相对项会原地打转，整步挂到超时（MEL-260）。**测试怎么共存**：`tests/test_helper/fake-bin` 在仓库里、谁都写得动，过滤之后必然被滤掉。行为判定调 `trust_fake_bin` 把假命令接回去，安全判定（种一个假 `gh` 看它跑不跑）跑原样的块 —— opt-in 不是默认，忘了加是红，忘了关才是假绿。
 - **PATH 过滤挡的是「跑哪个命令」，挡不住「加载哪个文件」**：`Check the fix outcome` 和 `Decide the takeover` 以前 `source` 一份放在 `$RUNNER_TEMP` 的告警函数文件。它是验证命令起跑之前写下的，而 `$RUNNER_TEMP` 验证命令写得动 —— 往里塞一行，就在握着 `github.token` 的那一步里跑起来，九步的 PATH 过滤一道都拦不住。现在同一份函数文本另走 step output 交过去：output 在验证命令起跑前已被 runner 收走，它改不到；文件只留给排在验证之前的 Gate 用。没拿到就红着停下。失败分类脚本（`classify-claude-failure.sh`）同一个毛病、同一个修法：正文在 PR 代码起跑前交给 step output，`Decide the takeover` 用写保护目录里的 bash 跑那份文本，不执行 `$RUNNER_TEMP` 里的文件 —— 否则换掉它既拿得到令牌，回一句「额度用完」还能把业务失败骗成换人（Codex 2026-09-26 / 10-01 的两条 P1，MEL-260）。
 - **GitHub 托管 runner 给 `runner` 用户免密 `sudo`**：真要动它，上面这一整串（进程清点、PATH、指纹、白名单）全都绕得过去 —— 这一系列防的是「不动 sudo」的那一类验证命令，也就是 `npm ci` 的生命周期钩子、pytest 插件那种顺手就能执行任意代码的路子。别把这些防线当成「外部 PR 在 runner 上做不了坏事」。同一档的还有「先不留活进程、过后再起一个」：`crontab` / `at` / `systemd-run --user` 排一个一分钟后的任务，清点那一刻它名下确实干净，任务起来时带凭据那一步可能还在跑 —— 按 uid 清点管的是「此刻有没有人在等」，管不了「过后有没有人来」（MEL-255）。换到专用账号下跑之后这两条都塌了半边：那个账号不在 sudoers 里（`sudo` 对它直接失败），`systemd-run --user` / `crontab` 也没有服务管理器可问；回退路径上原样成立（MEL-289）。
 - **`git clean -fd` 清不掉被忽略的残留**：Claude 撞额度前跑一半的 `uv sync` 留下的 `.venv`、`node_modules`、build 产物都躲在 `.gitignore` 后面，没有 `-x` 就原地留着跟进 Codex 那一轮，验证于是跑在一个被污染的工作区上。换人前的清理一律 `git clean -fdx`；本轮要留的东西（预取的 review 正文）在 clean 之前挪出工作区、clean 之后再放回来（MEL-252）。
