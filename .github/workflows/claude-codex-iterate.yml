@@ -1401,11 +1401,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          sha="$(gh api "repos/$REPO/actions/runs/$RUN_ID" |
+          # 按路径筛出来的 commit 必须恰好一个。记录里同一条路径带两个不同 sha 时
+          # 任意挑一个（原来这里是 `first`）就是在猜，而猜错的那一下照样静默跑完 ——
+          # 整轮拿错版本的脚本判完这个 PR。同一个 sha 记两遍不算歧义，先去重。
+          resolved="$(gh api "repos/$REPO/actions/runs/$RUN_ID" |
             jq -r --arg w "$WORKFLOW_PATH" '
-              .referenced_workflows // []
-              | map(select((.path | split("@")[0]) == $w)) | first | .sha // empty')" ||
-            sha=''
+              [ .referenced_workflows // []
+                | .[]
+                | select((.path | split("@")[0]) == $w)
+                | .sha // "" ]
+              | unique
+              | "\(length) \(.[0] // "")"')" || resolved=''
+          case "$resolved" in
+            [0-9]*' '*) ;;
+            *) resolved='0 ' ;;
+          esac
+          count="${resolved%% *}"
+          sha="${resolved#* }"
+          if [ "$count" -gt 1 ]; then
+            echo "::error::this run's record names $count different commits for $WORKFLOW_PATH; refusing to pick one of them for the shared fixer scripts"
+            exit 1
+          fi
           # 必须是一个完整的 commit：短 sha、ref 名、空串一概不收 —— 收了就等于
           # 让 checkout 去猜，而猜错的那一下是静默的。
           case "$sha" in

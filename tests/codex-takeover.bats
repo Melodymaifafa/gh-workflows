@@ -1976,6 +1976,25 @@ resolve_ref() { # resolve_ref <referenced_workflows 的 JSON>
   assert_contains "$output" 'does not say which commit'
 }
 
+# 同一条路径在记录里对应两个不同 commit：挑其中一个就是在猜，而猜错的那一下照样
+# 静默跑完 —— 整轮拿错版本的脚本判完这个 PR。所以不是恰好一个就红着停下。
+@test "scripts-ref: two commits for one path red the round instead of picking one" {
+  resolve_ref "[{\"path\": \"$WF_PATH@v1\", \"ref\": \"refs/tags/v1\", \"sha\": \"1111111111111111111111111111111111111111\"},
+                {\"path\": \"$WF_PATH@mel-272\", \"ref\": \"refs/heads/mel-272\", \"sha\": \"2222222222222222222222222222222222222222\"}]"
+  assert_equal "$status" 1
+  assert_contains "$output" 'names 2 different commits'
+  refute_contains "$(cat "$GITHUB_OUTPUT")" 'ref='
+}
+
+# 同一个 commit 记了两遍不是歧义，照常取它；别把去重做成「多于一条就红」。
+@test "scripts-ref: the same commit recorded twice is not an ambiguity" {
+  sha=5329f35611ffe5b07564edb0ec2f9203dfdb1850
+  resolve_ref "[{\"path\": \"$WF_PATH@v1\", \"ref\": \"refs/tags/v1\", \"sha\": \"$sha\"},
+                {\"path\": \"$WF_PATH@v1\", \"ref\": \"refs/tags/v1\", \"sha\": \"$sha\"}]"
+  assert_equal "$status" 0
+  assert_equal "$(step_output ref)" "$sha"
+}
+
 # 这一步排在 Gate 之后、被审 PR 的代码跑起来之前，所以它不在那十步里。守住位置本身：
 # 它必须排在取脚本那次 checkout 之前，否则 checkout 又拿不到 ref 了。
 @test "scripts-ref: the resolver runs before the checkout that uses it" {
