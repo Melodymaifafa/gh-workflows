@@ -2399,6 +2399,12 @@ jobs:
                 else [.html_url, (if mine then "self" else "other" end)] | @tsv
                 end' <<<"$comments")" ||
             give_up codex-busy '读不回这个 PR 的留言列表，没法确认现在能不能请 Codex 出补丁，这一轮什么都没推。'
+          # 这一问和下面那一发 POST 之间还有一小段时间。那一瞬间插进来的请求，编号比
+          # 我们这条小，光按「编号比我们大」扫是扫不到的 —— 所以把这一刻的最大编号记
+          # 下来，轮询时拿它当地板：比地板大、又不是我们自己那条的请求，一概算撞上。
+          preflight_max="$(jq -r '(add // []) | map(.id) | max // 0' <<<"$comments")" ||
+            give_up codex-busy '读不回这个 PR 的留言列表，没法确认现在能不能请 Codex 出补丁，这一轮什么都没推。'
+
           if [ -n "$busy" ]; then
             busy_url="${busy%%$'\t'*}"
             case "${busy##*$'\t'}" in
@@ -2439,11 +2445,12 @@ jobs:
             sleep 30
             # gh 偶发失败就当这一轮还没回，接着等；超时那条出口自然会收口。
             if comments="$(fetch_comments)"; then
-              # 我们问完之后又有人 @ 了一次 Codex：窗口里从此有两个请求，下一条回复
-              # 是回哪一次的就说不准了。当场收口，别赌。
-              rival="$(jq -r --argjson since "$request_id" '
+              # 开窗前后又有人 @ 了一次 Codex：窗口里从此有两个请求，下一条回复是回
+              # 哪一次的就说不准了。当场收口，别赌。地板取的是开窗前那一刻的最大编号
+              # （不是我们这条请求的编号），所以「问之前那一瞬间插进来的」也扫得到。
+              rival="$(jq -r --argjson floor "$preflight_max" --argjson since "$request_id" '
                 (add // [])
-                | map(select(.id > $since
+                | map(select(.id > $floor and .id != $since
                              and .user.type == "User"
                              and (.author_association == "OWNER"
                                   or .author_association == "MEMBER"

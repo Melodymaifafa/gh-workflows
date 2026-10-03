@@ -388,6 +388,32 @@ ask_codex() {
   assert_equal "$(git status --porcelain)" ''
 }
 
+# 「问之前确认一遍」和「发出请求」之间还有一小段时间。那一瞬间插进来的请求，编号比
+# 我们这条小，光按「编号比我们大」扫是扫不到的 —— 它的回复照样会顶上来。
+@test "patch: a request slipped in between the preflight and our own is caught too" {
+  handover_workspace
+  patch="$(codex_patch codex-review-context.md 'answer to the slipped-in request')"
+  export CODEX_PAT=owner-pat GH_TOKEN=write-token
+  export HEAD_SHA="$H" ROUND=2 RUN_ID=777
+  export PATCH_EXTRACTOR; PATCH_EXTRACTOR="$(cat "$SCRIPTS/extract-codex-patch.sh")"
+  export FAKE_NOW=2026-10-02T08:00:00Z
+  fake_route -X POST repos/o/r/issues/7/comments '{"id":5000}'
+  # 问的时候 PR 上一条留言都没有，所以地板是 0。
+  fake_route "repos/o/r/issues/7/comments?per_page=100" '[]' 1
+  # 4998 是我们 POST 之前那一瞬间插进来的手打请求：编号比 5000 小。
+  fake_route "repos/o/r/issues/7/comments?per_page=100" \
+    "$(json_array \
+      "$(gh_comment 4998 Melodymaifafa OWNER '@codex fix the race you found' 2026-10-02T07:59:58Z)" \
+      "$(gh_comment 5001 "$CODEX" NONE "$(diff_reply "$patch")" 2026-10-02T08:00:40Z)")" 2
+  trust_fake_bin
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-busy'
+  refute_contains "$(cat codex-review-context.md)" 'answer to the slipped-in request'
+  assert_equal "$(git status --porcelain)" ''
+}
+
 @test "patch: Codex's own review output is never mistaken for the patch reply" {
   handover_workspace
   patch="$(codex_patch codex-review-context.md 'fixed by codex')"
