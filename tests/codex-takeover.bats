@@ -178,20 +178,25 @@ diff_reply() { # diff_reply <补丁正文>
   printf '### Summary\n\n* Fixed the swallowed error.\n\n```diff\n%s\n```\n\n**Testing**\n\n* `bats tests/`\n' "$1"
 }
 
+# 把几段 JSON 数组接成一条评论列表。
+comment_list() { printf '%s ' "$@" | jq -s add; }
+
 # ask_codex [回复正文]：摆好这一步要的环境和假 GitHub，然后跑它。
 # 不给回复正文 = Codex 一直不回（超时那条路）。
+# $PRE（JSON 数组，可选）= 发请求之前这个 PR 上已有的评论。
 ask_codex() {
   export CODEX_PAT=owner-pat GH_TOKEN=write-token
   export HEAD_SHA="$H" ROUND=2 RUN_ID=777
   export PATCH_EXTRACTOR; PATCH_EXTRACTOR="$(cat "$SCRIPTS/extract-codex-patch.sh")"
   export FAKE_NOW=2026-10-02T08:00:00Z
+  local pre="${PRE:-[]}"
   fake_route -X POST repos/o/r/issues/7/comments '{"id":5000}'
+  # 第 1 次 GET 是发请求之前那一问「窗口里还有没有别的请求悬着」，第 2 次起才是轮询。
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$pre" 1
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$pre" 2
   if [ "$#" -ge 1 ]; then
-    fake_route "repos/o/r/issues/7/comments?per_page=100" '[]' 1
     fake_route "repos/o/r/issues/7/comments?per_page=100" \
-      "$(json_array "$(gh_comment 5001 "$CODEX" NONE "$1")")" 2
-  else
-    fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
+      "$(comment_list "$pre" "$(json_array "$(gh_comment 5001 "$CODEX" NONE "$1")")")" 3
   fi
   trust_fake_bin
   run run_block "$WF" "$STEP"
@@ -265,6 +270,118 @@ ask_codex() {
   assert_equal "$status" 1
   refute_contains "$(cat codex-review-context.md)" 'planted by a stranger'
   assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-no-patch'
+}
+
+# Codex 的回复里没有任何指回请求的东西（请求末尾那条隐藏标记它不回抄），所以
+# 「这条回复是回我这一次的」全靠「同一时间窗口里只有我这一个请求」。下面五条守
+# 这个窗口：开窗前有别的请求悬着就不开；开窗后又有人开了一个就收口；回来的是
+# 复审输出就跳过。反面两条（答过的、过期的）得照常放行，不然这条路会被堵死。
+
+@test "patch: a Codex request still waiting for an answer blocks a second one" {
+  handover_workspace
+  # 5 分钟前她点了一次召唤复审，Codex 还没回。这会儿再问一次，它那条回复会落在
+  # 我们这条请求之后，作者和编号两条判据都满足 —— 于是被当成这一次的补丁。
+  PRE="$(json_array \
+    "$(gh_comment 4990 "$CODEX" NONE 'Codex Review: all good' 2026-10-02T07:00:00Z)" \
+    "$(gh_comment 4995 Melodymaifafa OWNER '@codex review' 2026-10-02T07:55:00Z)")" \
+    ask_codex "$(diff_reply "$(codex_patch codex-review-context.md 'answer to the other request')")"
+
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-busy'
+  # 请求压根没发出去，工作区一个字没动
+  refute_called 'gh api POST repos/o/r/issues/7/comments'
+  refute_contains "$(cat codex-review-context.md)" 'answer to the other request'
+  assert_equal "$(git status --porcelain)" ''
+}
+
+@test "patch: a summon Codex answered by editing its review summary does not block" {
+  handover_workspace
+  # 复审带意见的那种 Codex 不新发评论，而是原地改写自己那条审查小结：编号还是老的，
+  # 只有 updated_at 往前走（实测 PR 23）。光比编号的话这条召唤会被永远当成没回话，
+  # 这条路就彻底堵死了。
+  summary="$(gh_comment 4990 "$CODEX" NONE '<!-- codex-pull-request-review-summary -->
+
+## Codex Review Summary' 2026-10-02T07:00:00Z | jq '.updated_at = "2026-10-02T07:51:00Z"')"
+  PRE="$(json_array "$summary" \
+    "$(gh_comment 4995 Melodymaifafa OWNER '@codex review' 2026-10-02T07:50:00Z)")" \
+    ask_codex "$(diff_reply "$(codex_patch codex-review-context.md 'fixed by codex')")"
+
+  assert_equal "$status" 0
+  assert_contains "$(cat codex-review-context.md)" 'fixed by codex'
+}
+
+@test "patch: an unanswered summon older than the reply window does not block" {
+  handover_workspace
+  # 20 分钟前的召唤：Codex 要么早答过、要么丢了，它的回复不可能现在才到。
+  PRE="$(json_array "$(gh_comment 4995 Melodymaifafa OWNER '@codex review' 2026-10-02T07:40:00Z)")" \
+    ask_codex "$(diff_reply "$(codex_patch codex-review-context.md 'fixed by codex')")"
+
+  assert_equal "$status" 0
+  assert_contains "$(cat codex-review-context.md)" 'fixed by codex'
+}
+
+@test "patch: a drive-by @codex from someone without write access never blocks" {
+  handover_workspace
+  # Codex 只理有写权限的真人，路人的 @ 它不接 —— 不排掉的话任何人都能用一句留言
+  # 把这条路堵 15 分钟。
+  PRE="$(json_array "$(gh_comment 4995 passerby NONE '@codex fix this for me' 2026-10-02T07:59:00Z)")" \
+    ask_codex "$(diff_reply "$(codex_patch codex-review-context.md 'fixed by codex')")"
+
+  assert_equal "$status" 0
+  assert_contains "$(cat codex-review-context.md)" 'fixed by codex'
+}
+
+@test "patch: a second summon landing after our request stops the round" {
+  handover_workspace
+  patch="$(codex_patch codex-review-context.md 'answer to the other request')"
+  export CODEX_PAT=owner-pat GH_TOKEN=write-token
+  export HEAD_SHA="$H" ROUND=2 RUN_ID=777
+  export PATCH_EXTRACTOR; PATCH_EXTRACTOR="$(cat "$SCRIPTS/extract-codex-patch.sh")"
+  export FAKE_NOW=2026-10-02T08:00:00Z
+  fake_route -X POST repos/o/r/issues/7/comments '{"id":5000}'
+  fake_route "repos/o/r/issues/7/comments?per_page=100" '[]' 1
+  # 我们问完之后她又点了一次召唤，紧接着一条带 diff 的回复到了：它回的是哪一次
+  # 说不准，所以这一轮当场收口，什么都不打。
+  fake_route "repos/o/r/issues/7/comments?per_page=100" \
+    "$(json_array \
+      "$(gh_comment 5002 Melodymaifafa OWNER '@codex review' 2026-10-02T08:00:20Z)" \
+      "$(gh_comment 5003 "$CODEX" NONE "$(diff_reply "$patch")" 2026-10-02T08:00:40Z)")" 2
+  trust_fake_bin
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-busy'
+  refute_contains "$(cat codex-review-context.md)" 'answer to the other request'
+  assert_equal "$(git status --porcelain)" ''
+}
+
+@test "patch: Codex's own review output is never mistaken for the patch reply" {
+  handover_workspace
+  patch="$(codex_patch codex-review-context.md 'fixed by codex')"
+  export CODEX_PAT=owner-pat GH_TOKEN=write-token
+  export HEAD_SHA="$H" ROUND=2 RUN_ID=777
+  export PATCH_EXTRACTOR; PATCH_EXTRACTOR="$(cat "$SCRIPTS/extract-codex-patch.sh")"
+  export FAKE_NOW=2026-10-02T08:00:00Z
+  fake_route -X POST repos/o/r/issues/7/comments '{"id":5000}'
+  fake_route "repos/o/r/issues/7/comments?per_page=100" '[]' 1
+  # 两条都是复审输出：审查小结 + 「没发现问题」。都在我们这条请求之后，作者也对，
+  # 但它们回的不是这次的请求 —— 跳过、接着等，补丁是第三条。
+  reviews="$(json_array \
+    "$(gh_comment 5001 "$CODEX" NONE '<!-- codex-pull-request-review-summary -->
+
+## Codex Review Summary' 2026-10-02T08:00:20Z)" \
+    "$(gh_comment 5002 "$CODEX" NONE 'Codex Review: Didn'"'"'t find any major issues. :+1:' 2026-10-02T08:00:40Z)")"
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$reviews" 2
+  fake_route "repos/o/r/issues/7/comments?per_page=100" \
+    "$(comment_list "$reviews" \
+      "$(json_array "$(gh_comment 5003 "$CODEX" NONE "$(diff_reply "$patch")" 2026-10-02T08:01:00Z)")")" 3
+  trust_fake_bin
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 0
+  assert_contains "$(cat codex-review-context.md)" 'fixed by codex'
+  # 第二轮才等到补丁：第一轮那两条复审输出被跳过了，不是当场拿去打
+  assert_called 'sleep 30' 2
 }
 
 @test "patch: Codex never answering is a red round with one alert and nothing applied" {

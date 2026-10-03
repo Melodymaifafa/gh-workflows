@@ -2334,6 +2334,66 @@ jobs:
           [ -n "${CODEX_PAT:-}" ] ||
             give_up pat-missing '请 Codex 出补丁得用你本人的令牌，仓库 secret CODEX_TRIGGER_TOKEN 现在是空的；这一轮什么都没推。'
 
+          # 「Codex 回的这条是回我这一次的」没有任何直接凭据：请求末尾那条隐藏标记
+          # （`<!-- codex-fix-request: ... -->`）Codex 不会回抄 —— MEL-266 实测那几次
+          # 请求里都带着标记，它回的补丁里一个字都没带回来。所以只能靠「同一时间这个
+          # PR 上只有我这一个请求」：开窗前确认没有别的请求悬着（下面这一段），开窗后
+          # 盯着有没有人又开了第二个（轮询里那一段）。少了这两道，另一次请求的回复晚到
+          # 就会顶上来——作者和编号两条判据它都满足——轻则拿一条「没发现问题」把这轮
+          # 判死，重则把一段跟本轮无关的补丁打上、验过、推出去。
+          codex_bot='chatgpt-codex-connector[bot]'
+          reply_window=900
+
+          fetch_comments() {
+            gh api --paginate --slurp "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100"
+          }
+
+          # 一条请求 = 有写权限的真人（OWNER / MEMBER / COLLABORATOR）@ 了 Codex。
+          # bot 发的 @ 提及 Codex 不理（同这一步用真人 PAT 发请求的理由），路人
+          # （NONE / CONTRIBUTOR）它也不理，都不算请求。
+          #
+          # 悬着 = 这条请求之后 Codex 一直没动静。「动静」看它名下评论的 updated_at，
+          # 不看编号：复审带意见的那种它不新发评论，而是原地改写自己那条审查小结
+          # （实测 PR 23：小结的 updated_at 跟着 review 一起动），光比编号会把一条早就
+          # 答过的召唤一直当成悬着的，把这条路堵死。超出回复窗口的也不算悬着 —— 那种
+          # Codex 要么早答过、要么丢了，它的回复不可能现在才到。
+          comments="$(fetch_comments)" ||
+            give_up codex-busy '读不回这个 PR 的留言列表，没法确认现在能不能请 Codex 出补丁，这一轮什么都没推。'
+          busy="$(jq -r --arg bot "$codex_bot" \
+            --argjson now "$(date +%s)" --argjson window "$reply_window" '
+              def requests:
+                map(select(.user.type == "User"
+                           and (.author_association == "OWNER"
+                                or .author_association == "MEMBER"
+                                or .author_association == "COLLABORATOR")
+                           and ((.body // "") | test("@codex"; "i"))));
+              (add // []) as $all
+              | ($all | map(select(.user.login == $bot)
+                            | (.updated_at // .created_at) | fromdateiso8601)
+                      | max // 0) as $answered
+              | $all
+              | requests
+              | map(select(((.created_at | fromdateiso8601) > $answered)
+                           and ($now - (.created_at | fromdateiso8601) < $window)))
+              | max_by(.id)
+              | if . == null then empty
+                else [.html_url,
+                      (if ((.body // "") | test("<!-- codex-fix-request:"))
+                       then "self" else "other" end)] | @tsv
+                end' <<<"$comments")" ||
+            give_up codex-busy '读不回这个 PR 的留言列表，没法确认现在能不能请 Codex 出补丁，这一轮什么都没推。'
+          if [ -n "$busy" ]; then
+            busy_url="${busy%%$'\t'*}"
+            case "${busy##*$'\t'}" in
+              self)
+                give_up codex-busy "上一次请 Codex 出补丁的留言还没等到回话（$busy_url）；这会儿再问一次就分不清哪条回复是回哪一次的，这一轮什么都没推。"
+                ;;
+              *)
+                give_up codex-busy "这个 PR 上有一次 @Codex 还没等到回话（$busy_url）；这会儿再问一次就分不清哪条回复是回哪一次的，这一轮什么都没推。"
+                ;;
+            esac
+          fi
+
           # 留言原文写死，别改措辞：MEL-266 实测就是这一句让 Codex 回了一整段能直接
           # git apply 的 diff（只说 `@codex fix` 它会修好却不推回 PR，要人去点一下）。
           # 句子里有 @codex、但没有「@codex review」—— codex-approved-merge 的触发条件
@@ -2356,16 +2416,36 @@ jobs:
           # 只认 Codex 自己在这条请求之后发的第一条新评论。评论编号单调递增，所以
           # 「编号比请求大」就等于「在请求之后发的」；改写一条旧评论不会改它的编号，
           # 顶不到这个位置上来。等 15 分钟（实测 75 秒），到点就按失败收口。
-          codex_bot='chatgpt-codex-connector[bot]'
           reply="$RUNNER_TEMP/codex-reply.md"
-          deadline="$(($(date +%s) + 900))"
+          deadline="$(($(date +%s) + reply_window))"
           while :; do
             sleep 30
             # gh 偶发失败就当这一轮还没回，接着等；超时那条出口自然会收口。
-            if ! gh api --paginate --slurp "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" |
+            if comments="$(fetch_comments)"; then
+              # 我们问完之后又有人 @ 了一次 Codex：窗口里从此有两个请求，下一条回复
+              # 是回哪一次的就说不准了。当场收口，别赌。
+              rival="$(jq -r --argjson since "$request_id" '
+                (add // [])
+                | map(select(.id > $since
+                             and .user.type == "User"
+                             and (.author_association == "OWNER"
+                                  or .author_association == "MEMBER"
+                                  or .author_association == "COLLABORATOR")
+                             and ((.body // "") | test("@codex"; "i"))))
+                | first | .html_url // empty' <<<"$comments")" || rival=''
+              [ -z "$rival" ] ||
+                give_up codex-busy "我们问完之后这个 PR 上又 @ 了一次 Codex（$rival）；接下来的回复分不清是回哪一次的，这一轮什么都没推。"
+              # Codex 的复审输出不是对这条请求的回复：审查小结那条以它自己的 HTML
+              # 标记开头，「没发现问题」那条以 Codex Review: 开头。认出来就跳过、接着
+              # 等真正的补丁 —— 不跳的话，一次复审就能把这一轮顶掉。
               jq -r --argjson since "$request_id" --arg bot "$codex_bot" '
-                add // [] | map(select(.user.login == $bot and .id > $since))
-                | sort_by(.id) | first | .body // empty' >"$reply"; then
+                (add // [])
+                | map(select(.user.login == $bot and .id > $since
+                             and ((.body // "")
+                                  | test("^[[:space:]]*(Codex Review:|<!-- codex-pull-request-review-summary -->)")
+                                  | not)))
+                | sort_by(.id) | first | .body // empty' <<<"$comments" >"$reply" || : >"$reply"
+            else
               : >"$reply"
             fi
             if [ -s "$reply" ]; then break; fi
