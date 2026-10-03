@@ -2352,34 +2352,51 @@ jobs:
           # bot 发的 @ 提及 Codex 不理（同这一步用真人 PAT 发请求的理由），路人
           # （NONE / CONTRIBUTOR）它也不理，都不算请求。
           #
-          # 悬着 = 这条请求之后 Codex 一直没动静。「动静」看它名下评论的 updated_at，
-          # 不看编号：复审带意见的那种它不新发评论，而是原地改写自己那条审查小结
-          # （实测 PR 23：小结的 updated_at 跟着 review 一起动），光比编号会把一条早就
-          # 答过的召唤一直当成悬着的，把这条路堵死。超出回复窗口的也不算悬着 —— 那种
-          # Codex 要么早答过、要么丢了，它的回复不可能现在才到。
+          # Codex 的复审输出不是对「出补丁」请求的回复：审查小结那条以它自己的 HTML
+          # 标记开头，「没发现问题」那条以 Codex Review: 开头。下面「这条请求答过了吗」
+          # 和轮询里「这条是不是我要的回复」用的是同一份判据，只在这里写一次。
+          codex_review_shape='^[[:space:]]*(Codex Review:|<!-- codex-pull-request-review-summary -->)'
+
+          # 「答过了」分两种请求，判据不一样：
+          #
+          # 自己发的那种（正文里带 `<!-- codex-fix-request:` 标记）—— 判据是精确的，
+          # 不带时效：它的回复一定是 Codex 新发的一条非复审评论（实测三次都是新评论，
+          # 不是改写旧的），所以「编号比它大的非复审回复一条都没有」就等于「还没回」。
+          # 这种回复里带着 diff，正是会被打上、验过、推出去的那种，所以只要还悬着就
+          # 一直挡着，不给它过期 —— 哪怕因此要她来处理这个 PR，也比打错一段补丁好。
+          #
+          # 别人发的那种（她手点的召唤复审、巡检的 kick）—— 回复是复审输出，可能是
+          # 原地改写那条审查小结（实测 PR 23：小结的 updated_at 跟着 review 一起动），
+          # 编号不变，所以只能看 Codex 名下评论的 updated_at 有没有往后动过。这种判据
+          # 是粗的，所以配一个回复窗口：超了就不算悬着（Codex 要么早答过、要么丢了），
+          # 否则她连点几次召唤就能把这条路永久堵死。粗判漏掉的那种回复是复审输出，
+          # 轮询里按长相跳过，顶不成补丁。
           comments="$(fetch_comments)" ||
             give_up codex-busy '读不回这个 PR 的留言列表，没法确认现在能不能请 Codex 出补丁，这一轮什么都没推。'
-          busy="$(jq -r --arg bot "$codex_bot" \
+          busy="$(jq -r --arg bot "$codex_bot" --arg rs "$codex_review_shape" \
             --argjson now "$(date +%s)" --argjson window "$reply_window" '
-              def requests:
-                map(select(.user.type == "User"
-                           and (.author_association == "OWNER"
-                                or .author_association == "MEMBER"
-                                or .author_association == "COLLABORATOR")
-                           and ((.body // "") | test("@codex"; "i"))));
+              def bots: map(select(.user.login == $bot));
+              def is_request: .user.type == "User"
+                and (.author_association == "OWNER"
+                     or .author_association == "MEMBER"
+                     or .author_association == "COLLABORATOR")
+                and ((.body // "") | test("@codex"; "i"));
+              def mine: (.body // "") | test("<!-- codex-fix-request:");
               (add // []) as $all
-              | ($all | map(select(.user.login == $bot)
-                            | (.updated_at // .created_at) | fromdateiso8601)
-                      | max // 0) as $answered
+              | ($all | bots | map(select((.body // "") | test($rs) | not)) | map(.id)) as $patch_replies
+              | ($all | bots | map((.updated_at // .created_at) | fromdateiso8601)
+                      | max // 0) as $last_bot
               | $all
-              | requests
-              | map(select(((.created_at | fromdateiso8601) > $answered)
-                           and ($now - (.created_at | fromdateiso8601) < $window)))
+              | map(select(is_request))
+              | map(. as $r | select(
+                  if ($r | mine)
+                  then ($patch_replies | map(select(. > $r.id)) | length) == 0
+                  else (($r.created_at | fromdateiso8601) > $last_bot)
+                       and ($now - ($r.created_at | fromdateiso8601) < $window)
+                  end))
               | max_by(.id)
               | if . == null then empty
-                else [.html_url,
-                      (if ((.body // "") | test("<!-- codex-fix-request:"))
-                       then "self" else "other" end)] | @tsv
+                else [.html_url, (if mine then "self" else "other" end)] | @tsv
                 end' <<<"$comments")" ||
             give_up codex-busy '读不回这个 PR 的留言列表，没法确认现在能不能请 Codex 出补丁，这一轮什么都没推。'
           if [ -n "$busy" ]; then
@@ -2435,15 +2452,13 @@ jobs:
                 | first | .html_url // empty' <<<"$comments")" || rival=''
               [ -z "$rival" ] ||
                 give_up codex-busy "我们问完之后这个 PR 上又 @ 了一次 Codex（$rival）；接下来的回复分不清是回哪一次的，这一轮什么都没推。"
-              # Codex 的复审输出不是对这条请求的回复：审查小结那条以它自己的 HTML
-              # 标记开头，「没发现问题」那条以 Codex Review: 开头。认出来就跳过、接着
-              # 等真正的补丁 —— 不跳的话，一次复审就能把这一轮顶掉。
-              jq -r --argjson since "$request_id" --arg bot "$codex_bot" '
+              # 复审输出不是对这条请求的回复（判据同上面那条 codex_review_shape）。
+              # 认出来就跳过、接着等真正的补丁 —— 不跳的话，一次复审就能把这轮顶掉。
+              jq -r --argjson since "$request_id" --arg bot "$codex_bot" \
+                --arg rs "$codex_review_shape" '
                 (add // [])
                 | map(select(.user.login == $bot and .id > $since
-                             and ((.body // "")
-                                  | test("^[[:space:]]*(Codex Review:|<!-- codex-pull-request-review-summary -->)")
-                                  | not)))
+                             and ((.body // "") | test($rs) | not)))
                 | sort_by(.id) | first | .body // empty' <<<"$comments" >"$reply" || : >"$reply"
             else
               : >"$reply"
@@ -2509,6 +2524,13 @@ jobs:
           fi
 
           sealed_git apply -- "$patch"
+
+          # 打上了、却没留下任何 git 会提交的改动（它只新建了被 .gitignore 挡住的路径，
+          # 或者本地排除的 .review/）—— 验证那一步会报 changed=false，推送和召唤复审
+          # 整段跳过，job 还打绿勾：失败伪装成成功，链条静默停住。照业务失败收口。
+          if [ -z "$(sealed_git status --porcelain)" ]; then
+            give_up codex-no-patch 'Codex 的补丁打上了，但仓库里没留下任何会被提交的改动（它改的都是被忽略的路径），这一轮什么都没推。'
+          fi
 
           {
             echo '### Codex cloud patch'

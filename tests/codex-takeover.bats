@@ -294,6 +294,39 @@ ask_codex() {
   assert_equal "$(git status --porcelain)" ''
 }
 
+# 自己发的那种请求不给过期：它的回复里带着 diff，正是会被打上、验过、推出去的那种。
+# 两小时前那条还没等到回话，照样挡着。
+@test "patch: our own earlier fix request keeps blocking however old it is" {
+  handover_workspace
+  PRE="$(json_array \
+    "$(gh_comment 4990 Melodymaifafa OWNER "$REQUEST
+
+<!-- codex-fix-request: head=$H round=1 run=776 -->" 2026-10-02T06:00:00Z)" \
+    "$(gh_comment 4995 "$CODEX" NONE 'Codex Review: Didn'"'"'t find any major issues.' 2026-10-02T07:59:00Z)")" \
+    ask_codex "$(diff_reply "$(codex_patch codex-review-context.md 'answer to the other request')")"
+
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-busy'
+  refute_called 'gh api POST repos/o/r/issues/7/comments'
+  refute_contains "$(cat codex-review-context.md)" 'answer to the other request'
+}
+
+# 反面：那条请求已经等到过一条真回复（新评论、不是复审输出），就不挡了。
+@test "patch: our own earlier fix request stops blocking once a real reply landed" {
+  handover_workspace
+  PRE="$(json_array \
+    "$(gh_comment 4990 Melodymaifafa OWNER "$REQUEST
+
+<!-- codex-fix-request: head=$H round=1 run=776 -->" 2026-10-02T06:00:00Z)" \
+    "$(gh_comment 4991 "$CODEX" NONE '### Summary
+
+* Patched it. See the diff above.' 2026-10-02T06:01:30Z)")" \
+    ask_codex "$(diff_reply "$(codex_patch codex-review-context.md 'fixed by codex')")"
+
+  assert_equal "$status" 0
+  assert_contains "$(cat codex-review-context.md)" 'fixed by codex'
+}
+
 @test "patch: a summon Codex answered by editing its review summary does not block" {
   handover_workspace
   # 复审带意见的那种 Codex 不新发评论，而是原地改写自己那条审查小结：编号还是老的，
@@ -449,6 +482,26 @@ ask_codex() {
 # 推送用的令牌没有 workflows 权限（gh-workflows PR #18 实测推不上去），而且工作流
 # 文件正是这条流水线自己的防线。两头都要拦：numstat 报的是改动的去处，一次改名把
 # 工作流文件搬走它看不见，所以补丁自己的头行也一起扫。
+# 补丁打上了却没留下任何 git 会提交的改动：验证那一步会报 changed=false，推送和召唤
+# 复审整段跳过，job 打绿勾收工 —— 失败伪装成成功。必须当场判死。
+@test "patch: a patch that leaves nothing to commit is a red round, not a green one" {
+  handover_workspace
+  # .review/ 在 .git/info/exclude 里，所以这段补丁打得上，但 git status 是空的。
+  ignored_only='diff --git a/.review/notes.md b/.review/notes.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/.review/notes.md
+@@ -0,0 +1 @@
++nothing git will commit'
+  ask_codex "$(diff_reply "$ignored_only")"
+
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body 'gh pr comment')" 'reason=codex-no-patch'
+  assert_contains "$(fake_last_body 'gh pr comment')" '没留下任何会被提交的改动'
+  assert_equal "$(git status --porcelain)" ''
+}
+
 @test "patch: a patch that touches .github/workflows is refused, both ways round" {
   handover_workspace
   mkdir -p .github/workflows
