@@ -48,6 +48,14 @@ fi
 # shellcheck disable=SC2016  # 单引号里是 awk 程序，$0 是 awk 的字段
 summary="$(awk -v out="$patch_out.raw" '
   function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+  # 围栏自己缩进了几格，块里每一行就跟着剥掉同样多的前导空格（CommonMark 的规矩）。
+  # 不剥的话，一段缩进了 1~3 格的 ```diff（Codex 把它嵌在列表项里就是这样）取出来
+  # 每一行都多带着那几格空格，git apply 一句「没有补丁」就把这一轮判死。
+  function undent(s, want,   k) {
+    k = 0
+    while (k < want && substr(s, k + 1, 1) == " ") k++
+    return substr(s, k + 1)
+  }
   {
     line = $0
     ind = 0
@@ -64,12 +72,12 @@ summary="$(awk -v out="$patch_out.raw" '
         is_diff = 0
         next
       }
-      if (is_diff && blocks == 0) body = body line "\n"
+      if (is_diff && blocks == 0) body = body undent(line, fence_ind) "\n"
       next
     }
 
     if (n >= 3) {
-      open = 1; fence_ch = ch; fence_n = n
+      open = 1; fence_ch = ch; fence_n = n; fence_ind = ind
       is_diff = (tolower(trim(substr(s, n + 1))) == "diff")
       next
     }

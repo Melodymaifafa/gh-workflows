@@ -133,6 +133,46 @@ reason() { printf '%s\n' "$output" | sed -n 's/^reason=//p'; }
   assert_equal "$(cat "$PATCH")" "$md"
 }
 
+# 围栏缩进 1~3 格是合法的（Codex 把补丁嵌在列表项里就会这样），块里每一行也跟着
+# 缩进。那几格空格必须剥掉，不剥的话取出来的每一行都多带着它们，git apply 一句
+# 「没有补丁」就把这一轮白白判死。
+@test "extract: an indented fence yields the patch without the fence's indentation" {
+  {
+    printf '1. Here is the change:\n\n'
+    printf '   ```diff\n'
+    printf '%s\n' "$DIFF" | sed 's/^/   /'
+    printf '   ```\n'
+  } >reply.md
+
+  extract
+
+  assert_equal "$status" 0
+  assert_equal "$(reason)" ok
+  assert_equal "$(cat "$PATCH")" "$DIFF"
+}
+
+# 剥的是「最多 fence_ind 格」，不是「所有前导空格」：diff 的上下文行本来就带一个
+# 空格，剥多了补丁就坏了。
+@test "extract: undenting stops at the fence's own depth, keeping context spaces" {
+  ctx='diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,2 @@
+ keep me
+-echo old
++echo new'
+  {
+    printf '  ```diff\n'
+    printf '%s\n' "$ctx" | sed 's/^/  /'
+    printf '  ```\n'
+  } >reply.md
+
+  extract
+
+  assert_equal "$status" 0
+  assert_equal "$(cat "$PATCH")" "$ctx"
+}
+
 @test "extract: a diff block with nothing in it is a failure" {
   printf '```diff\n```\n' >reply.md
   extract
