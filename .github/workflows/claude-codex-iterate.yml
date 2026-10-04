@@ -2764,7 +2764,7 @@ jobs:
               [ "$look" -eq 1 ] || sleep 10
               ids="$(gh api "repos/$REPO/actions/runs?head_sha=$PUSHED_HEAD&per_page=100" \
                 --jq ".workflow_runs[] | select(.head_sha == \"$PUSHED_HEAD\" and .conclusion == \"action_required\") | .id")" || {
-                echo "::warning::cannot list the CI runs on $PUSHED_HEAD"
+                echo "::warning::cannot list the CI runs on $PUSHED_HEAD; CODEX_TRIGGER_TOKEN needs Actions: Read and write"
                 return 0
               }
               for id in $ids; do

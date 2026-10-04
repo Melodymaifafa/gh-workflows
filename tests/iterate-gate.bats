@@ -703,6 +703,18 @@ runs_seq() { # runs_seq <seq> [run-json ...]
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 
+# 10-04 wf-smoke-test 实测：令牌没有 Actions 权限时，第一步「列出 run」就被拒。
+@test "summon: a token that cannot even list runs says which permission it lacks" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  fake_route_fail "$RUNS" 1
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_contains "$output" "cannot list the CI runs on $H2; CODEX_TRIGGER_TOKEN needs Actions: Read and write"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
 @test "summon: a head this round did not push gets no approval" {
   summon_env
   export PUSHED_HEAD="$H"
