@@ -76,7 +76,10 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 | [range(0; $retries | length) as $i | $retries[$i] as $t | ($retries[$i + 1] // 1e18) as $next
     | select(any($quota_at[]; . > $t and . < $next) | not)] | length as $counted
 # M8：修满轮数后 Claude 判定这几条 review 不拦合并（claude-codex-iterate 的 round-cap-judge）。
-| [$tc[] | (.body // "") | capture("<!-- claude-judge-clean: head=" + $h + " reviews=(?<ids>[0-9]+(,[0-9]+)*) -->")] as $m8
+# 只认主人写的，同 codex-approved-merge 的路径 E：github-actions[bot] 的评论里可能转贴着 Claude
+# 写的文字，认了它，巡检就会拿主人的 PAT 把一个没人判过的标记再发一遍（Codex 2026-10-04 的 P1）。
+| [$c[] | select(.author_association == "OWNER") | (.body // "")
+    | capture("<!-- claude-judge-clean: head=" + $h + " reviews=(?<ids>[0-9]+(,[0-9]+)*) -->")] as $m8
 | ([$m8[] | .ids | split(",")[] | tonumber] | unique) as $judged
 | [$r[] | select(.commit_id == $h and (.id as $id | any($judged[]; . == $id) | not) and (.user.login == $codex
       or (.author_association == "OWNER" and has("claude-review-findings: " + $h))))]

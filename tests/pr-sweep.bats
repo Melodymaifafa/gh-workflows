@@ -371,13 +371,16 @@ m8_comment() { # m8_comment <id> <reviews> <分钟前> [login] [assoc]
   refute_contains "$body" 'claude-judge-clean'
 }
 
-@test "an M8 from claude[bot] neither exempts findings nor re-requests a merge check" {
-  one_pr clean 61
-  reviews "$(codex_findings 111 "$H" 300)"
-  comments "$(m8_comment 900 111 200 'claude[bot]' NONE)"
-  sweep
-  assert_called "gh api POST repos/$R/pulls/7/reviews" 1
-  refute_called 'claude-judge-clean'
+@test "an M8 not written by the owner neither exempts findings nor re-requests a merge check" {
+  for who in 'claude[bot]:NONE' 'github-actions[bot]:NONE'; do
+    setup_fake_env
+    one_pr clean 61
+    reviews "$(codex_findings 111 "$H" 300)"
+    comments "$(m8_comment 900 111 200 "${who%%:*}" "${who#*:}")"
+    sweep
+    assert_called "gh api POST repos/$R/pulls/7/reviews" 1
+    refute_called 'claude-judge-clean'
+  done
 }
 
 @test "an OWNER M3 counts as findings and is the M5 target when newest" {

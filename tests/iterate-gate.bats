@@ -217,6 +217,18 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   assert_contains "$output" "already judged"
 }
 
+@test "gate: an M8 that github-actions[bot] wrote does not count as a verdict" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(gh_review 4001 "$CODEX" NONE "$H" 'body')")"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")" \
+    "$(gh_comment 3 'github-actions[bot]' NONE "<!-- claude-judge-clean: head=$H reviews=4001 -->")")"
+  gate
+  assert_equal "$(step_output judge)" true
+}
+
 # Codex 2026-10-04 的 P2：M8 之后同一个 head 上又来了新意见，它没被点过名，要重判；
 # 当成「判过了」的话巡检的重修一轮轮被忽略，最后误报 retry-exhausted。
 @test "gate: a findings review that arrived after the M8 gets a new judgment" {

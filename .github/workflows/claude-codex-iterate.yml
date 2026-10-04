@@ -198,10 +198,11 @@ jobs:
 
           # judged_already <head> <review ids>：修满轮数的这个 head 已经有判决了吗？打印 true / false。
           # 有 round-cap 停车告警，或者已有的放行标记（M8）合起来点名了列出的每一条 review。M8 之后
-          # 又来的新意见没被点过名，就还算没判，要重判（Codex 2026-10-04 的 P2）。
+          # 又来的新意见没被点过名，就还算没判，要重判（Codex 2026-10-04 的 P2）。M8 只认主人写的
+          # （同 codex-approved-merge 的路径 E）；停车告警两种可信作者都认（兜底那个 job 用 bot 令牌发）。
           judged_already() {
             trusted_comments | jq -r --arg h "$1" --arg ids "$2" '
-              ([.[] | (.body // "")
+              ([.[] | select(.author_association == "OWNER") | (.body // "")
                 | capture("<!-- claude-judge-clean: head=" + $h + " reviews=(?<ids>[0-9]+(,[0-9]+)*) -->").ids
                 | split(",")[]] | unique) as $named
               | any(.[]; (.body // "") | contains("<!-- pr-guard: alert head=" + $h + " reason=round-cap "))
