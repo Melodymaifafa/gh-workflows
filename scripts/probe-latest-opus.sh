@@ -11,6 +11,7 @@
 # 「同一个结论只推一次」不存状态，靠水位：本 workflow 上一次**成功**的 run 的开始时间。
 # 只有「最新那个 Opus 的发布时间」晚于这个水位才推 —— 新模型出现的那一周推一条，之后安静；
 # 她一直没改默认值也不会每周重复。推送失败时这一轮是红的，水位不前进，下一轮会重试。
+# 例外：接口没给发布时间（填的是 1970 年）的模型没法跟水位比，只能每轮都推，直到默认值换了。
 #
 # 环境变量：
 #   CLAUDE_CODE_OAUTH_TOKEN  读 /v1/models 用（已有密钥，和 Claude 修复共用，只读不烧额度）
@@ -49,11 +50,11 @@ if [ -z "${MODELS_JSON:-}" ]; then
 fi
 
 # 只看 claude-opus-*：钉死的那两个默认值就是 Opus，别的家族（fable / mythos）不在这张票里。
-# 按发布时间挑最新，不依赖接口的返回顺序。
+# 取列表里第一个：接口文档写明按发布时间新→旧排。不自己按 created_at 排 —— 发布时间不详时
+# 接口会填 1970 年（文档允许），自己排的话偏偏这种新模型会排到所有旧的后面，永远挑不中。
 latest_json="$(
   jq -c '
-    [(.data // [])[] | select((.id // "") | startswith("claude-opus-"))]
-    | sort_by(.created_at // "") | last // empty
+    [(.data // [])[] | select((.id // "") | startswith("claude-opus-"))] | .[0] // empty
   ' "$models" 2>/dev/null || true
 )"
 if [ -z "$latest_json" ]; then
@@ -68,6 +69,11 @@ if [ -z "$latest_at" ]; then
   echo "::error::$latest_id 没有 created_at，判断不了新旧，这一轮不推送"
   exit 1
 fi
+# 1970 年 = 接口说「发布时间不详」：显示成未知，第 4 步也不拿它比水位。
+case "$latest_at" in
+  1970-01-01T00:00:00*) released_known=false; latest_when="发布时间未知" ;;
+  *) released_known=true; latest_when="$latest_at 发布" ;;
+esac
 
 # ── 2. 仓库里钉死的默认值 ──
 # 读的是真文件，不维护第二份清单：这两个 workflow 的 claude_model 默认值就是「现在钉的」。
@@ -98,7 +104,7 @@ for f in claude-codex-iterate.yml codex-approved-merge.yml; do
 done
 
 # ── 3. 一样就什么都不发 ──
-say "最新的 Opus：**$latest_name**（\`$latest_id\`，$latest_at 发布）"
+say "最新的 Opus：**$latest_name**（\`$latest_id\`，$latest_when）"
 say ""
 say "仓库钉的：$pinned_list"
 say ""
@@ -109,9 +115,13 @@ if [ -z "$mismatched" ]; then
 fi
 
 # ── 4. 不一样：这个结论推过了没有 ──
+watermark=""   # 留空 = 不比水位，直接推
 if [ "$FORCE_NOTIFY" = true ]; then
-  watermark="1970-01-01T00:00:00Z"
   say "_手动跑勾了 force：无视「推过没有」，直接推。_"
+elif [ "$released_known" != true ]; then
+  # 拿 1970 年去比，它永远「早于上一次成功探测」，新模型就被咽掉了。
+  # 不存状态就没别的办法分辨推没推过：宁可每轮都推，也不漏。
+  say "_接口没给 \`$latest_id\` 的发布时间，判断不了推没推过：照推，下一轮可能还会再推。_"
 elif [ -n "${NOTIFY_WATERMARK:-}" ]; then
   watermark="$NOTIFY_WATERMARK"
 else
@@ -127,17 +137,19 @@ else
 fi
 
 epoch() { jq -rn --arg s "$1" '$s | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601'; }
-if ! latest_epoch="$(epoch "$latest_at")" || ! watermark_epoch="$(epoch "$watermark")"; then
-  echo "::error::时间格式认不出（模型 '$latest_at'，水位 '$watermark'），这一轮不推送"
-  exit 1
-fi
+if [ -n "$watermark" ]; then
+  if ! latest_epoch="$(epoch "$latest_at")" || ! watermark_epoch="$(epoch "$watermark")"; then
+    echo "::error::时间格式认不出（模型 '$latest_at'，水位 '$watermark'），这一轮不推送"
+    exit 1
+  fi
 
-if [ "$latest_epoch" -le "$watermark_epoch" ]; then
-  say "### 🔇 这条已经推过了，没有再推"
-  say ""
-  say "\`$latest_id\` 在上一次成功探测（$watermark）之前就发布了。"
-  echo "差异存在但已经推过（模型 $latest_at ≤ 水位 $watermark），不重复推送。"
-  exit 0
+  if [ "$latest_epoch" -le "$watermark_epoch" ]; then
+    say "### 🔇 这条已经推过了，没有再推"
+    say ""
+    say "\`$latest_id\` 在上一次成功探测（$watermark）之前就发布了。"
+    echo "差异存在但已经推过（模型 $latest_at ≤ 水位 $watermark），不重复推送。"
+    exit 0
+  fi
 fi
 
 # ── 5. 推一条 ──
@@ -148,8 +160,13 @@ if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then
   exit 1
 fi
 
-message="最新的 Opus 是 $latest_name（$latest_id，$latest_at 发布），仓库里钉的还是 $pinned_values。"
-message="$message 想换就把 claude-codex-iterate.yml 和 codex-approved-merge.yml 的 claude_model 默认值改成新的，合了 PR 再移 v1 标签；不换就不用管，这条下周不会再推。"
+message="最新的 Opus 是 $latest_name（$latest_id，$latest_when），仓库里钉的还是 $pinned_values。"
+message="$message 想换就把 claude-codex-iterate.yml 和 codex-approved-merge.yml 的 claude_model 默认值改成新的，合了 PR 再移 v1 标签；"
+if [ "$released_known" = true ]; then
+  message="${message}不换就不用管，这条下周不会再推。"
+else
+  message="${message}接口没给它的发布时间，分不清推没推过，所以没换之前下周可能还会再推。"
+fi
 if ! curl -sf -X POST https://api.pushover.net/1/messages.json \
   --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
   --form-string "title=🤖 有新的 Opus 了" \

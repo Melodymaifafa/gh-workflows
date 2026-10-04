@@ -85,6 +85,36 @@ setup() {
   refute_called pushover.net
 }
 
+@test "新 Opus 的发布时间接口填了 1970 年（不详）：照样认出它、照样推，不当成推过" {
+  # 接口按新→旧排；发布时间不详时文档允许填纪元时间。按日期自己排会挑回旧的那个。
+  MODELS_JSON="$(models_json \
+    "$(model claude-opus-6 1970-01-01T00:00:00Z 'Claude Opus 6')" \
+    "$(model "$(pinned_now)" 2026-09-21T16:24:00Z 'Claude Opus 5.5')")"
+  export MODELS_JSON
+  fake_route "$RUNS_ROUTE" '{"workflow_runs":[{"run_started_at":"2026-11-09T01:17:00Z"}]}'
+
+  run probe
+  assert_equal "$status" 0
+  assert_called pushover.net 1
+  body="$(fake_last_body pushover.net)"
+  assert_contains "$body" claude-opus-6
+  assert_contains "$body" 发布时间未知
+  refute_contains "$body" 1970
+  refute_contains "$body" 下周不会再推
+}
+
+@test "钉的就是最新的，但它发布时间不详：也什么都不推" {
+  MODELS_JSON="$(models_json \
+    "$(model "$(pinned_now)" 1970-01-01T00:00:00Z 'Claude Opus 新')" \
+    "$(model claude-opus-5 2026-07-24T00:00:00Z 'Claude Opus 5')")"
+  export MODELS_JSON
+
+  run probe
+  assert_equal "$status" 0
+  assert_contains "$output" '钉的就是最新的'
+  refute_called pushover.net
+}
+
 @test "第一次就跑（没有任何成功的 run）：推一条" {
   MODELS_JSON="$(models_json "$(model claude-opus-6 2026-11-02T00:00:00Z 'Claude Opus 6')")"
   export MODELS_JSON
