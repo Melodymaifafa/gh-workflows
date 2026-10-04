@@ -43,6 +43,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `claude-review-findings: H` | PAT | Claude 代审有意见（一条 COMMENT review） |
 | `claude-review-clean: H` | PAT | Claude 代审无意见，CI 绿就合 |
 | `claude-judge-clean: head=H reviews=ID,…` | PAT（iterate 的 round-cap-judge） | 修满轮数后 Claude 判定这几条 review 里的意见都不拦合并，CI 绿就合；之后在 H 上新出的 review 照样拦 |
+| `claude-judge-fix: head=H` | PAT（iterate 的 round-cap-judge，一条 COMMENT review） | 修满轮数后 Claude 确认这几条是真 bug，接着修（第二阶段，最多到 `max_confirmed_fix_rounds` 轮） |
 | `codex-fix-request: head=H round=N run=ID` | PAT（iterate） | 请 Codex 云端出一段补丁（句子里没有「@codex review」，不算复审请求） |
 | `fix-retry: head=H review=ID` | PAT（巡检） | 上次修复没完成，再修一次 |
 | `pr-guard: fix-round head=H round=N` | GITHUB_TOKEN | 第 N 轮修复已推送（轮数不靠召唤是否成功） |
@@ -55,7 +56,8 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 自动修满 `max_fix_rounds`（默认 5）轮、head 上还有意见时，不再直接停下告警，而是交给 iterate 里的 `round-cap-judge` job：Claude 只读这个 head 上剩下的全部意见（每条编号 F1、F2…，判决必须每个编号恰好一条，漏一条就算没判成）、PR 改动和代码，逐条重新定级——P0 安全 / 数据 / 线上故障，P1 确实存在的 bug，P2 可选的小改进、纯风格、文档措辞或误报，拿不准按 P1。
 
 - 全是 P2：用主人的 PAT 发一条评论，逐条写明放过了哪几条、为什么，末尾带 `claude-judge-clean` 标记，并推一次手机通知。`codex-approved-merge` 的路径 E 只放过标记里点名的那几条 review，之后在这个 head 上新出的意见照样拦；CI 全绿才合。
-- 有一条 P0 / P1、审查方自己标过 P0、或者 Claude 没判成（额度、输出不合法）：照旧告警 `round-cap` 停下，告警里写明是哪几条拦着。
+- 有 Claude 确认的 P0 / P1（第二阶段，2026-10-04）：不停车，用主人的 PAT 发一条 review，只列确认的那几条（带 `claude-review-findings` 和 `claude-judge-fix` 标记），iterate 收到后接着修，修完照旧请 Codex 复审、再判。一直修到 `max_confirmed_fix_rounds`（默认 10）轮；第 10 轮之后还有确认的 bug，才告警 `round-cap` 停下、推一次手机通知，告警里写明还剩哪几条。到第 10 轮剩下的全是 P2，照样合并。
+- 审查方标了 P0 而 Claude 一条都不认、或者 Claude 没判成（额度、输出不合法）：不替人拿主意，直接告警 `round-cap` 停下。
 - 同一个 head 只认第一个判决：已有 `round-cap` 告警，或者已有的放行标记点过它全部意见的名，就不再判；同一个 PR 的判决排队执行，发之前再查一遍。放行之后同一个 head 上又来了新意见，它没被点过名，下一轮会重判。
 - 每个修满轮数的 head 一定留下一个判决：主人的 PAT 缺失或失效、judge 半路挂了，`round-cap-park` 用 job 自己的令牌照旧告警 `round-cap`；没配 PAT 时 Gate 干脆不叫 judge，直接告警。
 - judge 在 iterate 红了时也跑，所以它自己再验一遍模型和思考力度（同一段 case 块，`tests/claude-model.bats` 盯着三处一字不差）。

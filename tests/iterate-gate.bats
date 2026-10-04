@@ -16,7 +16,7 @@ setup() {
   export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp"
   mkdir -p "$RUNNER_TEMP" "$BATS_TEST_TMPDIR/work"
   cd "$BATS_TEST_TMPDIR/work" || return
-  export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token MAX_FIX_ROUNDS=5 HAS_PAT=true
+  export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token MAX_FIX_ROUNDS=5 MAX_CONFIRMED_FIX_ROUNDS=10 HAS_PAT=true
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
   # 修满轮数时 Gate 要列这个 head 上的全部 review（judged_already）；默认一条都没有。
   fake_route "repos/o/r/pulls/7/reviews?per_page=100" '[]'
@@ -175,6 +175,69 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   assert_called "gh pr comment 7 --repo o/r" 1
   assert_contains "$(fake_last_body "gh pr comment")" "仓库没配 CODEX_TRIGGER_TOKEN"
   assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: alert head=$H reason=round-cap until=- -->"
+}
+
+# ---------- 第二阶段：judge 确认的 bug 接着修，最多到第 10 轮 ----------
+
+m9_body() { printf '### 🤖 Claude 复核：还有确认的 bug，接着修\n\n- **P1** F2 空列表会崩：越界\n\n<!-- claude-review-findings: %s -->\n<!-- claude-judge-fix: head=%s -->' "$1" "$1"; }
+
+m9_event() { # m9_event <login> <assoc>
+  export REVIEW_ID=5009 REVIEW_COMMIT="$H" REVIEW_LOGIN="${1:-melody}" REVIEW_ASSOC="${2:-OWNER}"
+  REVIEW_BODY="$(m9_body "$H")"; export REVIEW_BODY
+  serve_review 5009 "$(gh_review 5009 "${1:-melody}" "${2:-OWNER}" "$H" "$(m9_body "$H")")"
+}
+
+@test "gate: past round 5, the judge's confirmed bugs get fix round 6 with only those bugs" {
+  m9_event
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
+  gate
+  assert_equal "$status" 0
+  assert_equal "$(step_output run)" true
+  assert_equal "$(step_output round)" 6
+  assert_equal "$(step_output reviewer)" 'Claude 复核'
+  refute_contains "$(cat "$GITHUB_OUTPUT")" "judge=true"
+  assert_contains "$(cat .review/findings.md)" '空列表会崩'
+}
+
+@test "gate: confirmed bugs keep getting fixed through round 10" {
+  m9_event
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 9)")")"
+  gate
+  assert_equal "$(step_output run)" true
+  assert_equal "$(step_output round)" 10
+}
+
+@test "gate: a confirmed-bug request past round 10 is not fixed again" {
+  m9_event
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 10)")")"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(gh_review 5009 melody OWNER "$H" "$(m9_body "$H")")")"
+  gate
+  assert_equal "$(step_output run)" false
+  refute_contains "$(cat "$GITHUB_OUTPUT")" "run=true"
+}
+
+@test "gate: the same marker from claude[bot] does not open a second stage" {
+  m9_event 'claude[bot]' NONE
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
+  gate
+  assert_equal "$(step_output run)" false
+}
+
+@test "gate: a Codex review on a head whose bugs are already being fixed is not judged again" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array \
+    "$(gh_review 4001 "$CODEX" NONE "$H" 'body')" "$(gh_review 5009 melody OWNER "$H" "$(m9_body "$H")")")"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
+  gate
+  assert_equal "$(step_output run)" false
+  refute_contains "$(cat "$GITHUB_OUTPUT")" "judge=true"
+  assert_contains "$output" "already judged"
 }
 
 @test "gate: max_fix_rounds input is honored (round 2 > 1 parks)" {

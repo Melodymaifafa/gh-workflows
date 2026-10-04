@@ -71,9 +71,13 @@ on:
         type: string
         default: ''
       max_fix_rounds:
-        description: Stop (one round-cap alert) once a head needs more than this many automatic fix rounds.
+        description: Stage one. Past this many automatic fix rounds, the round-cap judge decides whether the leftover findings block the merge.
         type: number
         default: 5
+      max_confirmed_fix_rounds:
+        description: Stage two. While the judge confirms real bugs, keep fixing exactly those until this many rounds in total; past it, park and push one alert.
+        type: number
+        default: 10
 
 permissions:
   contents: write
@@ -115,6 +119,7 @@ jobs:
     outputs:
       judge: ${{ steps.gate.outputs.judge }}
       head: ${{ steps.gate.outputs.head }}
+      round: ${{ steps.gate.outputs.round }}
       pr_guard: ${{ steps.helpers.outputs.script }}
     # 每个 run: 步骤都从写死位置的 bash 起跑（参数同 GitHub 对 `shell: bash` 的默认）。
     # 不写的话 runner 按当时的 PATH 找 bash，而 PATH 第一项 ~/.local/bin 验证命令写得动：
@@ -197,10 +202,18 @@ jobs:
           }
 
           # judged_already <head> <review ids>：修满轮数的这个 head 已经有判决了吗？打印 true / false。
-          # 有 round-cap 停车告警，或者已有的放行标记（M8）合起来点名了列出的每一条 review。M8 之后
-          # 又来的新意见没被点过名，就还算没判，要重判（Codex 2026-10-04 的 P2）。M8 只认主人写的
-          # （同 codex-approved-merge 的路径 E）；停车告警两种可信作者都认（兜底那个 job 用 bot 令牌发）。
+          # 有 round-cap 停车告警、judge 确认了 bug 发的接着修请求（M9，主人写的 review），或者已有的
+          # 放行标记（M8）合起来点名了列出的每一条 review。M8 之后又来的新意见没被点过名，就还算没判，
+          # 要重判（Codex 2026-10-04 的 P2）。M8 / M9 只认主人写的（同 codex-approved-merge 的路径 E）；
+          # 停车告警两种可信作者都认（兜底那个 job 用 bot 令牌发）。
           judged_already() {
+            if gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" |
+              jq -e --arg h "$1" '(add // []) | any(.[]; .author_association == "OWNER" and .commit_id == $h
+                and ((.body // "") | contains("<!-- claude-judge-fix: head=" + $h + " -->")))' >/dev/null
+            then
+              echo true
+              return 0
+            fi
             trusted_comments | jq -r --arg h "$1" --arg ids "$2" '
               ([.[] | select(.author_association == "OWNER") | (.body // "")
                 | capture("<!-- claude-judge-clean: head=" + $h + " reviews=(?<ids>[0-9]+(,[0-9]+)*) -->").ids
@@ -1326,6 +1339,7 @@ jobs:
           REVIEW_ASSOC: ${{ github.event.review.author_association }}
           REVIEW_BODY: ${{ github.event.review.body }}
           MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
+          MAX_CONFIRMED_FIX_ROUNDS: ${{ inputs.max_confirmed_fix_rounds }}
           # 只传「有没有」，不把 PAT 本身交给这一步：没有它 judge 的结论发不出去。
           HAS_PAT: ${{ secrets.CODEX_TRIGGER_TOKEN != '' }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
@@ -1373,6 +1387,15 @@ jobs:
               then "Claude 代审"
             else "" end' <<<"$review")"
           [ -n "$reviewer" ] || skip "review $target is not a findings review on $H"
+          # M9：修满 max_fix_rounds 后 judge 确认了还有真 bug，用主人的 PAT 发的一条 review，只列它确认
+          # 的那几条。目标是它，而且还没修到 max_confirmed_fix_rounds，就接着修（第二阶段）。
+          confirmed=false
+          if jq -e --arg h "$H" '.author_association == "OWNER" and .commit_id == $h
+              and ((.body // "") | contains("<!-- claude-judge-fix: head=" + $h + " -->"))' <<<"$review" >/dev/null
+          then
+            confirmed=true
+            reviewer="Claude 复核"
+          fi
 
           # 轮数 = max(召唤 M1 上的 fix-round, 推送后 M7 上的 round) + 1；都没有就是第 1 轮。
           # M7 让召唤没发出去（令牌缺失、超时）、H 靠巡检 kick 才被审时轮数照样累加。
@@ -1385,7 +1408,9 @@ jobs:
               | tonumber]
             | max // 0')"
           round="$((last_round + 1))"
-          if [ "$round" -gt "$MAX_FIX_ROUNDS" ]; then
+          if [ "$round" -gt "$MAX_FIX_ROUNDS" ] &&
+            ! { [ "$confirmed" = true ] && [ "$round" -le "$MAX_CONFIRMED_FIX_ROUNDS" ]; }
+          then
             # 修满了还有意见：不在这里停下告警，交给 round-cap-judge 那个 job，让 Claude
             # 逐条判剩下的意见拦不拦合并。放行标记（M8）或 round-cap 告警都由那个 job 发；
             # 这个 head 已经判过（见 judged_already），巡检再踢一脚也不重判。
@@ -1400,6 +1425,7 @@ jobs:
             {
               echo "judge=true"
               echo "head=$H"
+              echo "round=$round"
             } >>"$GITHUB_OUTPUT"
             skip "round $round exceeds max_fix_rounds $MAX_FIX_ROUNDS; the round-cap judge takes the leftover findings"
           fi
@@ -3114,6 +3140,8 @@ jobs:
           FINDINGS: ${{ steps.judge_files.outputs.findings }}
           CODEX_P0: ${{ steps.judge_files.outputs.codex_p0 }}
           MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
+          MAX_CONFIRMED_FIX_ROUNDS: ${{ inputs.max_confirmed_fix_rounds }}
+          ROUND: ${{ needs.iterate.outputs.round }}
           PR_GUARD: ${{ needs.iterate.outputs.pr_guard }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
@@ -3125,7 +3153,10 @@ jobs:
             echo '::error::the pr-guard helpers did not arrive from the iterate job'
             exit 1
           }
-          stop_msg="自动修了 $MAX_FIX_ROUNDS 轮还有新意见，已停。"
+          # ROUND 是 Gate 算出来的「下一轮」，已经修了的就是它减一。
+          [[ "${ROUND:-}" =~ ^[0-9]+$ ]] || ROUND="$((MAX_FIX_ROUNDS + 1))"
+          done_rounds="$((ROUND - 1))"
+          stop_msg="自动修了 $done_rounds 轮还有新意见，已停。"
           tail_msg='点 Merge 或关掉；推新提交会重新开始。'
 
           # 主人的 PAT 缺失或失效：这里什么都发不出去，留给 round-cap-park 用 job 自己的令牌停车告警
@@ -3217,9 +3248,34 @@ jobs:
             jq -r "$sanitize"' [.findings[] | select(.severity != "P2") | (.title | clean(120) | line1)] | join("；")' \
               <<<"$STRUCTURED_OUTPUT"
           )"
+
+          # 第二阶段：Claude 确认了真 bug、还没修到 max_confirmed_fix_rounds，就不停车，用主人的 PAT
+          # 发一条 review（M9）只列确认的那几条，iterate 收到后接着修，修完照旧请 Codex 复审、再判。
+          # 只有审查方标了 P0 而 Claude 一条都不认的，不替人拿主意，照旧停车。
+          if [ -n "$blockers" ] && [ "$ROUND" -le "$MAX_CONFIRMED_FIX_ROUNDS" ]; then
+            body="$(
+              jq -r --arg head "$HEAD_SHA" --arg n "$done_rounds" --arg r "$ROUND" --arg cap "$MAX_CONFIRMED_FIX_ROUNDS" "$sanitize"'
+                "### 🤖 Claude 复核：修了 \($n) 轮，还有确认的 bug，接着修（第 \($r) 轮，最多修到第 \($cap) 轮）\n\n"
+                + "只修下面这几条；其余意见核实过，不拦合并。\n\n"
+                + ([.findings[] | select(.severity != "P2") | item] | join("\n"))
+                + "\n\n<!-- claude-review-findings: " + $head + " -->"
+                + "\n<!-- claude-judge-fix: head=" + $head + " -->"
+              ' <<<"$STRUCTURED_OUTPUT"
+            )"
+            jq -n --arg head "$HEAD_SHA" --arg body "$body" \
+              '{commit_id: $head, event: "COMMENT", body: $body}' |
+              gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --input - >/dev/null
+            echo 'posted=true' >>"$GITHUB_OUTPUT"
+            echo "::notice::Posted the confirmed bugs for fix round $ROUND on $HEAD_SHA"
+            exit 0
+          fi
+
           reason=''
           [ "${CODEX_P0:-}" != true ] || reason='审查方把其中一条标成了 P0（安全、数据或线上故障），这种不自动放过。'
-          [ -z "$blockers" ] || reason="${reason}Claude 判定不能忽略的：$blockers。"
+          if [ -n "$blockers" ]; then
+            stop_msg="自动修了 $done_rounds 轮，还有 Claude 确认的 bug 没修好，已停，需要你看。"
+            reason="${reason}还剩：$blockers。"
+          fi
           alert_once "$HEAD_SHA" round-cap - "$stop_msg$reason$tail_msg"
           echo 'posted=true' >>"$GITHUB_OUTPUT"
 
