@@ -620,18 +620,50 @@ summon_env() {
 }
 
 # MEL-292：github-actions[bot] 推的提交，CI 会被 GitHub 扣成 action_required 等人批。
-HELD="repos/o/r/actions/runs?head_sha=$H2&status=action_required&per_page=100"
+RUNS="repos/o/r/actions/runs?head_sha=$H2&per_page=100"
 
 @test "summon: approves the CI runs GitHub held on the commit this round pushed" {
   summon_env
   export PUSHED_HEAD="$H2"
   fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
-  fake_route "$HELD" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\"},{\"id\":12,\"head_sha\":\"$H\"}]}" 1
-  fake_route "$HELD" '{"workflow_runs":[]}' 2
+  fake_route "$RUNS" "{\"workflow_runs\":[
+    {\"id\":11,\"head_sha\":\"$H2\",\"status\":\"action_required\"},
+    {\"id\":12,\"head_sha\":\"$H\",\"status\":\"action_required\"},
+    {\"id\":13,\"head_sha\":\"$H2\",\"status\":\"queued\"}]}" 1
+  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"queued\"}]}" 2
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
   assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
   refute_called "actions/runs/12/approve"
+  refute_called "actions/runs/13/approve"
+  refute_called "sleep 10"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+# Codex 2026-10-04 的 P2：Claude 修得久、冷却早过了，两次批准就挨在一起跑；run 晚几秒
+# 才建出来的话两次都扑空。所以先等这个提交上出现 run，等待不挂在冷却上。
+@test "summon: waits for GitHub to create the run before approving, even past the cooldown" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  fake_route "$RUNS" '{"workflow_runs":[]}' 1
+  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"action_required\"}]}" 2
+  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"queued\"}]}" 3
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_called "sleep 10" 1
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+@test "summon: no run ever shows up -> gives up after a minute and still summons" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  fake_route "$RUNS" '{"workflow_runs":[]}'
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  refute_called "/approve"
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 
@@ -649,7 +681,7 @@ HELD="repos/o/r/actions/runs?head_sha=$H2&status=action_required&per_page=100"
   summon_env
   export PUSHED_HEAD="$H2"
   fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
-  fake_route "$HELD" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\"}]}"
+  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"action_required\"}]}"
   fake_route_fail -X POST repos/o/r/actions/runs/11/approve 1
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
