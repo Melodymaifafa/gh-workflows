@@ -8,24 +8,23 @@
 # 回报 model=claude-opus-5，而 /v1/models 当天最新的 Opus 是 claude-opus-5-5（2026-09-21 发布）。
 # 别名落后整整一代，而且问它要烧一次真实推理；接口是只读的，带发布时间，一次 HTTP 就够。
 #
-# 「同一个结论只推一次」不存状态，靠水位：本 workflow 上一次**成功**的 run 的开始时间。
-# 只有「最新那个 Opus 的发布时间」晚于这个水位才推 —— 新模型出现的那一周推一条，之后安静；
-# 她一直没改默认值也不会每周重复。推送失败时这一轮是红的，水位不前进，下一轮会重试。
-# 例外：接口没给发布时间（填的是 1970 年）的模型没法跟水位比，只能每轮都推，直到默认值换了。
+# 「同一条只推一次」盯的是模型本身，不是时间：推成功那一轮会留下一份以模型 id 命名的凭据
+# （本 workflow 的 artifact，名字 opus-notified-<id>），下一轮先问「这份凭据在不在」。
+# 发布时间一概不参与这个判断 —— 它是模型的发布时间，不是「这个令牌第一次看见它」的时间，
+# 两者能差开；拿它当依据时，发布日期比上一次探测还早的新模型会被判成「推过了」，然后永远
+# 不再提醒（MEL-294 审核退回的就是这个洞）。查不到凭据、凭据过期、凭据没留上，一律按
+# 「没推过」算：宁可同一条重复推一次，也不许把新模型咽掉。
 #
 # 环境变量：
 #   CLAUDE_CODE_OAUTH_TOKEN  读 /v1/models 用（已有密钥，和 Claude 修复共用，只读不烧额度）
-#   REPO                     owner/repo，查自己 run 历史用（workflow 里是 github.repository）
-#   GH_TOKEN                 查 run 历史用（Actions 自带令牌够）
-#   WORKFLOW_FILE            本 workflow 的文件名，默认 opus-model-probe.yml
+#   REPO                     owner/repo，查凭据用（workflow 里是 github.repository）
+#   GH_TOKEN                 查凭据用（Actions 自带令牌够，要 actions: read）
 #   PUSHOVER_TOKEN / PUSHOVER_USER  两个都有才推
-#   FORCE_NOTIFY             true = 无视水位，差了就推（手动跑时勾 force）
+#   FORCE_NOTIFY             true = 推过也再推一次（手动跑时勾 force）
 #   MODELS_JSON              测试 / 本地调试用：拿这个文件当 /v1/models 的响应，不联网
-#   NOTIFY_WATERMARK         测试 / 本地调试用：假的水位（ISO 8601），不问 GitHub
 set -euo pipefail
 
 REPO="${REPO:-}"
-WORKFLOW_FILE="${WORKFLOW_FILE:-opus-model-probe.yml}"
 FORCE_NOTIFY="${FORCE_NOTIFY:-false}"
 summary_file="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 tmp="$(mktemp -d)"
@@ -65,14 +64,11 @@ fi
 latest_id="$(jq -r '.id' <<<"$latest_json")"
 latest_name="$(jq -r '.display_name // .id' <<<"$latest_json")"
 latest_at="$(jq -r '.created_at // ""' <<<"$latest_json")"
-if [ -z "$latest_at" ]; then
-  echo "::error::$latest_id 没有 created_at，判断不了新旧，这一轮不推送"
-  exit 1
-fi
-# 1970 年 = 接口说「发布时间不详」：显示成未知，第 4 步也不拿它比水位。
+# 发布时间只拿来显示。没给、或者填的是 1970 年（接口说「不详」）都照样往下走：
+# 「推过没有」问的是凭据，跟时间无关，所以这里没有任何需要时间才能做的判断。
 case "$latest_at" in
-  1970-01-01T00:00:00*) released_known=false; latest_when="发布时间未知" ;;
-  *) released_known=true; latest_when="$latest_at 发布" ;;
+  ''|1970-01-01T00:00:00*) latest_when="发布时间未知" ;;
+  *) latest_when="$latest_at 发布" ;;
 esac
 
 # ── 2. 仓库里钉死的默认值 ──
@@ -114,42 +110,39 @@ if [ -z "$mismatched" ]; then
   exit 0
 fi
 
-# ── 4. 不一样：这个结论推过了没有 ──
-watermark=""   # 留空 = 不比水位，直接推
+# ── 4. 不一样：这个模型推过了没有 ──
+# 问的是「有没有一份以这个模型 id 命名的凭据」。名字里只留 artifact 认的那几类字符，
+# 读和写用同一行换法，所以两边永远算出同一个名字。
+ledger_name="opus-notified-$(printf '%s' "$latest_id" | tr -c 'A-Za-z0-9._-' '-')"
+notified=false
 if [ "$FORCE_NOTIFY" = true ]; then
-  say "_手动跑勾了 force：无视「推过没有」，直接推。_"
-elif [ "$released_known" != true ]; then
-  # 拿 1970 年去比，它永远「早于上一次成功探测」，新模型就被咽掉了。
-  # 不存状态就没别的办法分辨推没推过：宁可每轮都推，也不漏。
-  say "_接口没给 \`$latest_id\` 的发布时间，判断不了推没推过：照推，下一轮可能还会再推。_"
-elif [ -n "${NOTIFY_WATERMARK:-}" ]; then
-  watermark="$NOTIFY_WATERMARK"
+  say "_手动跑勾了 force：推过也再推一次。_"
 else
-  : "${REPO:?REPO 没设，查不到自己的 run 历史}"
-  # 读不到就当「没推过」：这样最坏是同一条重复推一次，而不是把新模型咽掉。
-  # （第一次跑、workflow 刚进默认分支时这个接口会 404，正是「当没推过」该生效的场景。）
-  if ! watermark="$(gh api \
-    "repos/$REPO/actions/workflows/$WORKFLOW_FILE/runs?status=success&per_page=1" \
-    --jq '.workflow_runs[0].run_started_at // "1970-01-01T00:00:00Z"')"; then
-    echo "::warning::读不到本 workflow 上一次成功的 run，按「没推过」处理（可能重复推一条，但不会漏）"
-    watermark="1970-01-01T00:00:00Z"
+  : "${REPO:?REPO 没设，查不到这个模型推过没有}"
+  # name= 是接口自带的精确过滤；jq 里再按名字比一次，万一接口忽略了这个参数，也不会把
+  # 别的模型的凭据当成这一条的（那又会变成「把没推过的新模型当成推过了」）。
+  # 过期的凭据不算：GitHub 到期回收，回收之后按没推过处理，最坏重复推一条。
+  if ! hits="$(LEDGER_NAME="$ledger_name" gh api \
+    "repos/$REPO/actions/artifacts?name=$ledger_name&per_page=100" \
+    --jq '[(.artifacts // [])[]
+           | select(.name == env.LEDGER_NAME and (.expired // false) == false)] | length')"; then
+    echo "::warning::查不到凭据列表，按「没推过」处理（可能重复推一条，但不会漏掉新模型）"
+    hits=0
   fi
+  case "$hits" in
+    ''|*[!0-9]*)
+      echo "::warning::凭据列表的回答认不出（'$hits'），按「没推过」处理"
+      hits=0 ;;
+  esac
+  [ "$hits" -eq 0 ] || notified=true
 fi
 
-epoch() { jq -rn --arg s "$1" '$s | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601'; }
-if [ -n "$watermark" ]; then
-  if ! latest_epoch="$(epoch "$latest_at")" || ! watermark_epoch="$(epoch "$watermark")"; then
-    echo "::error::时间格式认不出（模型 '$latest_at'，水位 '$watermark'），这一轮不推送"
-    exit 1
-  fi
-
-  if [ "$latest_epoch" -le "$watermark_epoch" ]; then
-    say "### 🔇 这条已经推过了，没有再推"
-    say ""
-    say "\`$latest_id\` 在上一次成功探测（$watermark）之前就发布了。"
-    echo "差异存在但已经推过（模型 $latest_at ≤ 水位 $watermark），不重复推送。"
-    exit 0
-  fi
+if [ "$notified" = true ]; then
+  say "### 🔇 这条已经推过了，没有再推"
+  say ""
+  say "\`$latest_id\` 之前推成功过（留着凭据 \`$ledger_name\`）。"
+  echo "差异存在但这个模型推过了（凭据 $ledger_name），不重复推送。"
+  exit 0
 fi
 
 # ── 5. 推一条 ──
@@ -161,21 +154,30 @@ if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then
 fi
 
 message="最新的 Opus 是 $latest_name（$latest_id，$latest_when），仓库里钉的还是 $pinned_values。"
-message="$message 想换就把 claude-codex-iterate.yml 和 codex-approved-merge.yml 的 claude_model 默认值改成新的，合了 PR 再移 v1 标签；"
-if [ "$released_known" = true ]; then
-  message="${message}不换就不用管，这条下周不会再推。"
-else
-  message="${message}接口没给它的发布时间，分不清推没推过，所以没换之前下周可能还会再推。"
-fi
+message="$message 想换就把 claude-codex-iterate.yml 和 codex-approved-merge.yml 的 claude_model 默认值改成新的，合了 PR 再移 v1 标签；不换就不用管，这条下周不会再推。"
 if ! curl -sf -X POST https://api.pushover.net/1/messages.json \
   --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
   --form-string "title=🤖 有新的 Opus 了" \
   --form-string "message=$message" >/dev/null; then
-  echo "::error::Pushover 发送失败；这一轮红着停下，水位不前进，下一轮会重试"
+  echo "::error::Pushover 发送失败；这一轮红着停下，没留凭据，下一轮会重试"
   exit 1
+fi
+
+# ── 6. 推成功了才留凭据 ──
+# 脚本只把「凭据叫什么、哪个文件」交出去，真正留下它的是 workflow 里上传那一步。
+# 顺序只能是先推后留：反过来会把「推过了」记在一轮没推成功的探测上，新模型就被咽掉了。
+marker="${RUNNER_TEMP:-$tmp}/opus-notified.txt"
+printf '%s\n' "$latest_id" >"$marker"
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  {
+    printf 'notified_artifact=%s\n' "$ledger_name"
+    printf 'notified_marker=%s\n' "$marker"
+  } >>"$GITHUB_OUTPUT"
 fi
 
 # 推成功才写进 summary：先写「已推送」再推，推挂了那行就是假的。
 say "### 📣 有新的 Opus，已推送通知"
 say ""
 say "还钉着旧值的文件：$mismatched"
+say ""
+say "下一轮认凭据 \`$ledger_name\`，认出来就不再推这一条。"
