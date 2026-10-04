@@ -301,7 +301,7 @@ prepare_repo() {
 @test "round-cap-judge job is locked down like the fallback reviewer" {
   job="$(awk '/^  round-cap-judge:/{on=1} on' "$REPO_ROOT/$WF")"
   assert_contains "$job" 'needs: iterate'
-  assert_contains "$job" "if: needs.iterate.outputs.judge == 'true'"
+  assert_contains "$job" "if: \${{ !cancelled() && needs.iterate.outputs.judge == 'true' }}"
   assert_contains "$job" $'concurrency:\n      group: round-cap-judge-${{ github.event.pull_request.number }}\n      cancel-in-progress: false\n'
   assert_contains "$job" $'permissions:\n      contents: read\n      pull-requests: read\n      issues: read\n'
   assert_contains "$job" 'shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}'

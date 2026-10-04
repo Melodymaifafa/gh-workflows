@@ -1300,6 +1300,8 @@ jobs:
           REVIEW_ASSOC: ${{ github.event.review.author_association }}
           REVIEW_BODY: ${{ github.event.review.body }}
           MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
+          # 只传「有没有」，不把 PAT 本身交给这一步：没有它 judge 的结论发不出去。
+          HAS_PAT: ${{ secrets.CODEX_TRIGGER_TOKEN != '' }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
         run: |
@@ -1366,6 +1368,12 @@ jobs:
                 or contains("<!-- claude-judge-clean: head=" + $h + " "))')"
             [ "$judged" != true ] ||
               skip "round $round exceeds max_fix_rounds $MAX_FIX_ROUNDS; this head was already judged"
+            # 没有主人的 PAT，judge 的结论（放行标记或停车告警）一条都发不出去，巡检会一遍遍
+            # 重新叫它（Codex 2026-10-04 的 P2）。这种时候照旧在这里用本 job 的令牌停车告警。
+            if [ "${HAS_PAT:-}" != true ]; then
+              alert_once "$H" round-cap - "自动修了 $MAX_FIX_ROUNDS 轮还有新意见，已停。仓库没配 CODEX_TRIGGER_TOKEN，Claude 判断不了剩下的意见能不能忽略。点 Merge 或关掉；推新提交会重新开始。"
+              skip "round $round exceeds max_fix_rounds $MAX_FIX_ROUNDS; no PAT to post a verdict with"
+            fi
             {
               echo "judge=true"
               echo "head=$H"
@@ -2871,7 +2879,10 @@ jobs:
   # CI 全绿才合）；否则照旧 round-cap 告警停下。Codex 自己标了 P0 的，Claude 判什么都不放过。
   round-cap-judge:
     needs: iterate
-    if: needs.iterate.outputs.judge == 'true'
+    # Gate 交过来了就跑，哪怕 iterate 后面的准备步骤（装工具、校验参数）红了：
+    # 不加 !cancelled() 的话 GitHub 会跳过这个 job，这个 head 既没有判决也没有停车告警
+    # （Codex 2026-10-04 的 P2）。
+    if: ${{ !cancelled() && needs.iterate.outputs.judge == 'true' }}
     # 同一个 PR 的判决排队：iterate 那把锁在本 job 起跑前就放开了，两轮排着的 review 会各起
     # 一个 judge；一个判停、一个判放，放行标记就可能盖过停车告警（Codex 2026-10-04 的 P1）。
     # 排队之后，后一个发结论前看得见前一个的标记（见 Post 那一步的重查）。

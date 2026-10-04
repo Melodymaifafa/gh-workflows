@@ -16,7 +16,7 @@ setup() {
   export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp"
   mkdir -p "$RUNNER_TEMP" "$BATS_TEST_TMPDIR/work"
   cd "$BATS_TEST_TMPDIR/work" || return
-  export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token MAX_FIX_ROUNDS=5
+  export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token MAX_FIX_ROUNDS=5 HAS_PAT=true
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
   run_block "$WF" "Define pr-guard helpers" >/dev/null
   # 验证命令之后的两步从这一步的 output 拿告警函数（真跑时由 env: 接过去），不读文件。
@@ -157,6 +157,22 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   refute_called "curl "
   refute_called "gh pr comment"
   [ ! -e .review/findings.md ]
+}
+
+# Codex 2026-10-04 的 P2：没有 PAT，judge 的结论发不出去，巡检会一遍遍重新叫它。
+@test "gate: without the owner PAT the cap parks right here with a round-cap alert, as before" {
+  codex_event
+  export HAS_PAT=false
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
+  gate
+  assert_equal "$status" 0
+  assert_equal "$(step_output run)" false
+  refute_contains "$(cat "$GITHUB_OUTPUT")" "judge=true"
+  assert_called "gh pr comment 7 --repo o/r" 1
+  assert_contains "$(fake_last_body "gh pr comment")" "仓库没配 CODEX_TRIGGER_TOKEN"
+  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: alert head=$H reason=round-cap until=- -->"
 }
 
 @test "gate: max_fix_rounds input is honored (round 2 > 1 parks)" {
