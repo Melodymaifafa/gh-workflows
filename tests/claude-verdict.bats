@@ -477,7 +477,7 @@ $markers" 'src/`x`.sh' 5)" \
   assert_contains "$job" $'permissions:\n      contents: read\n      pull-requests: read\n      issues: read\n'
   assert_contains "$job" 'timeout-minutes: 20'
   assert_equal "$(count_of "$job" 'persist-credentials: false')" 2
-  assert_contains "$job" 'uses: anthropics/claude-code-action@a4f54ef2c58884867281bd8e2f8d63352ad019a9'
+  assert_contains "$job" 'uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea'
   assert_contains "$job" 'continue-on-error: true'
   assert_contains "$job" 'github_token: ${{ github.token }}'
   assert_contains "$job" 'show_full_output: false'
