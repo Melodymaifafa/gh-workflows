@@ -52,7 +52,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 ### 修满轮数之后（2026-10-04）
 
-自动修满 `max_fix_rounds`（默认 5）轮、head 上还有意见时，不再直接停下告警，而是交给 iterate 里的 `round-cap-judge` job：Claude 只读这个 head 上剩下的全部意见、PR 改动和代码，逐条重新定级——P0 安全 / 数据 / 线上故障，P1 确实存在的 bug，P2 可选的小改进、纯风格、文档措辞或误报，拿不准按 P1。
+自动修满 `max_fix_rounds`（默认 5）轮、head 上还有意见时，不再直接停下告警，而是交给 iterate 里的 `round-cap-judge` job：Claude 只读这个 head 上剩下的全部意见（每条编号 F1、F2…，判决必须每个编号恰好一条，漏一条就算没判成）、PR 改动和代码，逐条重新定级——P0 安全 / 数据 / 线上故障，P1 确实存在的 bug，P2 可选的小改进、纯风格、文档措辞或误报，拿不准按 P1。
 
 - 全是 P2：用主人的 PAT 发一条评论，逐条写明放过了哪几条、为什么，末尾带 `claude-judge-clean` 标记，并推一次手机通知。`codex-approved-merge` 的路径 E 只放过标记里点名的那几条 review，之后在这个 head 上新出的意见照样拦；CI 全绿才合。
 - 有一条 P0 / P1、审查方自己标过 P0、或者 Claude 没判成（额度、输出不合法）：照旧告警 `round-cap` 停下，告警里写明是哪几条拦着。
