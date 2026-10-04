@@ -31,9 +31,13 @@ setup() {
   run_block "$WF" "Define pr-guard helpers" >/dev/null
   export PR_GUARD; PR_GUARD="$(step_output script)"
   : >"$GITHUB_OUTPUT"
+  fake_route repos/o/r '{"id":1}'
   fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$H\"}}"
   fake_route "$COMMENTS" '[]'
+  fake_route "$REVIEWS_ROUTE" '[]'
 }
+
+posted() { step_output posted 2>/dev/null || true; }
 
 # verdict <merge|stop> <summary> [item-json ...]
 verdict() {
@@ -72,6 +76,7 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   assert_equal "${body##*$'\n'}" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
   assert_called 'curl ' 1
   refute_called 'gh pr comment'
+  assert_equal "$(posted)" true
 }
 
 @test "a P1 stops the PR with a round-cap alert that names it" {
@@ -81,6 +86,7 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   assert_equal "$status" 0
   assert_round_cap_alert '自动修了 5 轮还有新意见，已停。Claude 判定不能忽略的：空列表会崩。点 Merge 或关掉；推新提交会重新开始。'
   assert_called 'curl ' 1
+  assert_equal "$(posted)" true
 }
 
 @test "a P0 the reviewer flagged is never waved through, whatever Claude says" {
@@ -138,14 +144,27 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   refute_called 'curl '
 }
 
-@test "missing PAT: nothing is posted, one Pushover" {
+# 缺 PAT 或 PAT 失效：这一步什么都发不出去，也不写 posted —— 交给 round-cap-park 停车告警。
+@test "missing PAT: nothing is posted and posted stays unset, so the park job takes over" {
   STRUCTURED_OUTPUT="$(verdict merge '都是小问题' "$(item P2 '措辞')")"
   export STRUCTURED_OUTPUT GH_TOKEN=''
   run run_block "$WF" "$POST"
   assert_equal "$status" 0
   refute_called 'gh '
-  assert_called 'curl ' 1
-  assert_contains "$(fake_last_body 'curl ')" 'CODEX_TRIGGER_TOKEN 缺失'
+  refute_called 'curl '
+  assert_equal "$(posted)" ''
+}
+
+@test "an expired PAT: nothing is posted and posted stays unset, so the park job takes over" {
+  STRUCTURED_OUTPUT="$(verdict merge '都是小问题' "$(item P2 '措辞')")"
+  export STRUCTURED_OUTPUT
+  fake_route_fail repos/o/r 1
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$output" 'cannot read o/r'
+  refute_called 'gh api POST'
+  refute_called 'gh pr comment'
+  assert_equal "$(posted)" ''
 }
 
 # Codex 2026-10-04 的 P1：两个 judge 判同一个 head，先停后放的话放行会盖过停车。
@@ -164,11 +183,22 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
 @test "a head another judge already cleared gets no second M8 and no alert" {
   STRUCTURED_OUTPUT="$(verdict stop 'bug' "$(item P1 'bug')")"
   export STRUCTURED_OUTPUT
-  fake_route "$COMMENTS" "$(json_array "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=901 -->")")"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=901,902 -->")")"
   run run_block "$WF" "$POST"
   assert_equal "$status" 0
   refute_called 'gh api POST repos/o/r/issues/7/comments'
   refute_called 'gh pr comment'
+  assert_equal "$(posted)" true
+}
+
+@test "an M8 that named only earlier reviews does not stop a verdict on the newer ones" {
+  STRUCTURED_OUTPUT="$(verdict merge '都是小问题' "$(item P2 '措辞')")"
+  export STRUCTURED_OUTPUT
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=901 -->")")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_called 'gh api POST repos/o/r/issues/7/comments' 1
+  assert_equal "$(m8_post | tail -n 1)" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
 }
 
 @test "a forged judgment by claude[bot] does not stop a real verdict" {
@@ -216,6 +246,55 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   run run_block "$WF" "$POST"
   assert_equal "$status" 1
   assert_contains "$output" 'pr-guard helpers did not arrive'
+}
+
+# ---------- 兜底：round-cap-park ----------
+
+PARK='Park the capped head'
+
+@test "park: a head with no verdict gets the round-cap alert with the job's own token" {
+  export GH_TOKEN=actions-token
+  run run_block "$WF" "$PARK"
+  assert_equal "$status" 0
+  assert_called "gh pr comment 7 --repo o/r" 1
+  assert_contains "$(fake_last_body "gh pr comment")" 'Claude 的判断这次没能发出来（多半是 CODEX_TRIGGER_TOKEN 缺失或失效）'
+  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: alert head=$H reason=round-cap until=- -->"
+  assert_called '[token=actions-token]'
+  assert_called 'curl ' 1
+}
+
+@test "park: a head that already carries a stop or a covering M8 is left alone" {
+  export GH_TOKEN=actions-token
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 3 melody OWNER "已停。$(m6_marker "$H" round-cap)")")"
+  run run_block "$WF" "$PARK"
+  assert_equal "$status" 0
+  refute_called 'gh pr comment'
+
+  fake_route "$REVIEWS_ROUTE" "$(json_array "$(gh_review 901 "$CODEX" NONE "$H" 'P2 nit')")"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=901 -->")")"
+  run run_block "$WF" "$PARK"
+  assert_equal "$status" 0
+  refute_called 'gh pr comment'
+}
+
+@test "park: a head that moved is left alone" {
+  export GH_TOKEN=actions-token
+  fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$OTHER\"}}"
+  run run_block "$WF" "$PARK"
+  assert_equal "$status" 0
+  refute_called 'gh pr comment'
+}
+
+@test "round-cap-park runs after a judge that left no verdict, with its own write token only" {
+  job="$(awk '/^  round-cap-park:/{on=1} on' "$REPO_ROOT/$WF")"
+  assert_contains "$job" 'needs: [iterate, round-cap-judge]'
+  assert_contains "$job" "if: \${{ always() && needs.iterate.outputs.judge == 'true' && needs.round-cap-judge.outputs.posted != 'true' }}"
+  assert_contains "$job" $'permissions:\n      issues: write\n      pull-requests: write\n'
+  assert_contains "$job" 'GH_TOKEN: ${{ github.token }}'
+  refute_contains "$job" 'secrets.CODEX_TRIGGER_TOKEN'
+  refute_contains "$job" 'uses:'
+  judge="$(awk '/^  round-cap-judge:/{on=1} /^  round-cap-park:/{exit} on' "$REPO_ROOT/$WF")"
+  assert_contains "$judge" $'    outputs:\n      posted: ${{ steps.post.outputs.posted }}\n'
 }
 
 # ---------- 准备材料 ----------

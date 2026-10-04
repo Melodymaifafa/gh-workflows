@@ -18,6 +18,8 @@ setup() {
   cd "$BATS_TEST_TMPDIR/work" || return
   export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token MAX_FIX_ROUNDS=5 HAS_PAT=true
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
+  # 修满轮数时 Gate 要列这个 head 上的全部 review（judged_already）；默认一条都没有。
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" '[]'
   run_block "$WF" "Define pr-guard helpers" >/dev/null
   # 验证命令之后的两步从这一步的 output 拿告警函数（真跑时由 env: 接过去），不读文件。
   export PR_GUARD; PR_GUARD="$(step_output script)"
@@ -202,16 +204,32 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   refute_called "gh pr comment"
 }
 
-@test "gate: a head the judge already cleared is not judged again" {
+@test "gate: a head whose M8 names every findings review is not judged again" {
   codex_event
   live_head "$H"
   serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(gh_review 4001 "$CODEX" NONE "$H" 'body')")"
   fake_route "$COMMENTS" "$(json_array \
     "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")" \
     "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=4001 -->")")"
   gate
   refute_contains "$(cat "$GITHUB_OUTPUT")" "judge=true"
   assert_contains "$output" "already judged"
+}
+
+# Codex 2026-10-04 的 P2：M8 之后同一个 head 上又来了新意见，它没被点过名，要重判；
+# 当成「判过了」的话巡检的重修一轮轮被忽略，最后误报 retry-exhausted。
+@test "gate: a findings review that arrived after the M8 gets a new judgment" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array \
+    "$(gh_review 4001 "$CODEX" NONE "$H" 'body')" "$(gh_review 4002 "$CODEX" NONE "$H" 'new')")"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")" \
+    "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=4001 -->")")"
+  gate
+  assert_equal "$(step_output judge)" true
 }
 
 @test "gate: markers from claude[bot] or a contributor are ignored" {

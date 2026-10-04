@@ -184,10 +184,35 @@ jobs:
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$body" >/dev/null
           }
 
-          declare -f pushover trusted_comments alert_once >"$RUNNER_TEMP/pr-guard.sh"
+          # findings_review_ids <head>：这个 head 上全部「有意见」的 review id，逗号隔开。判据同
+          # codex-approved-merge 的 has_findings：Codex 的，或可信作者带 claude-review-findings 标记的。
+          findings_review_ids() {
+            gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" |
+              jq -r --arg h "$1" '
+                [(add // [])[] | select(.commit_id == $h and (
+                    .user.login == "chatgpt-codex-connector[bot]" or (
+                      (.user.login == "github-actions[bot]" or .author_association == "OWNER") and
+                      ((.body // "") | contains("claude-review-findings: " + $h)))))]
+                | map(.id | tostring) | join(",")'
+          }
+
+          # judged_already <head> <review ids>：修满轮数的这个 head 已经有判决了吗？打印 true / false。
+          # 有 round-cap 停车告警，或者已有的放行标记（M8）合起来点名了列出的每一条 review。M8 之后
+          # 又来的新意见没被点过名，就还算没判，要重判（Codex 2026-10-04 的 P2）。
+          judged_already() {
+            trusted_comments | jq -r --arg h "$1" --arg ids "$2" '
+              ([.[] | (.body // "")
+                | capture("<!-- claude-judge-clean: head=" + $h + " reviews=(?<ids>[0-9]+(,[0-9]+)*) -->").ids
+                | split(",")[]] | unique) as $named
+              | any(.[]; (.body // "") | contains("<!-- pr-guard: alert head=" + $h + " reason=round-cap "))
+                or (($named | length) > 0
+                  and ($ids | split(",") | map(select(. != "")) | all(. as $i | any($named[]; . == $i))))'
+          }
+
+          declare -f pushover trusted_comments alert_once findings_review_ids judged_already >"$RUNNER_TEMP/pr-guard.sh"
           {
             echo 'script<<__PR_GUARD_HELPERS_EOF__'
-            declare -f pushover trusted_comments alert_once
+            declare -f pushover trusted_comments alert_once findings_review_ids judged_already
             echo '__PR_GUARD_HELPERS_EOF__'
           } >>"$GITHUB_OUTPUT"
 
@@ -1362,11 +1387,8 @@ jobs:
           if [ "$round" -gt "$MAX_FIX_ROUNDS" ]; then
             # 修满了还有意见：不在这里停下告警，交给 round-cap-judge 那个 job，让 Claude
             # 逐条判剩下的意见拦不拦合并。放行标记（M8）或 round-cap 告警都由那个 job 发；
-            # 这个 head 已经有其中一个，说明判过了，巡检再踢一脚也不重判。
-            judged="$(trusted_comments | jq -r --arg h "$H" '
-              any(.[]; (.body // "") | contains("<!-- pr-guard: alert head=" + $h + " reason=round-cap ")
-                or contains("<!-- claude-judge-clean: head=" + $h + " "))')"
-            [ "$judged" != true ] ||
+            # 这个 head 已经判过（见 judged_already），巡检再踢一脚也不重判。
+            [ "$(judged_already "$H" "$(findings_review_ids "$H")")" != true ] ||
               skip "round $round exceeds max_fix_rounds $MAX_FIX_ROUNDS; this head was already judged"
             # 没有主人的 PAT，judge 的结论（放行标记或停车告警）一条都发不出去，巡检会一遍遍
             # 重新叫它（Codex 2026-10-04 的 P2）。这种时候照旧在这里用本 job 的令牌停车告警。
@@ -2895,6 +2917,9 @@ jobs:
       issues: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # posted=true：这个 head 留下了判决（或者判决已经不需要了）。没有它，round-cap-park 兜底停车。
+    outputs:
+      posted: ${{ steps.post.outputs.posted }}
     defaults:
       run:
         shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
@@ -2975,6 +3000,36 @@ jobs:
           } >>"$GITHUB_OUTPUT"
           wc -c .review/pr.diff .review/findings.md
 
+      # 同 Resolve runtime defaults / 代审那一段先验（tests/claude-model.bats 盯着三处一字不差）。
+      # 这个 job 在 iterate 红了时也跑，那边的先验拦不住它：降级模型给出的放行判决等于用低一档
+      # 的模型放行自动合并（Codex 2026-10-04 的 P2）。这一步红了，Claude 那一步跟着跳过，
+      # 发结论那一步按「没判成」停车告警。
+      - name: Check the judge model and effort
+        env:
+          CLAUDE_MODEL: ${{ inputs.claude_model }}
+          CLAUDE_EFFORT: ${{ inputs.claude_effort }}
+        run: |
+          set -euo pipefail
+
+          case "$CLAUDE_MODEL" in
+            opus|opus\[1m\]|fable|fable\[1m\]|claude-opus-*|claude-fable-*|claude-mythos-*) ;;
+            '')
+              echo "::error::claude_model is empty; pass an Opus-tier model id such as claude-opus-5-5"
+              exit 1
+              ;;
+            *)
+              echo "::error::claude_model '$CLAUDE_MODEL' is not an explicit Opus-or-above selector; use opus, fable, claude-opus-*, claude-fable-* or claude-mythos-* (default, opusplan and the like can resolve to Sonnet)"
+              exit 1
+              ;;
+          esac
+          case "$CLAUDE_EFFORT" in
+            low|medium|high|xhigh|max) ;;
+            *)
+              echo "::error::claude_effort '$CLAUDE_EFFORT' is not one of low, medium, high, xhigh, max"
+              exit 1
+              ;;
+          esac
+
       - name: Claude judges the leftover findings
         id: judge
         continue-on-error: true
@@ -3027,6 +3082,7 @@ jobs:
             reason 说你核实了什么、为什么这样定级。
 
       - name: Post the round-cap verdict
+        id: post
         if: ${{ !cancelled() }}
         env:
           # 整个 job 里只有这一步拿得到主人的 PAT：放行标记必须是主人写的，
@@ -3051,24 +3107,28 @@ jobs:
           stop_msg="自动修了 $MAX_FIX_ROUNDS 轮还有新意见，已停。"
           tail_msg='点 Merge 或关掉；推新提交会重新开始。'
 
+          # 主人的 PAT 缺失或失效：这里什么都发不出去，留给 round-cap-park 用 job 自己的令牌停车告警
+          # （不写 posted），免得这个 head 没有任何标记、巡检一遍遍重新叫 judge（Codex 2026-10-04 的 P2）。
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo '::warning::CODEX_TRIGGER_TOKEN is missing; the round-cap verdict cannot be posted'
-            pushover "🤖 PR #$PR_NUMBER 自动修复停了" "$REPO：${stop_msg}令牌 CODEX_TRIGGER_TOKEN 缺失，Claude 的判断发不出去。$tail_msg"
+            echo '::warning::CODEX_TRIGGER_TOKEN is missing; round-cap-park records the stop'
+            exit 0
+          fi
+          if ! gh api "repos/$REPO" --jq .id >/dev/null 2>&1; then
+            echo "::warning::CODEX_TRIGGER_TOKEN cannot read $REPO (expired or revoked?); round-cap-park records the stop"
             exit 0
           fi
 
           live_head="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)"
           if [ "$live_head" != "$HEAD_SHA" ]; then
             echo "::notice::PR head moved to $live_head; dropping the round-cap verdict"
+            echo 'posted=true' >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          # 发之前再查一遍：同一个 head 已经有放行标记或停车告警，说明别的 judge 判过了，
-          # 这次的结论作废 —— 一个 head 只认第一个判决，不让后来的放行盖过先前的停车。
-          judged="$(trusted_comments | jq -r --arg h "$HEAD_SHA" '
-            any(.[]; (.body // "") | contains("<!-- pr-guard: alert head=" + $h + " reason=round-cap ")
-              or contains("<!-- claude-judge-clean: head=" + $h + " "))')"
-          if [ "$judged" = true ]; then
+          # 发之前再查一遍：别的 judge 已经停了车，或者已有的放行标记点过这几条的名，这次的结论
+          # 作废 —— 一个 head 只认第一个判决，不让后来的放行盖过先前的停车（Codex 2026-10-04 的 P1）。
+          if [ "$(judged_already "$HEAD_SHA" "${REVIEWS:-}")" = true ]; then
             echo "::notice::$HEAD_SHA was already judged; dropping this verdict"
+            echo 'posted=true' >>"$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -3091,6 +3151,7 @@ jobs:
             ! jq -e "$valid" <<<"${STRUCTURED_OUTPUT:-}" >/dev/null 2>&1
           then
             alert_once "$HEAD_SHA" round-cap - "${stop_msg}Claude 这次没能判断剩下的意见。$tail_msg"
+            echo 'posted=true' >>"$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -3121,6 +3182,7 @@ jobs:
               ' <<<"$STRUCTURED_OUTPUT"
             )"
             gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null
+            echo 'posted=true' >>"$GITHUB_OUTPUT"
             pushover "🤖 PR #$PR_NUMBER 剩下的意见判定可忽略" \
               "$REPO：$(jq -r '.findings | length' <<<"$STRUCTURED_OUTPUT") 条都是可选的小改进，CI 全绿后自动合并。忽略了哪几条、为什么，写在 PR 评论里。"
             echo "::notice::Posted the round-cap clean verdict for $HEAD_SHA"
@@ -3135,3 +3197,47 @@ jobs:
           [ "${CODEX_P0:-}" != true ] || reason='审查方把其中一条标成了 P0（安全、数据或线上故障），这种不自动放过。'
           [ -z "$blockers" ] || reason="${reason}Claude 判定不能忽略的：$blockers。"
           alert_once "$HEAD_SHA" round-cap - "$stop_msg$reason$tail_msg"
+          echo 'posted=true' >>"$GITHUB_OUTPUT"
+
+  # judge 没能留下判决时的兜底（主人的 PAT 缺失或失效、job 半路挂了）：用本 job 自己的令牌照旧
+  # 停车告警。这样每个修满轮数的 head 一定有一个判决，巡检不会一遍遍重新叫 judge（Codex 2026-10-04 的 P2）。
+  round-cap-park:
+    needs: [iterate, round-cap-judge]
+    if: ${{ always() && needs.iterate.outputs.judge == 'true' && needs.round-cap-judge.outputs.posted != 'true' }}
+    permissions:
+      issues: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - name: Park the capped head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ needs.iterate.outputs.head }}
+          MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
+          PR_GUARD: ${{ needs.iterate.outputs.pr_guard }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+        run: |
+          set -euo pipefail
+
+          eval "${PR_GUARD:-}"
+          declare -F alert_once >/dev/null || {
+            echo '::error::the pr-guard helpers did not arrive from the iterate job'
+            exit 1
+          }
+          live_head="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)"
+          if [ "$live_head" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved to $live_head; nothing to park"
+            exit 0
+          fi
+          if [ "$(judged_already "$HEAD_SHA" "$(findings_review_ids "$HEAD_SHA")")" = true ]; then
+            echo "::notice::$HEAD_SHA already carries a verdict"
+            exit 0
+          fi
+          alert_once "$HEAD_SHA" round-cap - "自动修了 $MAX_FIX_ROUNDS 轮还有新意见，已停。Claude 的判断这次没能发出来（多半是 CODEX_TRIGGER_TOKEN 缺失或失效）。点 Merge 或关掉；推新提交会重新开始。"
