@@ -25,7 +25,8 @@ setup() {
   setup_fake_env
   export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp"
   mkdir -p "$RUNNER_TEMP"
-  export REPO=o/r PR_NUMBER=7 HEAD_SHA="$H" GH_TOKEN=pat-token MAX_FIX_ROUNDS=5
+  # ROUND = Gate 算出的下一轮：修满 5 轮之后是第 6 轮；第二阶段最多修到第 10 轮。
+  export REPO=o/r PR_NUMBER=7 HEAD_SHA="$H" GH_TOKEN=pat-token MAX_FIX_ROUNDS=5 ROUND=6 MAX_CONFIRMED_FIX_ROUNDS=10
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu FAKE_NOW=2026-09-18T08:00:00Z
   export OUTCOME=success STRUCTURED_OUTPUT='' REVIEWS=901,902 CODEX_P0=false
   run_block "$WF" "Define pr-guard helpers" >/dev/null
@@ -85,21 +86,73 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   assert_equal "$(posted)" true
 }
 
-@test "a P1 stops the PR with a round-cap alert that names it" {
-  use_verdict "$(verdict stop '有一条是真 bug' "$(item P2 '措辞')" "$(item P1 '空列表会崩')")"
+# 第二阶段（Melody 2026-10-04 定）：修满 5 轮还有 Claude 确认的 bug，不停车，接着修那几条，
+# 最多修到第 10 轮；第 10 轮之后还有，才停下推通知。
+@test "a confirmed P1 after the first stage goes back for another fix round, not to the owner" {
+  use_verdict "$(verdict stop '有一条是真 bug' "$(item P2 '措辞')" "$(item P1 '空列表会崩' '读了代码，空数组时访问越界')")"
   run run_block "$WF" "$POST"
   assert_equal "$status" 0
-  assert_round_cap_alert '自动修了 5 轮还有新意见，已停。Claude 判定不能忽略的：空列表会崩。点 Merge 或关掉；推新提交会重新开始。'
+  assert_called 'gh api POST repos/o/r/pulls/7/reviews' 1
+  body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
+  assert_contains "$body" '修了 5 轮，还有确认的 bug，接着修（第 6 轮，最多修到第 10 轮）'
+  assert_contains "$body" '- **P1** F2 空列表会崩：读了代码，空数组时访问越界'
+  refute_contains "$body" '措辞'
+  assert_contains "$body" "<!-- claude-review-findings: $H -->"
+  assert_equal "${body##*$'\n'}" "<!-- claude-judge-fix: head=$H -->"
+  assert_called '"event":"COMMENT"' 1
+  refute_called 'gh pr comment'
+  refute_called 'curl '
+  refute_called 'claude-judge-clean'
+  assert_equal "$(posted)" true
+}
+
+@test "a confirmed bug past round 10 stops the PR and pushes one alert that names it" {
+  use_verdict "$(verdict stop '有一条是真 bug' "$(item P2 '措辞')" "$(item P1 '空列表会崩')")"
+  export ROUND=11
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_called 'gh api POST repos/o/r/pulls/7/reviews'
+  assert_round_cap_alert '自动修了 10 轮，还有 Claude 确认的 bug 没修好，已停，需要你看。还剩：空列表会崩。点 Merge 或关掉；推新提交会重新开始。'
   assert_called 'curl ' 1
   assert_equal "$(posted)" true
 }
 
+@test "all P2 at round 10 still merges: only confirmed bugs keep a PR out" {
+  use_verdict "$(verdict merge '都是小问题' "$(item P2 '措辞')")"
+  export ROUND=11
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$(m8_post)" '🤖 自动修了 5 轮'
+  assert_contains "$(m8_post)" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
+}
+
+# Codex 标了 P0、Claude 一条都不认：不替人拿主意，停车通知，不接着修也不放行。
 @test "a P0 the reviewer flagged is never waved through, whatever Claude says" {
   use_verdict "$(verdict merge '都是小问题' "$(item P2 '其实没事')")"
   export CODEX_P0=true
   run run_block "$WF" "$POST"
   assert_equal "$status" 0
   assert_round_cap_alert '审查方把其中一条标成了 P0（安全、数据或线上故障），这种不自动放过。'
+  refute_called 'gh api POST repos/o/r/pulls/7/reviews'
+}
+
+@test "a reviewer P0 that Claude confirms goes back for another fix round" {
+  use_verdict "$(verdict stop '确认' "$(item P0 '令牌会泄露')")"
+  export CODEX_P0=true
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_called 'gh api POST repos/o/r/pulls/7/reviews' 1
+  assert_contains "$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')" '- **P0** F1 令牌会泄露'
+}
+
+@test "a head that already has a confirmed-bug fix request is not judged twice" {
+  use_verdict "$(verdict stop 'bug' "$(item P1 'bug')")"
+  fake_route "$REVIEWS_ROUTE" "$(json_array "$(gh_review 905 melody OWNER "$H" "确认的 bug <!-- claude-review-findings: $H --> <!-- claude-judge-fix: head=$H -->")")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$output" 'already judged'
+  refute_called 'gh api POST'
+  refute_called 'gh pr comment'
 }
 
 # Codex 2026-10-04 的 P1：意见多了，判决只写了一部分，漏掉的那条也会随整条 review 被放过。
@@ -290,6 +343,13 @@ PARK='Park the capped head'
   refute_called 'gh pr comment'
 }
 
+@test "park: after the second stage the fallback alert counts all ten rounds" {
+  export GH_TOKEN=actions-token ROUND=11
+  run run_block "$WF" "$PARK"
+  assert_equal "$status" 0
+  assert_contains "$(fake_last_body "gh pr comment")" '自动修了 10 轮还有新意见，已停。Claude 的判断这次没能发出来'
+}
+
 @test "park: a head that moved is left alone" {
   export GH_TOKEN=actions-token
   fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$OTHER\"}}"
@@ -388,9 +448,9 @@ prepare_repo() {
 
 # ---------- job 形状（配置写错就没有安全边界） ----------
 
-@test "the iterate job hands judge, head and the pr-guard helpers to the judge job" {
+@test "the iterate job hands judge, head, round and the pr-guard helpers to the judge job" {
   job="$(awk '/^  iterate:/{on=1} /^    steps:/{exit} on' "$REPO_ROOT/$WF")"
-  assert_contains "$job" $'    outputs:\n      judge: ${{ steps.gate.outputs.judge }}\n      head: ${{ steps.gate.outputs.head }}\n      pr_guard: ${{ steps.helpers.outputs.script }}\n'
+  assert_contains "$job" $'    outputs:\n      judge: ${{ steps.gate.outputs.judge }}\n      head: ${{ steps.gate.outputs.head }}\n      round: ${{ steps.gate.outputs.round }}\n      pr_guard: ${{ steps.helpers.outputs.script }}\n'
 }
 
 @test "round-cap-judge job is locked down like the fallback reviewer" {
