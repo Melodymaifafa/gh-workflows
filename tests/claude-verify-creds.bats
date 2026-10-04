@@ -1174,10 +1174,12 @@ EOS
 }
 
 # action 自己的步骤写的是 `shell: bash`，不吃 job 层的默认，照样按 PATH 找 bash。
-# 验证命令之后再出现一个 `uses:`，MEL-278 的洞就从那一步回来。
+# 验证命令之后再出现一个 `uses:`，MEL-278 的洞就从那一步回来。只看 iterate 这个 job：
+# 别的 job（round-cap-judge）跑在另一台新机器上，被审 PR 的代码在那边一行都没跑过。
 @test "claude: no action step runs after the first verify step, where it would find bash on PATH" {
   late_uses="$(awk '
     $0 == "      - name: Verify the Claude fix" { after = 1; next }
+    after && /^  [A-Za-z_-]+:$/ { exit }
     after && /^      - uses: |^        uses: / { print NR": "$0 }
   ' "$REPO_ROOT/$WF")"
   assert_equal "$late_uses" ""

@@ -19,8 +19,8 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | 文件 | 什么时候跑 | 干什么 |
 |---|---|---|
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
-| `claude-codex-iterate.yml` | Codex 或 Claude 代审提交意见后 | 选一个 fixer 读意见、只改代码；验证、push、发中文总结由不带凭据/带凭据的独立步骤接手，然后召唤复审；最多连修 5 轮。默认 Claude 先上，撞额度/限流/认证失效才换 Codex 接手 |
-| `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` / Claude 代审通过 | 先等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop） |
+| `claude-codex-iterate.yml` | Codex 或 Claude 代审提交意见后 | 选一个 fixer 读意见、只改代码；验证、push、发中文总结由不带凭据/带凭据的独立步骤接手，然后召唤复审；最多连修 5 轮，修满还有意见就让 Claude 逐条判断剩下的意见拦不拦合并（见下方「修满轮数之后」）。默认 Claude 先上，撞额度/限流/认证失效才换 Codex 接手 |
+| `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 | 先等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop） |
 | `pr-sweeper.yml` | 定时（cron 写每 15 分钟，实测 2–7 小时一次；只在本仓库跑） | 扫 owner 名下所有仓库，集成分支取各仓库调用桩的 `base_branch`；给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
 | `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
 
@@ -32,7 +32,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 - 喊了 `@codex review` 5 分钟没有 👀 也没有结论；
 - 20 分钟还没有结论。
 
-没有「Codex 已坏」的全局开关：下一轮照样先问 Codex，它额度恢复就自动接回。Claude 代审只读（Read/Glob/Grep），看不到任何密钥，结论必须是合法 JSON 才算数；空结果一律当「没审过」，绝不当「通过」。**有意见的 head 永远不会被合并。**
+没有「Codex 已坏」的全局开关：下一轮照样先问 Codex，它额度恢复就自动接回。Claude 代审只读（Read/Glob/Grep），看不到任何密钥，结论必须是合法 JSON 才算数；空结果一律当「没审过」，绝不当「通过」。**有意见的 head 不会被合并**，唯一的例外是下面「修满轮数之后」那条路：Claude 逐条核过、点名放过的那几条意见。
 
 机器之间靠藏在评论里的标记接力，只认 `github-actions[bot]` 或 OWNER 写的，`claude[bot]` 写什么都不算：
 
@@ -42,12 +42,23 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `pr-guard: fallback head=H` | GITHUB_TOKEN | Codex 这次不行，换 Claude |
 | `claude-review-findings: H` | PAT | Claude 代审有意见（一条 COMMENT review） |
 | `claude-review-clean: H` | PAT | Claude 代审无意见，CI 绿就合 |
+| `claude-judge-clean: head=H reviews=ID,…` | PAT（iterate 的 round-cap-judge） | 修满轮数后 Claude 判定这几条 review 里的意见都不拦合并，CI 绿就合；之后在 H 上新出的 review 照样拦 |
 | `codex-fix-request: head=H round=N run=ID` | PAT（iterate） | 请 Codex 云端出一段补丁（句子里没有「@codex review」，不算复审请求） |
 | `fix-retry: head=H review=ID` | PAT（巡检） | 上次修复没完成，再修一次 |
 | `pr-guard: fix-round head=H round=N` | GITHUB_TOKEN | 第 N 轮修复已推送（轮数不靠召唤是否成功） |
 | `pr-guard: alert head=H reason=R until=T` | 各环节 | 已告警 R，同一 head 同一原因只推一次 |
 
 告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
+
+### 修满轮数之后（2026-10-04）
+
+自动修满 `max_fix_rounds`（默认 5）轮、head 上还有意见时，不再直接停下告警，而是交给 iterate 里的 `round-cap-judge` job：Claude 只读这个 head 上剩下的全部意见、PR 改动和代码，逐条重新定级——P0 安全 / 数据 / 线上故障，P1 确实存在的 bug，P2 可选的小改进、纯风格、文档措辞或误报，拿不准按 P1。
+
+- 全是 P2：用主人的 PAT 发一条评论，逐条写明放过了哪几条、为什么，末尾带 `claude-judge-clean` 标记，并推一次手机通知。`codex-approved-merge` 的路径 E 只放过标记里点名的那几条 review，之后在这个 head 上新出的意见照样拦；CI 全绿才合。
+- 有一条 P0 / P1、审查方自己标过 P0、或者 Claude 没判成（额度、输出不合法）：照旧告警 `round-cap` 停下，告警里写明是哪几条拦着。
+- 同一个 head 判过一次（已有放行标记或 `round-cap` 告警）就不再判，巡检再踢也一样。
+
+Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根目录是受信任的 base，主人的 PAT 只在最后发结论那一步。
 
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
 
