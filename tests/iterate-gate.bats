@@ -711,6 +711,22 @@ runs_seq() { # runs_seq <seq> [run-json ...]
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 
+# 2026-10-04 wf-smoke-test 20 号 PR 实测：权限不够时 403 落在「列 run」那一步，
+# 根本走不到批准 —— 真会发生的就是这条路，告警也得点名缺哪一项权限。
+@test "summon: a token that cannot even list the runs still names the missing permission" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  fake_route_fail "$RUNS" 1
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_contains "$output" "CODEX_TRIGGER_TOKEN needs Actions: Read and write"
+  refute_called "/approve"
+  # 列不出来就不在这一分钟里反复试：召唤前一次，冷却后再一次。
+  assert_called "gh api GET repos/o/r/actions/runs" 2
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
 # 本票堵的那个洞：这一步手上是 CODEX_TRIGGER_TOKEN（真人账号的 fine-grained PAT），
 # 而排在它前面的验证那一步跑的是被审 PR 自己的命令 —— PR 往「自己写得动的 PATH 目录」
 # 放一个假 gh，这一步去跑它，令牌就直接落到 PR 手上。所以它的命令只从我们写不动的
