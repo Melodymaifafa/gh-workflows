@@ -3051,6 +3051,9 @@ jobs:
         uses: anthropics/claude-code-action@a4f54ef2c58884867281bd8e2f8d63352ad019a9 # v1.0.229
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # 修满轮数通常是 Codex bot 的 review 触发的，action 默认不认 bot 触发者（防循环），不放行
+          # 的话主路径上 Claude 一次都不跑、每个 head 都被兜底停车（Codex 2026-10-04 的 P1）。同 fixer。
+          allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"
           # 只读的 GITHUB_TOKEN：action 不再换 App token，Claude 也发不了任何东西。
           github_token: ${{ github.token }}
           show_full_output: false

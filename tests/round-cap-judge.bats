@@ -404,6 +404,8 @@ prepare_repo() {
   while [[ "$s" == *'persist-credentials: false'* ]]; do s="${s#*'persist-credentials: false'}"; n=$((n + 1)); done
   assert_equal "$n" 2
   assert_contains "$job" 'uses: anthropics/claude-code-action@a4f54ef2c58884867281bd8e2f8d63352ad019a9'
+  # 主路径的触发者是 Codex bot：不放行它，Claude 一次都不跑。
+  assert_contains "$job" 'allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"'
   assert_contains "$job" 'continue-on-error: true'
   assert_contains "$job" 'github_token: ${{ github.token }}'
   assert_contains "$job" '"disableAllHooks": true'
