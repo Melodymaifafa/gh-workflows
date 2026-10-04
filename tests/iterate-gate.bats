@@ -646,12 +646,14 @@ RUNS="repos/o/r/actions/runs?head_sha=$H2&per_page=100"
   summon_env
   export PUSHED_HEAD="$H2"
   fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  # 两次批准各只查一遍的话，前两次都扑空，第三次才有 run —— 永远批不到。
   fake_route "$RUNS" '{"workflow_runs":[]}' 1
-  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"action_required\"}]}" 2
-  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"queued\"}]}" 3
+  fake_route "$RUNS" '{"workflow_runs":[]}' 2
+  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"action_required\"}]}" 3
+  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"queued\"}]}" 4
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
-  assert_called "sleep 10" 1
+  assert_called "sleep 10" 2
   assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
   assert_called "gh pr comment 7 --repo o/r" 1
 }
