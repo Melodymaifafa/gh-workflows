@@ -2872,6 +2872,12 @@ jobs:
   round-cap-judge:
     needs: iterate
     if: needs.iterate.outputs.judge == 'true'
+    # 同一个 PR 的判决排队：iterate 那把锁在本 job 起跑前就放开了，两轮排着的 review 会各起
+    # 一个 judge；一个判停、一个判放，放行标记就可能盖过停车告警（Codex 2026-10-04 的 P1）。
+    # 排队之后，后一个发结论前看得见前一个的标记（见 Post 那一步的重查）。
+    concurrency:
+      group: round-cap-judge-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     permissions:
       contents: read
       pull-requests: read
@@ -3043,6 +3049,15 @@ jobs:
           live_head="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)"
           if [ "$live_head" != "$HEAD_SHA" ]; then
             echo "::notice::PR head moved to $live_head; dropping the round-cap verdict"
+            exit 0
+          fi
+          # 发之前再查一遍：同一个 head 已经有放行标记或停车告警，说明别的 judge 判过了，
+          # 这次的结论作废 —— 一个 head 只认第一个判决，不让后来的放行盖过先前的停车。
+          judged="$(trusted_comments | jq -r --arg h "$HEAD_SHA" '
+            any(.[]; (.body // "") | contains("<!-- pr-guard: alert head=" + $h + " reason=round-cap ")
+              or contains("<!-- claude-judge-clean: head=" + $h + " "))')"
+          if [ "$judged" = true ]; then
+            echo "::notice::$HEAD_SHA was already judged; dropping this verdict"
             exit 0
           fi
 

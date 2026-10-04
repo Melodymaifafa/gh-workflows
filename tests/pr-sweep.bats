@@ -320,6 +320,66 @@ refute_writes() {
 <!-- fix-retry: head=$H review=4863267293 -->"
 }
 
+# ---------- 4b. 修满轮数后 Claude 判过可合（M8） ----------
+
+m8_comment() { # m8_comment <id> <reviews> <分钟前> [login] [assoc]
+  gh_comment "$1" "${4:-Melodymaifafa}" "${5:-OWNER}" \
+    "🤖 自动修了 5 轮…"$'\n\n'"<!-- claude-judge-clean: head=$H reviews=$2 -->" "$(ago "$3")"
+}
+
+# Codex 2026-10-04 的 P2：M8 发出时 CI 还没绿、合并检查没合上，巡检不认识 M8 的话，会把点名
+# 的 review 当成没修的意见去发 M5 —— 那一轮被 Gate 当作「已判过」忽略，最后误报 retry-exhausted。
+@test "an M8 head is not retried: the same M8 goes out again after 60 idle minutes" {
+  one_pr clean 61
+  reviews "$(codex_findings 111 "$H" 300)"
+  comments "$(m8_comment 900 111 61)"
+  sweep
+  refute_called "gh api POST repos/$R/pulls/7/reviews"
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  assert_contains "$body" '再请合并检查跑一次'
+  assert_equal "${body##*$'\n'}" "<!-- claude-judge-clean: head=$H reviews=111 -->"
+  refute_contains "$body" '@codex'
+}
+
+@test "an M8 head waits 60 idle minutes for the merge check it just triggered" {
+  one_pr clean 30
+  reviews "$(codex_findings 111 "$H" 300)"
+  comments "$(m8_comment 900 111 30)"
+  sweep
+  refute_writes
+}
+
+@test "a review the M8 did not name is still findings and gets M5" {
+  one_pr clean 61
+  reviews "$(codex_findings 111 "$H" 300)" "$(codex_findings 222 "$H" 100)"
+  comments "$(m8_comment 900 111 200)"
+  sweep
+  assert_called "gh api POST repos/$R/pulls/7/reviews" 1
+  assert_contains "$(fake_last_body "gh api POST")" "<!-- fix-retry: head=$H review=222 -->"
+}
+
+@test "two re-requested merge checks later: one stalled alert, no fourth M8" {
+  one_pr clean 61
+  reviews "$(codex_findings 111 "$H" 400)"
+  comments "$(m8_comment 900 111 300)" "$(m8_comment 901 111 200)" "$(m8_comment 902 111 100)"
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  assert_contains "$body" '合并检查跑了 3 次都没合上'
+  assert_contains "$body" "<!-- pr-guard: alert head=$H reason=stalled until=- -->"
+  refute_contains "$body" 'claude-judge-clean'
+}
+
+@test "an M8 from claude[bot] neither exempts findings nor re-requests a merge check" {
+  one_pr clean 61
+  reviews "$(codex_findings 111 "$H" 300)"
+  comments "$(m8_comment 900 111 200 'claude[bot]' NONE)"
+  sweep
+  assert_called "gh api POST repos/$R/pulls/7/reviews" 1
+  refute_called 'claude-judge-clean'
+}
+
 @test "an OWNER M3 counts as findings and is the M5 target when newest" {
   one_pr clean 200
   reviews "$(codex_findings 111 "$H" 300)" \

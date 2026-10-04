@@ -11,7 +11,9 @@
 #   3. 额度还没恢复      → 停（这个 head 上最晚的 until 还没到）。
 #   4. head 有审查意见   → 空闲 ≥ 60 分钟或额度已恢复时发 M5 让 iterate 再修，每个 head 最多算 2 次
 #                          （M5 之后又撞额度的那次不算），但 M5 总数封顶 6 次；用完且空闲 ≥ 60 分钟就告警一次
-#                          retry-exhausted，停。
+#                          retry-exhausted，停。修满轮数后 Claude 判过可合（M8）点名的 review 不算意见。
+#   4b. 有 M8 还没合     → 多半是当时 CI 还没绿：空闲 ≥ 60 分钟就把同一个 M8 再发一次，让合并检查重跑；
+#                          每个 head 最多补 2 次，之后告警一次 stalled，停。
 #   5. 其余              → 没人碰过且空闲 ≥ 30 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
 #                          每个 head 最多 3 次、间隔 ≥ 60 分钟；然后告警一次 stalled；然后 7 天内每天一次。
 #
@@ -45,6 +47,8 @@ trap 'rm -rf "$tmp"' EXIT
 max_kicks=3
 max_daily_kicks=7
 max_retries=2
+# M8 之后合并检查最多补跑 2 次（加上 judge 自己发的那条，一共 3 条 M8）。
+max_merge_rekicks=2
 # 撞额度的重试不计数，但总次数也要封顶，免得额度一直不够时无限重试。
 max_total_retries=6
 
@@ -71,7 +75,10 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 # 某次 M5 之后、下一次 M5 之前又撞了 fix-quota，这次重试不算数。
 | [range(0; $retries | length) as $i | $retries[$i] as $t | ($retries[$i + 1] // 1e18) as $next
     | select(any($quota_at[]; . > $t and . < $next) | not)] | length as $counted
-| [$r[] | select(.commit_id == $h and (.user.login == $codex
+# M8：修满轮数后 Claude 判定这几条 review 不拦合并（claude-codex-iterate 的 round-cap-judge）。
+| [$tc[] | (.body // "") | capture("<!-- claude-judge-clean: head=" + $h + " reviews=(?<ids>[0-9]+(,[0-9]+)*) -->")] as $m8
+| ([$m8[] | .ids | split(",")[] | tonumber] | unique) as $judged
+| [$r[] | select(.commit_id == $h and (.id as $id | any($judged[]; . == $id) | not) and (.user.login == $codex
       or (.author_association == "OWNER" and has("claude-review-findings: " + $h))))]
     | sort_by(.submitted_at) as $findings
 | ($retries | last // 0) as $last_retry
@@ -81,7 +88,8 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 | [ $now - $last,
     (if any($tc[]; has("<!-- codex-review-head: " + $h + " -->")
           or has("<!-- pr-guard: fallback head=" + $h + " ")
-          or has("<!-- claude-review-clean: " + $h + " -->"))
+          or has("<!-- claude-review-clean: " + $h + " -->")
+          or has("<!-- claude-judge-clean: head=" + $h + " "))
         or any($tr[]; has("claude-review-findings: " + $h)) then 1 else 0 end),
     ($findings | length),
     ($findings | last | .id // 0),
@@ -95,7 +103,9 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     $fix_reason,
     ($p.mergeable_state // "unknown"),
     (if $p.merged then 1 else 0 end),
-    ($retries | length)
+    ($retries | length),
+    ($m8 | length),
+    ($m8 | last | .ids // "-")
   ] | @tsv
 '
 
@@ -187,6 +197,15 @@ retry_fix() {
   summary "- retried fix $who$hs review=$1"
 }
 
+# rekick_merge <review ids>：把 Claude 判过可合的那条 M8 原样再发一次（只换开头那句话），
+# codex-approved-merge 的路径 E 会重新跑一遍：CI 绿了就合，H 上有没点名的新意见照样拦。
+rekick_merge() {
+  if [ "$MODE" = dry ]; then summary "- would re-request the merge check $who$hs"; return 0; fi
+  head_unchanged || return 0
+  post_comment "🤖 巡检：Claude 已判定剩下的意见不拦合并，但还没合上（多半是当时 CI 还没绿），再请合并检查跑一次。"$'\n\n'"<!-- claude-judge-clean: head=$H reviews=$1 -->"
+  summary "- re-requested the merge check $who$hs"
+}
+
 # sweep_pr <owner/名> <N> <private> <集成分支，没接共享自动化是 -> <watched 1/0>
 sweep_pr() {
   repo="$1" n="$2" private="$3" base="$4" watched="$5"
@@ -197,11 +216,11 @@ sweep_pr() {
   url="$(jq -r .html_url "$tmp/pr.json")"
   if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
 
-  local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries
+  local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
   facts="$(jq -rn --slurpfile pr "$tmp/pr.json" --slurpfile cs "$tmp/comments.json" --slurpfile rs "$tmp/reviews.json" \
     --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq")"
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
-    until_active until_passed fix_reason state merged total_retries <<<"$facts"
+    until_active until_passed fix_reason state merged total_retries judged judged_reviews <<<"$facts"
   echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
   # 0. 没人管：不叫审、不重修，告警一次。空闲 60 分钟再告，给人留时间改 base 或关掉。
@@ -243,8 +262,21 @@ sweep_pr() {
     return 0
   fi
 
-  # 5. 没意见也没合：重新请求审查。
   [ "$merged" = 0 ] || return 0
+
+  # 4b. Claude 判过可合（M8）还没合上：再请合并检查跑一次，不重审 —— 重审出来的同一批意见
+  #     是新 review，M8 没点它的名，反而会把这个 head 拦死。
+  if [ "$judged" -gt 0 ]; then
+    [ "$idle" -ge 3600 ] || { echo "  等合并检查"; return 0; }
+    if [ "$judged" -le "$max_merge_rekicks" ]; then
+      rekick_merge "$judged_reviews"
+    else
+      alert_once stalled - "🤖 巡检：Claude 判定剩下的意见不拦合并，但合并检查跑了 $judged 次都没合上，请打开 PR 看看（多半是 CI 红）。"
+    fi
+    return 0
+  fi
+
+  # 5. 没意见也没合：重新请求审查。
   if ! { [ "$referenced" = 0 ] && [ "$idle" -ge 1800 ]; } && [ "$idle" -lt 3600 ]; then
     echo "  还不够空闲"; return 0
   fi

@@ -148,6 +148,38 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   assert_contains "$(fake_last_body 'curl ')" 'CODEX_TRIGGER_TOKEN 缺失'
 }
 
+# Codex 2026-10-04 的 P1：两个 judge 判同一个 head，先停后放的话放行会盖过停车。
+@test "a head another judge already stopped gets no M8, even when this verdict is all P2" {
+  STRUCTURED_OUTPUT="$(verdict merge '都是小问题' "$(item P2 '措辞')")"
+  export STRUCTURED_OUTPUT
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 3 melody OWNER "已停。$(m6_marker "$H" round-cap)")")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$output" 'already judged'
+  refute_called 'gh api POST repos/o/r/issues/7/comments'
+  refute_called 'gh pr comment'
+  refute_called 'curl '
+}
+
+@test "a head another judge already cleared gets no second M8 and no alert" {
+  STRUCTURED_OUTPUT="$(verdict stop 'bug' "$(item P1 'bug')")"
+  export STRUCTURED_OUTPUT
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=901 -->")")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_called 'gh api POST repos/o/r/issues/7/comments'
+  refute_called 'gh pr comment'
+}
+
+@test "a forged judgment by claude[bot] does not stop a real verdict" {
+  STRUCTURED_OUTPUT="$(verdict merge '都是小问题' "$(item P2 '措辞')")"
+  export STRUCTURED_OUTPUT
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 3 'claude[bot]' NONE "$(m6_marker "$H" round-cap)")")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_called 'gh api POST repos/o/r/issues/7/comments' 1
+}
+
 @test "a round-cap alert already on record is not sent twice" {
   STRUCTURED_OUTPUT="$(verdict stop 'bug' "$(item P1 'bug')")"
   export STRUCTURED_OUTPUT
@@ -270,6 +302,7 @@ prepare_repo() {
   job="$(awk '/^  round-cap-judge:/{on=1} on' "$REPO_ROOT/$WF")"
   assert_contains "$job" 'needs: iterate'
   assert_contains "$job" "if: needs.iterate.outputs.judge == 'true'"
+  assert_contains "$job" $'concurrency:\n      group: round-cap-judge-${{ github.event.pull_request.number }}\n      cancel-in-progress: false\n'
   assert_contains "$job" $'permissions:\n      contents: read\n      pull-requests: read\n      issues: read\n'
   assert_contains "$job" 'shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}'
   n=0; s="$job"
