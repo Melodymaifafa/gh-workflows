@@ -619,6 +619,44 @@ summon_env() {
   refute_called "gh pr comment"
 }
 
+# MEL-292：github-actions[bot] 推的提交，CI 会被 GitHub 扣成 action_required 等人批。
+HELD="repos/o/r/actions/runs?head_sha=$H2&status=action_required&per_page=100"
+
+@test "summon: approves the CI runs GitHub held on the commit this round pushed" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  fake_route "$HELD" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\"},{\"id\":12,\"head_sha\":\"$H\"}]}" 1
+  fake_route "$HELD" '{"workflow_runs":[]}' 2
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
+  refute_called "actions/runs/12/approve"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+@test "summon: a head this round did not push gets no approval" {
+  summon_env
+  export PUSHED_HEAD="$H"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  refute_called "actions/runs"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+@test "summon: a token without Actions write only warns; the summon still goes out" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  fake_route "$HELD" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\"}]}"
+  fake_route_fail -X POST repos/o/r/actions/runs/11/approve 1
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_contains "$output" "CODEX_TRIGGER_TOKEN needs Actions: Read and write"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
 # 本票堵的那个洞：这一步手上是 CODEX_TRIGGER_TOKEN（真人账号的 fine-grained PAT），
 # 而排在它前面的验证那一步跑的是被审 PR 自己的命令 —— PR 往「自己写得动的 PATH 目录」
 # 放一个假 gh，这一步去跑它，令牌就直接落到 PR 手上。所以它的命令只从我们写不动的
