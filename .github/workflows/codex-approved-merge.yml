@@ -823,7 +823,10 @@ jobs:
       - name: Claude review
         id: review
         continue-on-error: true
-        uses: anthropics/claude-code-action@a4f54ef2c58884867281bd8e2f8d63352ad019a9 # v1.0.229
+        # 钉的版本必须认得默认模型：v1.0.229 自带的 Claude Code 2.1.276 调 claude-opus-5-5 时请求一发出去
+        # 就报错（0.4 秒、零花费，2026-10-04 round-cap-judge 演练实测），代审从没真正跑成过。跟 fixer 的
+        # @v1 当天解析到的同一个提交；round-cap-judge 钉同一个（tests/round-cap-judge.bats 盯着两处一致）。
+        uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # 只读的 GITHUB_TOKEN：action 不再换 App token，Claude 也发不了任何东西。

@@ -403,7 +403,11 @@ prepare_repo() {
   n=0; s="$job"
   while [[ "$s" == *'persist-credentials: false'* ]]; do s="${s#*'persist-credentials: false'}"; n=$((n + 1)); done
   assert_equal "$n" 2
-  assert_contains "$job" 'uses: anthropics/claude-code-action@a4f54ef2c58884867281bd8e2f8d63352ad019a9'
+  assert_contains "$job" 'uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea'
+  # 和代审钉同一个版本：旧版本认不得默认模型时两处一起坏，升级也一起升。
+  reviewer_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' "$REPO_ROOT/.github/workflows/codex-approved-merge.yml")"
+  judge_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' <<<"$job")"
+  assert_equal "$judge_pin" "$reviewer_pin"
   # 主路径的触发者是 Codex bot：不放行它，Claude 一次都不跑。
   assert_contains "$job" 'allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"'
   assert_contains "$job" 'continue-on-error: true'

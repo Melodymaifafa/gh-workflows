@@ -3050,7 +3050,7 @@ jobs:
       - name: Claude judges the leftover findings
         id: judge
         continue-on-error: true
-        uses: anthropics/claude-code-action@a4f54ef2c58884867281bd8e2f8d63352ad019a9 # v1.0.229
+        uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # 修满轮数通常是 Codex bot 的 review 触发的，action 默认不认 bot 触发者（防循环），不放行
