@@ -1152,6 +1152,35 @@ EOS
   done
 }
 
+# 上面那段 PATH 过滤是 bash 代码，得先有一个 bash 来跑它。runner 按 PATH 找 bash 的话，
+# 验证命令往 ~/.local/bin 放一个假的，下一步的令牌在过滤之前就交出去了（MEL-278）。
+@test "claude: every run step in the iterate job starts from an absolute bash, never one found on PATH" {
+  job_shell="$(awk '
+    $0 == "  iterate:"               { in_job = 1; next }
+    in_job && $0 == "    steps:"     { exit }
+    in_job && $0 == "    defaults:"  { in_def = 1; next }
+    in_def && $0 == "      run:"     { in_run = 1; next }
+    in_run && /^        shell: /     { sub(/^        shell: /, ""); print; exit }
+  ' "$REPO_ROOT/$WF")"
+  assert_equal "$job_shell" "/usr/bin/bash --noprofile --norc -eo pipefail {0}"
+  # 单步写 `shell: bash` 会盖掉 job 层那条，同一个洞原样回来。
+  overrides="$(awk '
+    $0 == "    steps:"                      { in_steps = 1; next }
+    in_steps && /^        shell: / && !/^        shell: \// { print NR": "$0 }
+  ' "$REPO_ROOT/$WF")"
+  assert_equal "$overrides" ""
+}
+
+# action 自己的步骤写的是 `shell: bash`，不吃 job 层的默认，照样按 PATH 找 bash。
+# 验证命令之后再出现一个 `uses:`，MEL-278 的洞就从那一步回来。
+@test "claude: no action step runs after the first verify step, where it would find bash on PATH" {
+  late_uses="$(awk '
+    $0 == "      - name: Verify the Claude fix" { after = 1; next }
+    after && /^      - uses: |^        uses: / { print NR": "$0 }
+  ' "$REPO_ROOT/$WF")"
+  assert_equal "$late_uses" ""
+}
+
 # ---------- 门禁：谁跑得到验证和推送这两步 ----------
 
 claude_mode_context() {
