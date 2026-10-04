@@ -1263,6 +1263,8 @@ jobs:
             credentialed_git push -q origin "HEAD:$HEAD_REF"
             new_head="$(sealed_git rev-parse HEAD)"
             echo 'pushed=true' >>"$GITHUB_OUTPUT"
+            # 召唤复审那一步只批这个提交上被 GitHub 扣住的 CI（MEL-292）。
+            echo "head=$new_head" >>"$GITHUB_OUTPUT"
             echo '- verification: passed, the fix was pushed' >>"$GITHUB_STEP_SUMMARY"
 
             # M7 轮数标记：两条路都在这里发。以前 Claude 那半边在 Check the fix outcome 里发、
@@ -2655,6 +2657,7 @@ jobs:
           REVIEWED_SHA: ${{ steps.gate.outputs.head }}
           REVIEWED_AT: ${{ github.event.review.submitted_at }}
           FIX_ROUND: ${{ steps.gate.outputs.round }}
+          PUSHED_HEAD: ${{ steps.claude_push.outputs.head || steps.codex_push.outputs.head }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
         run: |
@@ -2729,6 +2732,36 @@ jobs:
             exit 0
           fi
 
+          # 机器人（github-actions[bot]）推的提交，它触发的 CI 在有的仓库会被 GitHub 扣成
+          # action_required、等人点 Approve and run；没人点，CI 不跑，合并那一环等到超时
+          # 就停了（MEL-292）。这把令牌是真人账号的，批得动 —— 但只批「本轮自己刚推的
+          # 那个提交」上被扣住的 run，别人推的提交一概不碰。被扣住的 run 长这样：
+          # status=completed、conclusion=action_required（Codex 2026-10-04 的 P1）。
+          # 一次推送会触发好几个 workflow，GitHub 不一定同时、也不一定马上把它们建出来，
+          # 所以召唤前连看 60 秒、每 10 秒一眼，看到被扣的就批；冷却过后再看一眼。等待不挂
+          # 在召唤冷却上：Claude 修得久、冷却早过了，也照样看满 60 秒。令牌没有 Actions 写
+          # 权限时只 warning 一次就不再试：CI 照旧等人点，召唤照发。
+          approve_held_runs() { # approve_held_runs <looks>
+            [[ "${PUSHED_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] && [ "$head_sha" = "$PUSHED_HEAD" ] || return 0
+            local look ids id
+            for ((look = 1; look <= $1; look++)); do
+              [ "$look" -eq 1 ] || sleep 10
+              ids="$(gh api "repos/$REPO/actions/runs?head_sha=$PUSHED_HEAD&per_page=100" \
+                --jq ".workflow_runs[] | select(.head_sha == \"$PUSHED_HEAD\" and .conclusion == \"action_required\") | .id")" || {
+                echo "::warning::cannot list the CI runs on $PUSHED_HEAD"
+                return 0
+              }
+              for id in $ids; do
+                if ! gh api -X POST "repos/$REPO/actions/runs/$id/approve" --silent; then
+                  echo "::warning::could not approve held run $id; CODEX_TRIGGER_TOKEN needs Actions: Read and write"
+                  return 0
+                fi
+                echo "approved held run $id on $PUSHED_HEAD"
+              done
+            done
+          }
+          approve_held_runs 7
+
           reviewed_epoch="$(date -d "$REVIEWED_AT" +%s)"
 
           # 召唤距上轮 review 至少 6 分钟：实测（2026-07-15 PR #54/#62）连发数次后
@@ -2745,6 +2778,8 @@ jobs:
             echo "PR HEAD changed while waiting; skipping stale Codex re-review"
             exit 0
           fi
+
+          approve_held_runs 1
 
           # fix-round 标记是轮数计数器：用主人令牌写，修复的 Claude 改不了
           printf -v request_body \

@@ -619,6 +619,98 @@ summon_env() {
   refute_called "gh pr comment"
 }
 
+# MEL-292：github-actions[bot] 推的提交，CI 会被 GitHub 扣成 action_required 等人批。
+# 被扣住的 run 是 status=completed、conclusion=action_required（10-04 wf-smoke-test 实测）。
+RUNS="repos/o/r/actions/runs?head_sha=$H2&per_page=100"
+held() { printf '{"id":%s,"head_sha":"%s","status":"completed","conclusion":"action_required"}' "$1" "${2:-$H2}"; }
+queued() { printf '{"id":%s,"head_sha":"%s","status":"queued","conclusion":null}' "$1" "${2:-$H2}"; }
+runs_seq() { # runs_seq <seq> [run-json ...]
+  local n="$1"; shift
+  fake_route "$RUNS" "{\"workflow_runs\":$(json_array "$@")}" "$n"
+}
+
+@test "summon: approves the CI runs GitHub held on the commit this round pushed" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  runs_seq 1 "$(held 11)" "$(held 12 "$H")" "$(queued 13)"
+  runs_seq 2 "$(queued 11)" "$(queued 13)"
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
+  refute_called "actions/runs/12/approve"
+  refute_called "actions/runs/13/approve"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+# Codex 2026-10-04 的 P2（第一条）：Claude 修得久、冷却早过了，两次批准就挨在一起跑；
+# run 晚几秒才建出来的话两次都扑空。所以召唤前连看 60 秒，不挂在冷却上。
+@test "summon: watches for a minute before summoning, even past the cooldown" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  # 召唤前后各只看一眼的话，两眼都扑空，第三眼才有 —— 永远批不到。
+  runs_seq 1
+  runs_seq 2
+  runs_seq 3 "$(held 11)"
+  runs_seq 4 "$(queued 11)"
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_called "sleep 10" 6
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+# Codex 2026-10-04 的 P2（第二条）：一次推送触发好几个 workflow，先建出来的那个不一定是
+# 被扣的。看到第一个 run 就停，晚到的那个被扣的就漏了。
+@test "summon: a held run that shows up after another run is still approved" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  runs_seq 1 "$(queued 13)"
+  runs_seq 2 "$(queued 13)"
+  runs_seq 3 "$(queued 13)" "$(held 11)"
+  runs_seq 4 "$(queued 13)" "$(queued 11)"
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
+}
+
+@test "summon: no run ever shows up -> gives up after a minute and still summons" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  runs_seq 1
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  refute_called "/approve"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+@test "summon: a head this round did not push gets no approval" {
+  summon_env
+  export PUSHED_HEAD="$H"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  refute_called "actions/runs"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+@test "summon: a token without Actions write only warns; the summon still goes out" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  runs_seq 1 "$(held 11)"
+  fake_route_fail -X POST repos/o/r/actions/runs/11/approve 1
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_contains "$output" "CODEX_TRIGGER_TOKEN needs Actions: Read and write"
+  # 批不了就不在这一分钟里反复试：召唤前一次，冷却后再一次。
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 2
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
 # 本票堵的那个洞：这一步手上是 CODEX_TRIGGER_TOKEN（真人账号的 fine-grained PAT），
 # 而排在它前面的验证那一步跑的是被审 PR 自己的命令 —— PR 往「自己写得动的 PATH 目录」
 # 放一个假 gh，这一步去跑它，令牌就直接落到 PR 手上。所以它的命令只从我们写不动的

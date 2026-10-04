@@ -131,7 +131,7 @@ jobs:
 | `CODEX_TRIGGER_TOKEN` | 无法召唤 Codex 复审；Claude 撞额度时请不动 Codex 出补丁；Claude 代审结论发不出（告警 `pat-missing`）；巡检不能动手 |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
 
-`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write —— 覆盖全部仓库，接新仓库不用回去改 PAT。
+`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。
 
 `SWEEP_READ_TOKEN` 只存在本仓库（`gh secret set SWEEP_READ_TOKEN --repo Melodymaifafa/gh-workflows`，不走 `onboard.sh`）：另建一个 fine-grained PAT，**All repositories** + Metadata read + Contents read，巡检只用它读各仓库调用桩的 `base_branch`。不把 Contents 读权限加给 `CODEX_TRIGGER_TOKEN`，因为那个令牌会复制到每个仓库，任何一个仓库泄露就能读到所有私有仓库的代码。没设它，私有仓库的调用桩读不到，巡检退回只扫默认分支是 develop 的仓库，并在 run 里警告。
 

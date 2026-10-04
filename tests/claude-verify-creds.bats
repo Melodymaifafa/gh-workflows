@@ -1050,6 +1050,8 @@ EOS
 
   assert_equal "$status" 0
   assert_equal "$(step_output pushed)" true
+  # 召唤那一步只批这个提交上被扣住的 CI（MEL-292）
+  assert_equal "$(step_output head)" "$(git rev-parse HEAD)"
   assert_called 'gh pr comment 7 --repo o/r' 1
   # 正文比全等，顺带守住「标记里不许有触发词」：混进一句 @codex review 就红。
   assert_equal "$(fake_last_body 'gh pr comment')" "🤖 自动修复第 2 轮已推送。
