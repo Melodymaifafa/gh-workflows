@@ -620,49 +620,67 @@ summon_env() {
 }
 
 # MEL-292：github-actions[bot] 推的提交，CI 会被 GitHub 扣成 action_required 等人批。
+# 被扣住的 run 是 status=completed、conclusion=action_required（10-04 wf-smoke-test 实测）。
 RUNS="repos/o/r/actions/runs?head_sha=$H2&per_page=100"
+held() { printf '{"id":%s,"head_sha":"%s","status":"completed","conclusion":"action_required"}' "$1" "${2:-$H2}"; }
+queued() { printf '{"id":%s,"head_sha":"%s","status":"queued","conclusion":null}' "$1" "${2:-$H2}"; }
+runs_seq() { # runs_seq <seq> [run-json ...]
+  local n="$1"; shift
+  fake_route "$RUNS" "{\"workflow_runs\":$(json_array "$@")}" "$n"
+}
 
 @test "summon: approves the CI runs GitHub held on the commit this round pushed" {
   summon_env
   export PUSHED_HEAD="$H2"
   fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
-  fake_route "$RUNS" "{\"workflow_runs\":[
-    {\"id\":11,\"head_sha\":\"$H2\",\"status\":\"action_required\"},
-    {\"id\":12,\"head_sha\":\"$H\",\"status\":\"action_required\"},
-    {\"id\":13,\"head_sha\":\"$H2\",\"status\":\"queued\"}]}" 1
-  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"queued\"}]}" 2
+  runs_seq 1 "$(held 11)" "$(held 12 "$H")" "$(queued 13)"
+  runs_seq 2 "$(queued 11)" "$(queued 13)"
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
   assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
   refute_called "actions/runs/12/approve"
   refute_called "actions/runs/13/approve"
-  refute_called "sleep 10"
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 
-# Codex 2026-10-04 的 P2：Claude 修得久、冷却早过了，两次批准就挨在一起跑；run 晚几秒
-# 才建出来的话两次都扑空。所以先等这个提交上出现 run，等待不挂在冷却上。
-@test "summon: waits for GitHub to create the run before approving, even past the cooldown" {
+# Codex 2026-10-04 的 P2（第一条）：Claude 修得久、冷却早过了，两次批准就挨在一起跑；
+# run 晚几秒才建出来的话两次都扑空。所以召唤前连看 60 秒，不挂在冷却上。
+@test "summon: watches for a minute before summoning, even past the cooldown" {
   summon_env
   export PUSHED_HEAD="$H2"
   fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
-  # 两次批准各只查一遍的话，前两次都扑空，第三次才有 run —— 永远批不到。
-  fake_route "$RUNS" '{"workflow_runs":[]}' 1
-  fake_route "$RUNS" '{"workflow_runs":[]}' 2
-  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"action_required\"}]}" 3
-  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"queued\"}]}" 4
+  # 召唤前后各只看一眼的话，两眼都扑空，第三眼才有 —— 永远批不到。
+  runs_seq 1
+  runs_seq 2
+  runs_seq 3 "$(held 11)"
+  runs_seq 4 "$(queued 11)"
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
-  assert_called "sleep 10" 2
+  assert_called "sleep 10" 6
   assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
   assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+# Codex 2026-10-04 的 P2（第二条）：一次推送触发好几个 workflow，先建出来的那个不一定是
+# 被扣的。看到第一个 run 就停，晚到的那个被扣的就漏了。
+@test "summon: a held run that shows up after another run is still approved" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  runs_seq 1 "$(queued 13)"
+  runs_seq 2 "$(queued 13)"
+  runs_seq 3 "$(queued 13)" "$(held 11)"
+  runs_seq 4 "$(queued 13)" "$(queued 11)"
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
 }
 
 @test "summon: no run ever shows up -> gives up after a minute and still summons" {
   summon_env
   export PUSHED_HEAD="$H2"
   fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
-  fake_route "$RUNS" '{"workflow_runs":[]}'
+  runs_seq 1
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
   refute_called "/approve"
@@ -683,11 +701,13 @@ RUNS="repos/o/r/actions/runs?head_sha=$H2&per_page=100"
   summon_env
   export PUSHED_HEAD="$H2"
   fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
-  fake_route "$RUNS" "{\"workflow_runs\":[{\"id\":11,\"head_sha\":\"$H2\",\"status\":\"action_required\"}]}"
+  runs_seq 1 "$(held 11)"
   fake_route_fail -X POST repos/o/r/actions/runs/11/approve 1
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
   assert_contains "$output" "CODEX_TRIGGER_TOKEN needs Actions: Read and write"
+  # 批不了就不在这一分钟里反复试：召唤前一次，冷却后再一次。
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 2
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 

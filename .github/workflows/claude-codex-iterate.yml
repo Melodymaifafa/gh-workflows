@@ -2735,32 +2735,32 @@ jobs:
           # 机器人（github-actions[bot]）推的提交，它触发的 CI 在有的仓库会被 GitHub 扣成
           # action_required、等人点 Approve and run；没人点，CI 不跑，合并那一环等到超时
           # 就停了（MEL-292）。这把令牌是真人账号的，批得动 —— 但只批「本轮自己刚推的
-          # 那个提交」上被扣住的 run，别人推的提交一概不碰。令牌没有 Actions 写权限时只
-          # warning：CI 照旧等人点，召唤照发。GitHub 收到推送后要过几秒才把 run 建出来，
-          # 所以先等这个提交上出现任何一个 run（最多 60 秒），再批其中被扣住的；召唤前后
-          # 各批一次。等待不挂在召唤冷却上：Claude 修得久、冷却早过了，也照样等。
-          approve_held_runs() {
+          # 那个提交」上被扣住的 run，别人推的提交一概不碰。被扣住的 run 长这样：
+          # status=completed、conclusion=action_required（Codex 2026-10-04 的 P1）。
+          # 一次推送会触发好几个 workflow，GitHub 不一定同时、也不一定马上把它们建出来，
+          # 所以召唤前连看 60 秒、每 10 秒一眼，看到被扣的就批；冷却过后再看一眼。等待不挂
+          # 在召唤冷却上：Claude 修得久、冷却早过了，也照样看满 60 秒。令牌没有 Actions 写
+          # 权限时只 warning 一次就不再试：CI 照旧等人点，召唤照发。
+          approve_held_runs() { # approve_held_runs <looks>
             [[ "${PUSHED_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] && [ "$head_sha" = "$PUSHED_HEAD" ] || return 0
-            local runs ids id _
-            for _ in 1 2 3 4 5 6 7; do
-              runs="$(gh api "repos/$REPO/actions/runs?head_sha=$PUSHED_HEAD&per_page=100" \
-                --jq "[.workflow_runs[] | select(.head_sha == \"$PUSHED_HEAD\") | {id, status}]")" || {
+            local look ids id
+            for ((look = 1; look <= $1; look++)); do
+              [ "$look" -eq 1 ] || sleep 10
+              ids="$(gh api "repos/$REPO/actions/runs?head_sha=$PUSHED_HEAD&per_page=100" \
+                --jq ".workflow_runs[] | select(.head_sha == \"$PUSHED_HEAD\" and .conclusion == \"action_required\") | .id")" || {
                 echo "::warning::cannot list the CI runs on $PUSHED_HEAD"
                 return 0
               }
-              [ "$(jq length <<<"$runs")" -eq 0 ] || break
-              sleep 10
-            done
-            ids="$(jq -r '.[] | select(.status == "action_required") | .id' <<<"$runs")"
-            for id in $ids; do
-              if gh api -X POST "repos/$REPO/actions/runs/$id/approve" --silent; then
+              for id in $ids; do
+                if ! gh api -X POST "repos/$REPO/actions/runs/$id/approve" --silent; then
+                  echo "::warning::could not approve held run $id; CODEX_TRIGGER_TOKEN needs Actions: Read and write"
+                  return 0
+                fi
                 echo "approved held run $id on $PUSHED_HEAD"
-              else
-                echo "::warning::could not approve held run $id; CODEX_TRIGGER_TOKEN needs Actions: Read and write"
-              fi
+              done
             done
           }
-          approve_held_runs
+          approve_held_runs 7
 
           reviewed_epoch="$(date -d "$REVIEWED_AT" +%s)"
 
@@ -2779,7 +2779,7 @@ jobs:
             exit 0
           fi
 
-          approve_held_runs
+          approve_held_runs 1
 
           # fix-round 标记是轮数计数器：用主人令牌写，修复的 Claude 改不了
           printf -v request_body \
