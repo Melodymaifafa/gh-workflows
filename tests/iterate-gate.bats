@@ -16,8 +16,10 @@ setup() {
   export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp"
   mkdir -p "$RUNNER_TEMP" "$BATS_TEST_TMPDIR/work"
   cd "$BATS_TEST_TMPDIR/work" || return
-  export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token MAX_FIX_ROUNDS=5
+  export REPO=o/r PR_NUMBER=7 GH_TOKEN=test-token MAX_FIX_ROUNDS=5 HAS_PAT=true
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
+  # 修满轮数时 Gate 要列这个 head 上的全部 review（judged_already）；默认一条都没有。
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" '[]'
   run_block "$WF" "Define pr-guard helpers" >/dev/null
   # 验证命令之后的两步从这一步的 output 拿告警函数（真跑时由 env: 接过去），不读文件。
   export PR_GUARD; PR_GUARD="$(step_output script)"
@@ -128,9 +130,8 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   gate
   assert_equal "$status" 0
   assert_equal "$(step_output run)" false
+  assert_equal "$(step_output judge)" true
   assert_contains "$output" "round 6 exceeds max_fix_rounds 5"
-  assert_contains "$(fake_last_body "gh pr comment")" "reason=round-cap until=- -->"
-  assert_called "curl " 1
 }
 
 @test "gate: M7 from claude[bot] does not count" {
@@ -143,7 +144,9 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   assert_equal "$(step_output round)" 1
 }
 
-@test "gate: round 6 parks with the default cap of 5 and alerts once" {
+# 修满了不在 Gate 里停下告警：交给 round-cap-judge 那个 job 让 Claude 判剩下的意见，
+# 告警或放行标记都由那边发。
+@test "gate: round 6 hands the head to the round-cap judge instead of alerting" {
   codex_event
   live_head "$H"
   serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
@@ -151,13 +154,27 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   gate
   assert_equal "$status" 0
   assert_equal "$(step_output run)" false
-  assert_called "curl " 1
-  assert_called "gh pr comment 7 --repo o/r" 1
-  assert_equal "$(fake_last_body "gh pr comment")" "自动修了 5 轮还有新意见，已停。点 Merge 或关掉；推新提交会重新开始。
-
-<!-- pr-guard: alert head=$H reason=round-cap until=- -->"
-  assert_equal "$(fake_last_body "curl ")" "自动修了 5 轮还有新意见，已停。点 Merge 或关掉；推新提交会重新开始。"
+  assert_equal "$(step_output judge)" true
+  assert_equal "$(step_output head)" "$H"
+  refute_called "curl "
+  refute_called "gh pr comment"
   [ ! -e .review/findings.md ]
+}
+
+# Codex 2026-10-04 的 P2：没有 PAT，judge 的结论发不出去，巡检会一遍遍重新叫它。
+@test "gate: without the owner PAT the cap parks right here with a round-cap alert, as before" {
+  codex_event
+  export HAS_PAT=false
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
+  gate
+  assert_equal "$status" 0
+  assert_equal "$(step_output run)" false
+  refute_contains "$(cat "$GITHUB_OUTPUT")" "judge=true"
+  assert_called "gh pr comment 7 --repo o/r" 1
+  assert_contains "$(fake_last_body "gh pr comment")" "仓库没配 CODEX_TRIGGER_TOKEN"
+  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: alert head=$H reason=round-cap until=- -->"
 }
 
 @test "gate: max_fix_rounds input is honored (round 2 > 1 parks)" {
@@ -168,20 +185,63 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 1)")")"
   gate
   assert_equal "$(step_output run)" false
-  assert_contains "$(fake_last_body "gh pr comment")" "自动修了 1 轮还有新意见"
+  assert_equal "$(step_output judge)" true
+  assert_contains "$output" "round 2 exceeds max_fix_rounds 1"
 }
 
-@test "gate: an existing trusted round-cap marker suppresses a second alert" {
+@test "gate: a head the judge already stopped is not judged again" {
   codex_event
   live_head "$H"
   serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
   fake_route "$COMMENTS" "$(json_array \
     "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")" \
-    "$(gh_comment 3 'github-actions[bot]' NONE "已停。$(m6_marker "$H" round-cap)")")"
+    "$(gh_comment 3 melody OWNER "已停。$(m6_marker "$H" round-cap)")")"
   gate
   assert_equal "$(step_output run)" false
+  refute_contains "$(cat "$GITHUB_OUTPUT")" "judge=true"
+  assert_contains "$output" "already judged"
   refute_called "curl "
   refute_called "gh pr comment"
+}
+
+@test "gate: a head whose M8 names every findings review is not judged again" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(gh_review 4001 "$CODEX" NONE "$H" 'body')")"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")" \
+    "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=4001 -->")")"
+  gate
+  refute_contains "$(cat "$GITHUB_OUTPUT")" "judge=true"
+  assert_contains "$output" "already judged"
+}
+
+@test "gate: an M8 that github-actions[bot] wrote does not count as a verdict" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(gh_review 4001 "$CODEX" NONE "$H" 'body')")"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")" \
+    "$(gh_comment 3 'github-actions[bot]' NONE "<!-- claude-judge-clean: head=$H reviews=4001 -->")")"
+  gate
+  assert_equal "$(step_output judge)" true
+}
+
+# Codex 2026-10-04 的 P2：M8 之后同一个 head 上又来了新意见，它没被点过名，要重判；
+# 当成「判过了」的话巡检的重修一轮轮被忽略，最后误报 retry-exhausted。
+@test "gate: a findings review that arrived after the M8 gets a new judgment" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array \
+    "$(gh_review 4001 "$CODEX" NONE "$H" 'body')" "$(gh_review 4002 "$CODEX" NONE "$H" 'new')")"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")" \
+    "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=4001 -->")")"
+  gate
+  assert_equal "$(step_output judge)" true
 }
 
 @test "gate: markers from claude[bot] or a contributor are ignored" {
@@ -196,15 +256,17 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   assert_equal "$(step_output run)" true
   assert_equal "$(step_output round)" 1
 
-  # 真轮数 5 + claude[bot] 想清零的 fix-round 0 + 伪造的 round-cap 告警 → 仍然停、仍然告警
+  # 真轮数 5 + claude[bot] 想清零的 fix-round 0 + 伪造的 round-cap 告警 / 放行标记
+  # → 仍然停、仍然交给 judge
   : >"$GITHUB_OUTPUT"
   fake_route "$COMMENTS" "$(json_array \
     "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")" \
     "$(jq --arg h "$H" '.body |= gsub("[0-9a-f]{40}"; $h)' "$FIXTURES_DIR/forged/claude-bot-m1-comment.json")" \
-    "$(gh_comment 4 'claude[bot]' NONE "$(m6_marker "$H" round-cap)")")"
+    "$(gh_comment 4 'claude[bot]' NONE "$(m6_marker "$H" round-cap)")" \
+    "$(gh_comment 5 'claude[bot]' NONE "<!-- claude-judge-clean: head=$H reviews=4001 -->")")"
   gate
   assert_equal "$(step_output run)" false
-  assert_called "gh pr comment" 1
+  assert_equal "$(step_output judge)" true
 }
 
 @test "gate: owner M3 on this head is its own target, reviewer is Claude" {
@@ -684,6 +746,18 @@ runs_seq() { # runs_seq <seq> [run-json ...]
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
   refute_called "/approve"
+  assert_called "gh pr comment 7 --repo o/r" 1
+}
+
+# 10-04 wf-smoke-test 实测：令牌没有 Actions 权限时，第一步「列出 run」就被拒。
+@test "summon: a token that cannot even list runs says which permission it lacks" {
+  summon_env
+  export PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  fake_route_fail "$RUNS" 1
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_contains "$output" "cannot list the CI runs on $H2; CODEX_TRIGGER_TOKEN needs Actions: Read and write"
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 

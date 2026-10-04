@@ -155,6 +155,34 @@ model_guard_block() {
   assert_equal "$reviewer" "$fixer"
 }
 
+# round-cap-judge 在 iterate 红了时也跑，那边的先验拦不住它，所以有第三份同样的块。
+judge_guard_block() {
+  awk '/^  round-cap-judge:/{on=1} /^  round-cap-park:/{exit} on' "$REPO_ROOT/$WF" | awk '
+    /case "\$CLAUDE_MODEL" in/ { on = 1 }
+    on { print }
+    on && /^ *esac$/ { if (++n == 2) exit }
+  '
+}
+
+@test "judge: the round-cap judge carries the very same guard, before Claude runs" {
+  fixer="$(model_guard_block "$WF")"
+  assert_equal "$(judge_guard_block)" "$fixer"
+  job="$(awk '/^  round-cap-judge:/{on=1} /^  round-cap-park:/{exit} on' "$REPO_ROOT/$WF")"
+  guard_at="$(awk '/- name: Check the judge model and effort/{print NR; exit}' <<<"$job")"
+  judge_at="$(awk '/- name: Claude judges the leftover findings$/{print NR; exit}' <<<"$job")"
+  [ -n "$guard_at" ] && [ -n "$judge_at" ] || { echo 'guard or judge step missing' >&2; return 1; }
+  [ "$guard_at" -lt "$judge_at" ] || { echo "guard at $guard_at is after judge at $judge_at" >&2; return 1; }
+}
+
+@test "judge: the guard refuses a Sonnet model before the judge runs" {
+  export CLAUDE_MODEL=claude-sonnet-5 CLAUDE_EFFORT=xhigh
+  run run_block "$WF" "Check the judge model and effort"
+  assert_equal "$status" 1
+  export CLAUDE_MODEL=claude-opus-5-5
+  run run_block "$WF" "Check the judge model and effort"
+  assert_equal "$status" 0
+}
+
 # 先验必须排在 Claude 那一步前面，否则 action 已经带着错值启动了。
 @test "merge: the guard runs before the Claude review step" {
   job="$(awk '/^  claude-review:/{on=1} on' "$REPO_ROOT/$MERGE_WF")"

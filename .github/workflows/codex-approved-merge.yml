@@ -72,6 +72,12 @@ jobs:
         github.event.issue.pull_request &&
         github.event.comment.author_association == 'OWNER' &&
         contains(github.event.comment.body, 'claude-review-clean:')
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        github.event.comment.author_association == 'OWNER' &&
+        contains(github.event.comment.body, 'claude-judge-clean:')
       )
     concurrency:
       group: codex-clean-review-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -161,6 +167,7 @@ jobs:
 
           # H 上有没有待修的问题：任何时候的 Codex review，或可信的 M3。
           # 读不到 review 就直接失败，绝不当成「没问题」。
+          # 第二个参数：逗号分隔的 review id，路径 E 里 Claude 已逐条核过、判定不拦合并的那几条。
           has_findings() {
             local reviews found
             reviews="$(
@@ -168,9 +175,11 @@ jobs:
                 "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100"
             )" || { echo "::error::Cannot read PR reviews"; exit 1; }
             found="$(
-              jq -r --arg bot "$codex_login" --arg head "$1" '
-                (add // [])
+              jq -r --arg bot "$codex_login" --arg head "$1" --arg judged "${2:-}" '
+                ($judged | split(",") | map(select(. != "") | tonumber)) as $judged
+                | (add // [])
                 | any(.[];
+                    (.id as $id | any($judged[]; . == $id) | not) and
                     .commit_id == $head and (
                       .user.login == $bot or (
                         (.user.login == "github-actions[bot]" or
@@ -240,6 +249,7 @@ jobs:
           signoff_id=
           signoff_at=
           signoff_kind=
+          judged_reviews=
 
           if [ -n "$EVENT_HEAD" ]; then
             # For automatic reviews, bind the watcher to the event's head SHA.
@@ -323,13 +333,38 @@ jobs:
               signoff_id="$TARGET_ID"
               signoff_at="$comment_created_at"
               signoff_kind=claude
+            elif [ "$association" = OWNER ] &&
+              [[ "$body" == *'claude-judge-clean:'* ]]
+            then
+              # 路径 E：自动修满轮数后，Claude 逐条核过 Codex 在这个 head 上剩下的意见，
+              # 判定都不拦合并（M8，claude-codex-iterate 的 round-cap judge 发）。只认主人写的、
+              # 绑定当前 head 的标记，而且只放过标记里点名的那几条 review：Codex 之后在
+              # 这个 head 上再出的 review 照样拦。
+              judge_marker="$(
+                sed -nE \
+                  's/.*<!--[[:space:]]*claude-judge-clean: head=([0-9a-f]{40}) reviews=([0-9]+(,[0-9]+)*)[[:space:]]*-->.*/\1 \2/p' \
+                  <<<"$body" |
+                  head -1
+              )"
+              if [ -z "$judge_marker" ]; then
+                echo "::notice::Claude judge result has no exact HEAD binding"
+                exit 0
+              fi
+              if [ "$expected_head" != "${judge_marker%% *}" ]; then
+                echo "::notice::Claude judge result targets a stale PR head"
+                exit 0
+              fi
+              judged_reviews="${judge_marker#* }"
+              signoff_id="$TARGET_ID"
+              signoff_at="$comment_created_at"
+              signoff_kind=judge
             else
               echo "::notice::Review request is no longer eligible"
               exit 0
             fi
           fi
 
-          if has_findings "$expected_head"; then
+          if has_findings "$expected_head" "$judged_reviews"; then
             echo "::notice::PR head $expected_head has review findings; not merging"
             exit 0
           fi
@@ -626,6 +661,18 @@ jobs:
               echo "::notice::Claude clean comment changed; skipping"
               exit 0
             fi
+          elif [ "$signoff_kind" = judge ]; then
+            clean_comment="$(
+              gh api "repos/$REPO/issues/comments/$signoff_id"
+            )"
+            clean_association="$(jq -r .author_association <<<"$clean_comment")"
+            clean_body="$(jq -r .body <<<"$clean_comment")"
+            if [ "$clean_association" != OWNER ] ||
+              [[ "$clean_body" != *"<!-- claude-judge-clean: head=$expected_head reviews=$judged_reviews -->"* ]]
+            then
+              echo "::notice::Claude judge comment changed; skipping"
+              exit 0
+            fi
           else
             clean_comment="$(
               gh api "repos/$REPO/issues/comments/$signoff_id"
@@ -651,7 +698,7 @@ jobs:
             fi
           fi
 
-          if has_findings "$expected_head"; then
+          if has_findings "$expected_head" "$judged_reviews"; then
             echo "::notice::Findings appeared on this head after the sign-off; skipping"
             exit 0
           fi

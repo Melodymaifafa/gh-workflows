@@ -412,6 +412,94 @@ $(m6_marker "$H" pat-missing)")")"
   refute_called 'gh pr merge'
 }
 
+# ---------- 路径 E：修满轮数后 Claude 逐条核过 Codex 剩下的意见（M8） ----------
+
+# m8_body <head> <review-ids>
+m8_body() {
+  printf '🤖 自动修满轮数，Codex 剩下的意见 Claude 核过都不拦合并。\n\n<!-- claude-judge-clean: head=%s reviews=%s -->' "$1" "$2"
+}
+
+codex_findings_on_h() { # codex_findings_on_h <id> ...
+  local id reviews=()
+  for id in "$@"; do reviews+=("$(gh_review "$id" "$CODEX" NONE "$H" 'P2 nit')"); done
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "${reviews[@]}")"
+}
+
+@test "path E: an OWNER M8 merges past exactly the Codex reviews it judged" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 901,902)")"
+  codex_findings_on_h 901 902
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+  refute_called 'sleep 30'
+  refute_fallback
+}
+
+@test "path E: a Codex review on H the judge never saw still blocks the merge" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 901)")"
+  codex_findings_on_h 901 902
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'has review findings'
+  refute_called 'gh pr merge'
+}
+
+@test "path E: findings that land after the M8 still block the merge" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 901)")"
+  green_checks
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
+    "$(json_array "$(gh_review 901 "$CODEX" NONE "$H" 'P2 nit')")" 1
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
+    "$(json_array "$(gh_review 901 "$CODEX" NONE "$H" 'P2 nit')" "$(gh_review 903 "$CODEX" NONE "$H" 'new')")" 2
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'Findings appeared on this head'
+  refute_called 'gh pr merge'
+}
+
+@test "path E refuses an M8 for a stale head" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$OTHER" 901)")"
+  codex_findings_on_h 901
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'stale PR head'
+  refute_called 'gh pr merge'
+}
+
+@test "path E refuses an M8 that is not written by the owner" {
+  path_d "$(gh_comment 600 'claude[bot]' NONE "$(m8_body "$H" 901)")"
+  codex_findings_on_h 901
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'no longer eligible'
+  refute_called 'gh pr merge'
+}
+
+@test "path E refuses when the M8 changed before the merge" {
+  export EVENT_HEAD='' TARGET_ID=600
+  fake_route repos/o/r/issues/comments/600 "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 901)")" 1
+  fake_route repos/o/r/issues/comments/600 "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 901,902)")" 2
+  codex_findings_on_h 901
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'Claude judge comment changed'
+  refute_called 'gh pr merge'
+}
+
+@test "a Codex review with findings still blocks path D: only an M8 can name it" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  codex_findings_on_h 901
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called 'gh pr merge'
+}
+
 @test "reading reviews fails closed: no merge" {
   path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
   green_checks
