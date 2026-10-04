@@ -2740,7 +2740,9 @@ jobs:
           # 一次推送会触发好几个 workflow，GitHub 不一定同时、也不一定马上把它们建出来，
           # 所以召唤前连看 60 秒、每 10 秒一眼，看到被扣的就批；冷却过后再看一眼。等待不挂
           # 在召唤冷却上：Claude 修得久、冷却早过了，也照样看满 60 秒。令牌没有 Actions 写
-          # 权限时只 warning 一次就不再试：CI 照旧等人点，召唤照发。
+          # 权限时只 warning 一次就不再试：CI 照旧等人点，召唤照发。权限不够时 403 先落在
+          # 「列 run」这一步、还没走到批准（2026-10-04 wf-smoke-test 20 号 PR 实测），所以
+          # 两条告警都点名缺的那一项，别让人看着「列不出来」猜不到要去加什么。
           approve_held_runs() { # approve_held_runs <looks>
             [[ "${PUSHED_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] && [ "$head_sha" = "$PUSHED_HEAD" ] || return 0
             local look ids id
@@ -2748,7 +2750,7 @@ jobs:
               [ "$look" -eq 1 ] || sleep 10
               ids="$(gh api "repos/$REPO/actions/runs?head_sha=$PUSHED_HEAD&per_page=100" \
                 --jq ".workflow_runs[] | select(.head_sha == \"$PUSHED_HEAD\" and .conclusion == \"action_required\") | .id")" || {
-                echo "::warning::cannot list the CI runs on $PUSHED_HEAD"
+                echo "::warning::cannot list the CI runs on $PUSHED_HEAD; CODEX_TRIGGER_TOKEN needs Actions: Read and write"
                 return 0
               }
               for id in $ids; do
