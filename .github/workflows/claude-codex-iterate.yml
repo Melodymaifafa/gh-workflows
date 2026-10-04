@@ -111,6 +111,13 @@ jobs:
     # 默认 360 分钟太长。Claude 最多 80 轮；换人那条路还要等 Codex 云端回补丁
     # （最多 15 分钟）和召唤复审的冷却（最多 6 分钟），所以留 60 分钟。
     timeout-minutes: 60
+    # 每个 run: 步骤都从写死位置的 bash 起跑（参数同 GitHub 对 `shell: bash` 的默认）。
+    # 不写的话 runner 按当时的 PATH 找 bash，而 PATH 第一项 ~/.local/bin 验证命令写得动：
+    # 它放一个假 bash，下一步一启动，假 bash 先拿到整步 env: 里的令牌再转交真 bash，
+    # 步骤里那段 PATH 过滤根本来不及跑（MEL-278）。写在 job 层，新加的步骤自动带上。
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
     steps:
       - uses: actions/checkout@v4
         with:
