@@ -343,6 +343,13 @@ PARK='Park the capped head'
   refute_called 'gh pr comment'
 }
 
+@test "park: after the second stage the fallback alert counts all ten rounds" {
+  export GH_TOKEN=actions-token ROUND=11
+  run run_block "$WF" "$PARK"
+  assert_equal "$status" 0
+  assert_contains "$(fake_last_body "gh pr comment")" '自动修了 10 轮还有新意见，已停。Claude 的判断这次没能发出来'
+}
+
 @test "park: a head that moved is left alone" {
   export GH_TOKEN=actions-token
   fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$OTHER\"}}"

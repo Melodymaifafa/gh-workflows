@@ -240,6 +240,16 @@ m9_event() { # m9_event <login> <assoc>
   assert_contains "$output" "already judged"
 }
 
+@test "gate: without the PAT after the second stage the alert counts all ten rounds" {
+  m9_event
+  export HAS_PAT=false
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 10)")")"
+  gate
+  assert_equal "$(step_output run)" false
+  assert_contains "$(fake_last_body "gh pr comment")" "自动修了 10 轮还有新意见，已停。仓库没配 CODEX_TRIGGER_TOKEN"
+}
+
 @test "gate: max_fix_rounds input is honored (round 2 > 1 parks)" {
   codex_event
   export MAX_FIX_ROUNDS=1

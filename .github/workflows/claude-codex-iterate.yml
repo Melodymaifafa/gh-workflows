@@ -1419,7 +1419,7 @@ jobs:
             # 没有主人的 PAT，judge 的结论（放行标记或停车告警）一条都发不出去，巡检会一遍遍
             # 重新叫它（Codex 2026-10-04 的 P2）。这种时候照旧在这里用本 job 的令牌停车告警。
             if [ "${HAS_PAT:-}" != true ]; then
-              alert_once "$H" round-cap - "自动修了 $MAX_FIX_ROUNDS 轮还有新意见，已停。仓库没配 CODEX_TRIGGER_TOKEN，Claude 判断不了剩下的意见能不能忽略。点 Merge 或关掉；推新提交会重新开始。"
+              alert_once "$H" round-cap - "自动修了 $((round - 1)) 轮还有新意见，已停。仓库没配 CODEX_TRIGGER_TOKEN，Claude 判断不了剩下的意见能不能忽略。点 Merge 或关掉；推新提交会重新开始。"
               skip "round $round exceeds max_fix_rounds $MAX_FIX_ROUNDS; no PAT to post a verdict with"
             fi
             {
@@ -3302,6 +3302,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ needs.iterate.outputs.head }}
           MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
+          ROUND: ${{ needs.iterate.outputs.round }}
           PR_GUARD: ${{ needs.iterate.outputs.pr_guard }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
@@ -3313,6 +3314,9 @@ jobs:
             echo '::error::the pr-guard helpers did not arrive from the iterate job'
             exit 1
           }
+          # ROUND 是 Gate 算出来的「下一轮」：第二阶段修到第 10 轮后兜底，要写 10 轮，不是 5 轮
+          # （Codex 2026-10-04 的 P2）。
+          [[ "${ROUND:-}" =~ ^[0-9]+$ ]] || ROUND="$((MAX_FIX_ROUNDS + 1))"
           live_head="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)"
           if [ "$live_head" != "$HEAD_SHA" ]; then
             echo "::notice::PR head moved to $live_head; nothing to park"
@@ -3322,4 +3326,4 @@ jobs:
             echo "::notice::$HEAD_SHA already carries a verdict"
             exit 0
           fi
-          alert_once "$HEAD_SHA" round-cap - "自动修了 $MAX_FIX_ROUNDS 轮还有新意见，已停。Claude 的判断这次没能发出来（多半是 CODEX_TRIGGER_TOKEN 缺失或失效）。点 Merge 或关掉；推新提交会重新开始。"
+          alert_once "$HEAD_SHA" round-cap - "自动修了 $((ROUND - 1)) 轮还有新意见，已停。Claude 的判断这次没能发出来（多半是 CODEX_TRIGGER_TOKEN 缺失或失效）。点 Merge 或关掉；推新提交会重新开始。"
