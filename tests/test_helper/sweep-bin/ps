@@ -16,10 +16,11 @@
 #   2. argv 里带本次 run 临时目录的其它进程。逃逸的残留靠这一条：它 setsid 换了会话、
 #      关光了描述符、被过继给 init，父子链上认不回来了，但它跑的还是本次 run 临时
 #      目录下那个探针脚本。
-#   3. 探针自己报过的 pid（GHWF_SWEEP_PROBE_PIDFILE 指的那个文件里的号码）。逃出去
-#      之后再 exec 成 /bin/sleep 这类普通程序的残留，argv 里一点标记都不剩，前两条
-#      都认不回它，跟机器上随便一个外人长得一样；exec 不换 pid，所以探针 exec 之前
-#      先把自己的 pid 写下来，这一条按号码认。只会多认，不会让别的少认。
+#   3. 探针自己报过的 pid（GHWF_SWEEP_PROBE_PIDFILE 指的那些文件里的号码）。两种
+#      情况前两条都认不回来：残留 exec 成 /bin/sleep 这类普通程序，argv 里一点标记
+#      都不剩；以及 macOS 的 ps 这一瞬读不到它的命令行、只给一个括号里的名字。
+#      pid 不受这两件事影响，所以每个探针起来时都先把自己的号码写下来，这一条按号码
+#      认。只会多认，不会让别的少认。
 #   4. 上面那些的后代 —— 验证命令和它还连着的子孙都在这里。
 #
 # 这条规则的失败方向是「少报」，所以它必须有自测，而且有：每个会活过验证命令的探针
@@ -38,8 +39,9 @@
 # GHWF_SWEEP_REAL_PS / GHWF_SWEEP_SELF / GHWF_SWEEP_RUN_TAG / GHWF_SWEEP_SELF_UID
 # 只给 tests/harness.bats 那几条用：进程表、「我们是谁」、本次标记、uid 全喂死，于是
 # 那几条在哪台机器上都是同一个答案，不靠真实 pid 撞不撞上表里的号码。
-# GHWF_SWEEP_PROBE_PIDFILE 是上面第 3 条的那个文件，由 exec 掉标记的探针所在的测试
-# 自己设（codex-takeover 那条 idle daemon）。
+# GHWF_SWEEP_PROBE_PIDFILE 是上面第 3 条的那些文件，冒号分隔，由跑探针的那两个套件
+# 在 setup 里一次设好（见 common.bash 里 scope_proc_sweep_to_this_run 旁边那段）。
+# 文件不存在、是空的、里面不是数字，都当没报 —— 这一条只往「多认」那边加。
 
 # 真正的 ps 只认绝对路径：这个目录就在 PATH 最前面，退回去按名字找会找回自己，
 # 变成无限递归。一个都找不到就红着停下 —— 清点问不出来，而静默空转比红了更糟。
@@ -125,11 +127,15 @@ filtered="$({
       # 3. 探针自己报过的 pid（exec 掉标记的残留靠这一条认回来）。文件不在、读不出来
       #    就当没报 —— 这一条只往「多认」那边加，不让别的少认。
       if (probe_pidfile != "") {
-        while ((getline d < probe_pidfile) > 0) {
-          split(d, w, " ")
-          if (w[1] ~ /^[0-9]+$/) root[w[1]] = 1
+        nf = split(probe_pidfile, pf, ":")
+        for (k = 1; k <= nf; k++) {
+          if (pf[k] == "") continue
+          while ((getline d < pf[k]) > 0) {
+            split(d, w, " ")
+            if (w[1] ~ /^[0-9]+$/) root[w[1]] = 1
+          }
+          close(pf[k])
         }
-        close(probe_pidfile)
       }
       # 4. 上面那些的后代。链子走到一半断了（那一环不在快照里）就算「说不清」，
       #    照答 —— 两次 ps 隔着一瞬，进程表本来就会对不齐，而说不清要往「多报」

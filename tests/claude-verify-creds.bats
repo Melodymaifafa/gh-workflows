@@ -33,6 +33,10 @@ setup() {
   # 残留清点按运行用户问「名下有谁」，本机上那等于「这台 Mac 上这个用户有谁」——
   # 隔壁 worker 的 bats 一起数进来。把回答这个问题的 ps 换成只认本次 run 的那一份
   # （见 common.bash 里 scope_proc_sweep_to_this_run）。
+  # 探针起来时都会把自己的号码写进这两个文件之一；那份 ps 按号码也认一次，所以
+  # argv 里的标记没了（exec 掉了、或者 macOS 这一瞬读不到命令行）也还认得出它是
+  # 我们的。文件这会儿还不存在，不要紧。
+  export GHWF_SWEEP_PROBE_PIDFILE="$BATS_TEST_TMPDIR/escaped.pid:$BATS_TEST_TMPDIR/leftover.pid"
   scope_proc_sweep_to_this_run
   : >"$GITHUB_OUTPUT"
 }

@@ -39,6 +39,10 @@ setup() {
   # 残留清点按运行用户问「名下有谁」，本机上那等于「这台 Mac 上这个用户有谁」——
   # 隔壁 worker 的 bats 一起数进来。把回答这个问题的 ps 换成只认本次 run 的那一份
   # （见 common.bash 里 scope_proc_sweep_to_this_run）。
+  # 探针起来时都会把自己的号码写进这两个文件之一；那份 ps 按号码也认一次，所以
+  # argv 里的标记没了（exec 掉了、或者 macOS 这一瞬读不到命令行）也还认得出它是
+  # 我们的。文件这会儿还不存在，不要紧。
+  export GHWF_SWEEP_PROBE_PIDFILE="$BATS_TEST_TMPDIR/escaped.pid:$BATS_TEST_TMPDIR/leftover.pid"
   scope_proc_sweep_to_this_run
   : >"$GITHUB_OUTPUT"
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
@@ -1506,7 +1510,6 @@ EOS
   # exec 之前把自己的 pid 报给那份 ps（exec 不换 pid），按号码认回来。
   # 不再套一层 shell 还有一个原因：套着的话 reap_escaped 收掉的只是外面那层 shell，
   # 里面的 sleep 被过继给 init、再活一分钟，跟后面那些清点进程的测试撞在一起。
-  export GHWF_SWEEP_PROBE_PIDFILE="$ESCAPE_PID"
   cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
 #!/bin/sh
 echo "$$" >"$ESCAPE_PID"

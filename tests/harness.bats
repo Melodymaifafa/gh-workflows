@@ -320,7 +320,9 @@ EOF
   # 都认不回它。探针 exec 之前把自己的 pid 报出来（exec 不换 pid），筛选按号码认。
   # 少了这一条，「残留不带标记」那种逃逸在整套测试里就没人管了。
   printf '700\n' >"$BATS_TEST_TMPDIR/probe.pid"
-  export GHWF_SWEEP_PROBE_PIDFILE="$BATS_TEST_TMPDIR/probe.pid"
+  # 跑探针的那两个套件在 setup 里一次给出全部号码文件，冒号分隔，而且允许其中某个
+  # 还不存在（探针没起来就没人写）。这里照那个样子喂：一个有号码、一个不存在。
+  export GHWF_SWEEP_PROBE_PIDFILE="$BATS_TEST_TMPDIR/probe.pid:$BATS_TEST_TMPDIR/never-written.pid"
   run sweep_ps_with_table 301 /tmp/bats-run-mine -U 501 -o pid=,args=
   assert_equal "$status" 0
   assert_contains "$output" '700 /bin/sleep 60'
