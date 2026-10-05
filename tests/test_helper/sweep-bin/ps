@@ -3,17 +3,23 @@
 # tests/test_helper/common.bash 里 scope_proc_sweep_to_this_run 的那段注释。
 #
 # 一句话：验证正文那道「按运行用户清点残留」问的是「这个 uid 名下有谁」，在 runner
-# 上这等于「我们自己起的有谁」（进程表干净），在本机上不等于 —— 同一台 Mac 上另一个
-# worker 的 `bats tests/` 跟我们同一个用户，它的进程于是被当成「验证命令留下的」。
-# 这一份把答案收窄回 runner 上那个意思：隔壁那次 bats run 整棵树不报，其余一律原样报。
+# 上这等于「本次 run 自己起的有谁」（进程表干净），在本机上不等于 —— 同一个用户名下
+# 还有隔壁 worker 的 `bats tests/`，以及 macOS 自己按需拉起来的一堆服务
+# （networkserviceproxy、iCloudHelper、mdworker…）。这一份把答案收窄回 runner 上那个
+# 意思：只答本次 run 自己的进程。
 #
-# 收窄的是「**隔壁那次 run**」，不是「不是我们起的」—— 两者差别就是这道门的全部价值：
-# 验证命令的逃逸进程 setsid 换了会话、关光了描述符、被过继给 init，认不回我们，但它
-# 同样认不回隔壁那棵树，所以照报、照红。探针测的还是原来那件事。
+# 「本次 run 自己的」按三条认，缺一条这道门就在本机上失效：
+#   1. 调用 ps 的那条祖先链（bats → 这一步的 shell → …）。
+#   2. 链上任何一个进程的后代 —— 验证命令和它还连着的子孙都在这里。
+#   3. argv 里带本次 run 临时目录的（$BATS_RUN_TMPDIR）。逃逸的残留靠这一条：它
+#      setsid 换了会话、关光了描述符、被过继给 init，父子链上认不回来了，但它跑的
+#      还是本次 run 临时目录下那个探针脚本。探针故意写成「从一个带路径的文件起」
+#      就是为了这条认得出它 —— 认不出就等于清点看不见它，那几条「必须红」的测试
+#      会假绿，所以它们本身就是这条规则的自测。
 #
-# GHWF_SWEEP_REAL_PS / GHWF_SWEEP_SELF 只给 tests/harness.bats 那两条用：喂一张固定的
-# 进程表 + 一个固定的「我们是谁」，那两条于是在哪台机器上都是同一个答案，不靠真实
-# pid 撞不撞上表里的号码。
+# GHWF_SWEEP_REAL_PS / GHWF_SWEEP_SELF / GHWF_SWEEP_RUN_TAG 只给 tests/harness.bats
+# 那几条用：进程表、「我们是谁」、本次标记全喂死，于是那几条在哪台机器上都是同一个
+# 答案，不靠真实 pid 撞不撞上表里的号码。
 
 # 真正的 ps 只认绝对路径：这个目录就在 PATH 最前面，退回去按名字找会找回自己，
 # 变成无限递归。一个都找不到就红着停下 —— 清点问不出来，而静默空转比红了更糟。
@@ -30,7 +36,7 @@ if [ ! -x "$real" ]; then
   exit 2
 fi
 
-# 只有「按 uid 全机清点」那一种调用会数到隔壁（`ps -U <uid>`）。按进程组那一下
+# 只有「按 uid 全机清点」那一种调用会数到别人（`ps -U <uid>`）。按进程组那一下
 # （`ps -e -o pgid=…`）本来就只看我们自己那个组号，原样放过。
 scoped=''
 for arg in "$@"; do
@@ -41,8 +47,8 @@ done
 status=0
 out="$("$real" "$@")" || status=$?
 # 全机快照问不出来就什么都不筛：宁可把今天的噪声留着，也不要悄悄少报一个残留。
-# -ww 不许截断命令行：Linux 的 ps 在不是终端的时候按 80 列裁，裁掉 bats-exec-* 那
-# 几个字就等于认不出隔壁那棵树的根，筛选于是变成空操作（本机不截断，看不出来）。
+# -ww 不许截断命令行：Linux 的 ps 在不是终端的时候按 80 列裁，裁掉探针脚本的路径
+# 就等于认不出它是本次 run 的（本机不截断，看不出来）。
 snap="$("$real" -A -ww -o pid=,ppid=,args= 2>/dev/null)" || snap=''
 if [ -z "$snap" ] || [ -z "$out" ]; then
   [ -z "$out" ] || printf '%s\n' "$out"
@@ -56,7 +62,8 @@ fi
 filtered="$({
   printf '%s\n' "$snap" | sed 's/^/S|/'
   printf '%s\n' "$out" | sed 's/^/O|/'
-} | awk -v self="${GHWF_SWEEP_SELF:-$PPID}" '
+} | awk -v self="${GHWF_SWEEP_SELF:-$PPID}" \
+      -v tag="${GHWF_SWEEP_RUN_TAG-${BATS_RUN_TMPDIR-}}" '
     substr($0, 1, 2) == "S|" {
       line = substr($0, 3)
       n = split(line, f, " ")
@@ -70,34 +77,32 @@ filtered="$({
     }
     substr($0, 1, 2) == "O|" { asked[++no] = substr($0, 3); next }
     END {
-      # 我们自己这条祖先链：从调用 ps 的那个 shell 一路往上。链上那些 bats 进程是
-      # 我们这次 run 的，不许被当成隔壁。
+      # 1. 调用 ps 的那条祖先链
       p = self; hops = 0
       while (p != "" && p != "0" && p != "1" && hops < 64) {
-        mine[p] = 1
+        root[p] = 1
         p = parent[p]
         hops++
       }
-      # 隔壁那次 run 的根：bats 自己那几个 exec 进程，而且不在我们这条链上。
-      # 认 bats-exec-* 而不认别的，是因为 bats run 里所有其它进程都挂在它们底下，
-      # 而我们的探针（`sh …/escape.sh`、`perl …`、`sleep`）谁都不长这个样子。
-      for (i = 1; i <= np; i++) {
-        p = seen[i]
-        if (!(p in mine) && cmd[p] ~ /bats-exec-/) elsewhere[p] = 1
+      # 3. argv 里带本次 run 临时目录的（逃逸的残留靠这一条认回来）
+      if (tag != "") {
+        for (i = 1; i <= np; i++) {
+          p = seen[i]
+          if (index(cmd[p], tag) > 0) root[p] = 1
+        }
       }
-      # 根加它的全部后代
+      # 2. 上面那些的后代
       for (i = 1; i <= np; i++) {
         p = seen[i]; q = p; hops = 0
         while (q != "" && q != "0" && q != "1" && hops < 64) {
-          if (q in elsewhere) { hide[p] = 1; break }
+          if (q in root) { ours[p] = 1; break }
           q = parent[q]
           hops++
         }
       }
       for (i = 1; i <= no; i++) {
         split(asked[i], g, " ")
-        if (g[1] in hide) continue
-        print asked[i]
+        if (g[1] in ours) print asked[i]
       }
     }')" || {
   echo 'sweep-bin/ps: the filter failed; answering with the unfiltered sweep' >&2

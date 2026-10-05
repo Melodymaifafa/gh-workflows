@@ -1272,17 +1272,25 @@ done'
 # 就能把钥匙捞走。守的是：验证跑完连整个进程组一起收掉，收干净之前不许把凭据塞
 # 回去。探针盯着 .git/config，一看到凭据回来就抄走 —— 战利品不存在 = 它在凭据回
 # 来之前就被收掉了。循环有上限，万一收不掉也不会把测试挂死。
+# 载荷写成本次 run 临时目录下的一个文件再后台跑，不写成匿名子 shell：本机跑测试时，
+# 清点按「argv 里带不带本次 run 的临时目录」认哪些进程是我们的（见
+# tests/test_helper/sweep-bin/ps）。匿名子 shell 的 argv 是光秃秃一个 `(bash)`，
+# 清点于是看不见它 —— 而「它必须被收掉」正是这两条要证明的事。
 leftover_probe() { # leftover_probe [收到 TERM 不退的写法]
-  printf 'cfg="$PWD/.git/config"
-loot=%s/payload-loot.txt
-( %s
-  i=0
-  while [ "$i" -lt 20000 ]; do
-    if grep -q extraheader "$cfg" 2>/dev/null; then cp "$cfg" "$loot"; exit 0; fi
-    i=$((i + 1))
-  done ) >/dev/null 2>&1 &
+  cat >"$BATS_TEST_TMPDIR/leftover.sh" <<EOS
+#!/bin/sh
+${1:-}
+cfg="\$1"
+loot=$BATS_TEST_TMPDIR/payload-loot.txt
+i=0
+while [ "\$i" -lt 20000 ]; do
+  if grep -q extraheader "\$cfg" 2>/dev/null; then cp "\$cfg" "\$loot"; exit 0; fi
+  i=\$((i + 1))
+done
+EOS
+  printf '/bin/sh %s/leftover.sh "$PWD/.git/config" >/dev/null 2>&1 &
 echo "$!" >%s/leftover.pid
-' "$BATS_TEST_TMPDIR" "${1:-}" "$BATS_TEST_TMPDIR"
+' "$BATS_TEST_TMPDIR" "$BATS_TEST_TMPDIR"
 }
 
 leftover_state() {
@@ -1472,12 +1480,16 @@ EOS
 # 「那一刻这个用户名下一个残留都没有」。
 @test "takeover: an idle daemon left behind is caught even though it steals nothing" {
   escaped_probe
-  # 换掉载荷：什么都不偷，只是活着。exec 掉之后 pid 不变，收尾那一下收的正是它。
+  # 换掉载荷：什么都不偷，只是活着。报出来的 pid 就是它自己写下的那个。
   # 走 /bin/sleep 的绝对路径：测试环境里 PATH 上那个假 sleep 压根不睡。
+  # 这里**不** exec 成 /bin/sleep：本机跑测试时，清点按「argv 里带不带本次 run 的
+  # 临时目录」认哪些进程是我们的（见 tests/test_helper/sweep-bin/ps）。exec 之后
+  # argv 变成光秃秃一个 `/bin/sleep 12`，什么线索都不剩，清点看不见它、这一条假绿
+  # （实测过一次）。留着这层 shell，活着的那个进程 argv 里就一直带着探针脚本的路径。
   cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
 #!/bin/sh
 echo "$$" >"$ESCAPE_PID"
-exec /bin/sleep 12
+/bin/sleep 12
 EOS
   push_workspace "$ESCAPE_VERIFY"
 

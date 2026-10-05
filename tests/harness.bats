@@ -232,68 +232,88 @@ YML
 
 # ---------- 只认本次 run 的那份 ps（MEL-304） ----------
 
-# 验证正文那道清点按运行用户问「名下有谁」。本机上另一个 worker 的 `bats tests/` 跟
-# 我们同一个用户，它的进程会被当成「验证命令留下的」，整套测试随机变红。tests 里那份
-# ps（tests/test_helper/sweep-bin/ps）把答案收窄回 runner 上那个意思。
-# 这两条钉住它收窄到哪儿：隔壁那棵 bats 树整个不报，别的一个都不少报 —— 尤其是逃出
-# 进程组、被过继给 init 的那种残留，那正是这道门要抓的东西，少报一个就是假绿。
-# 进程表是喂进去的（GHWF_SWEEP_REAL_PS），所以这两条在哪台机器上都是同一个答案。
-sweep_ps_with_table() { # sweep_ps_with_table <args…>
+# 验证正文那道清点按运行用户问「名下有谁」。本机上那个名下还有隔壁 worker 的
+# `bats tests/`，以及 macOS 自己按需拉起来的一堆服务，它们会被当成「验证命令留下的」，
+# 整套测试随机变红。tests 里那份 ps（tests/test_helper/sweep-bin/ps）把答案收窄回
+# runner 上那个意思：只答本次 run 自己的进程。
+# 下面三条钉住「本次 run 自己的」是哪三类，以及按进程组那一道一个字不许改。
+# 进程表、「我们是谁」、本次标记全是喂进去的，所以在哪台机器上都是同一个答案。
+sweep_ps_with_table() { # sweep_ps_with_table <我们是谁的 pid> <本次 run 的标记> <args…>
   local fake="$BATS_TEST_TMPDIR/table-ps"
   cat >"$fake" <<'EOF'
 #!/bin/sh
 # 两种问法答同一张表：-A 是快照（带 ppid），别的是清点自己要的格式。
+#   1    launchd；谁的祖先都不是
+#   100  隔壁那次 run 的 bats，101 它的测试进程，102 它起的 sleep
+#   300  我们这次 run 的 bats，301 这一步的 shell（清点从这儿问出来），302 它的子进程
+#   400  我们的逃逸残留：被过继给 init，argv 里还带着本次 run 的临时目录
+#   500  macOS 按需拉起来的服务：谁的后代都不是、也不带标记
 case " $* " in
   *" -A "*) printf '%s\n' \
       '    1     0 /sbin/launchd' \
       '  100     1 bash /opt/bats-core/libexec/bats-core/bats-exec-suite --x' \
       '  101   100 bash /opt/bats-core/libexec/bats-core/bats-exec-test --x' \
       '  102   101 sleep 10' \
-      '  200     1 sh /tmp/bats-run-zzz/test/9/escape.sh' ;;
+      '  300     1 bash /opt/bats-core/libexec/bats-core/bats-exec-test --mine' \
+      '  301   300 bash /tmp/run-mine/block-Verify.sh' \
+      '  302   301 git status' \
+      '  400     1 /bin/sh /tmp/run-mine/escapee.sh' \
+      '  500     1 /usr/libexec/networkserviceproxy' ;;
   *) printf '%s\n' \
       '    1 /sbin/launchd' \
       '  100 bash /opt/bats-core/libexec/bats-core/bats-exec-suite --x' \
       '  101 bash /opt/bats-core/libexec/bats-core/bats-exec-test --x' \
       '  102 sleep 10' \
-      '  200 sh /tmp/bats-run-zzz/test/9/escape.sh' ;;
+      '  300 bash /opt/bats-core/libexec/bats-core/bats-exec-test --mine' \
+      '  301 bash /tmp/run-mine/block-Verify.sh' \
+      '  302 git status' \
+      '  400 /bin/sh /tmp/run-mine/escapee.sh' \
+      '  500 /usr/libexec/networkserviceproxy' ;;
 esac
 EOF
   chmod +x "$fake"
-  # 「我们是谁」也喂死（GHWF_SWEEP_SELF）：真用调用者的 pid，表里那几个号码万一撞上
-  # 就换一个答案 —— 容器里 pid 从小数开始，撞得上。
-  GHWF_SWEEP_REAL_PS="$fake" GHWF_SWEEP_SELF="${1:-9}" "$SWEEP_BIN_DIR/ps" "${@:2}"
+  GHWF_SWEEP_REAL_PS="$fake" GHWF_SWEEP_SELF="$1" GHWF_SWEEP_RUN_TAG="$2" \
+    "$SWEEP_BIN_DIR/ps" "${@:3}"
 }
 
-@test "the scoped ps drops another bats run's whole tree and nothing else" {
-  # 清点是从 999（表里没有、也不是任何人的后代）那儿问出来的 = 表里每一棵 bats 树
-  # 都是「隔壁」。
-  run sweep_ps_with_table 999 -U 501 -o pid=,args=
+@test "the scoped ps answers with this run's own processes and nothing else" {
+  run sweep_ps_with_table 301 /tmp/run-mine -U 501 -o pid=,args=
   assert_equal "$status" 0
-  # 隔壁那棵树：根（bats-exec-*）和挂在它底下的进程一起消失
-  refute_contains "$output" 'bats-exec-suite'
-  refute_contains "$output" 'bats-exec-test'
+  # 我们这次 run：祖先链（300、301）加链上进程的后代（302）
+  assert_contains "$output" '300 bash'
+  assert_contains "$output" '301 bash'
+  assert_contains "$output" '302 git status'
+  # 逃出去、被过继给 init 的那个残留 —— 父子链上认不回来，靠 argv 里的本次标记。
+  # 少报它就等于本机上这道门整个空转，所以这一条是整份筛选的要害。
+  assert_contains "$output" '400 /bin/sh /tmp/run-mine/escapee.sh'
+  # 隔壁那次 run 整棵树，和 macOS 按需拉起来的服务，都不答
+  refute_contains "$output" 'bats-exec-suite --x'
+  refute_contains "$output" 'bats-exec-test --x'
   refute_contains "$output" 'sleep 10'
-  # 逃出进程组、被过继给 init 的那个残留照旧报出来 —— 它是这道门的全部意义
-  assert_contains "$output" '200 sh /tmp/bats-run-zzz/test/9/escape.sh'
-  assert_contains "$output" '1 /sbin/launchd'
+  refute_contains "$output" 'networkserviceproxy'
+  refute_contains "$output" 'launchd'
+}
+
+@test "the scoped ps gives each run only its own side of the same table" {
+  # 对称的那一半：换成隔壁那次 run 来问（它的祖先链是 101，它的标记是它自己的目录），
+  # 答的就只有它那一棵。两次问同一张表，两边各自只看见自己 —— 这就是「同机并发
+  # 两套测试互不干扰」在筛选这一层的全部含义。
+  run sweep_ps_with_table 101 /tmp/run-theirs -U 501 -o pid=,args=
+  assert_equal "$status" 0
+  assert_contains "$output" '101 bash'
+  assert_contains "$output" '102 sleep 10'
+  refute_contains "$output" '301 bash'
+  refute_contains "$output" '302 git status'
+  refute_contains "$output" 'escapee.sh'
+  refute_contains "$output" 'networkserviceproxy'
 }
 
 @test "the scoped ps leaves the process-group sweep alone" {
-  # 按进程组那一下（`ps -e -o pgid=…`）只看我们自己那个组号，本来就不会数到隔壁，
+  # 按进程组那一下（`ps -e -o pgid=…`）只看我们自己那个组号，本来就不会数到别人，
   # 所以一个字都不许改：改了就是在筛一道压根没误判的清点。
-  run sweep_ps_with_table 999 -e -o pgid=,pid=,stat=
+  run sweep_ps_with_table 301 /tmp/run-mine -e -o pgid=,pid=,stat=
   assert_equal "$status" 0
-  assert_contains "$output" 'bats-exec-suite'
-  assert_contains "$output" 'sleep 10'
-}
-
-@test "the scoped ps keeps our own bats run, tree and all" {
-  # 反面那一半：清点是从 102（挂在 100 那棵树底下）问出来的，那棵树于是是**我们**
-  # 这次 run，一个都不许少报。少报就等于本机上这道门整个空转。
-  run sweep_ps_with_table 102 -U 501 -o pid=,args=
-  assert_equal "$status" 0
-  assert_contains "$output" 'bats-exec-suite'
-  assert_contains "$output" 'bats-exec-test'
-  assert_contains "$output" 'sleep 10'
-  assert_contains "$output" '200 sh /tmp/bats-run-zzz/test/9/escape.sh'
+  assert_contains "$output" 'bats-exec-suite --x'
+  assert_contains "$output" 'networkserviceproxy'
+  assert_contains "$output" 'launchd'
 }

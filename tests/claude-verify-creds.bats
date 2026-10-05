@@ -321,13 +321,20 @@ chmod +x .git/hooks/post-index-change'
 # 验证留下一个活进程，它盯着 .git/config 等凭据回来。两道各守一半：跑完先按进程组
 # 收掉它，而且凭据摘掉之后再也不还回那个文件 —— 战利品是空的 = 它什么都没等到。
 @test "claude: a process the verify command leaves behind never sees the credentials return" {
-  push_workspace "cfg=\"\$PWD/.git/config\"
+  # 载荷写成本次 run 临时目录下的一个文件再后台跑，不写成匿名子 shell：本机跑测试时
+  # 清点按 argv 里带不带这个目录认「哪些进程是我们的」（见 sweep-bin/ps），匿名子
+  # shell 的 argv 光秃秃一个 `(bash)`，清点看不见它，这一条就假绿。
+  cat >"$BATS_TEST_TMPDIR/leftover.sh" <<EOS
+#!/bin/sh
+cfg="\$1"
 loot=$BATS_TEST_TMPDIR/payload-loot.txt
-( i=0
-  while [ \"\$i\" -lt 20000 ]; do
-    if grep -q extraheader \"\$cfg\" 2>/dev/null; then cp \"\$cfg\" \"\$loot\"; exit 0; fi
-    i=\$((i + 1))
-  done ) >/dev/null 2>&1 &
+i=0
+while [ "\$i" -lt 20000 ]; do
+  if grep -q extraheader "\$cfg" 2>/dev/null; then cp "\$cfg" "\$loot"; exit 0; fi
+  i=\$((i + 1))
+done
+EOS
+  push_workspace "/bin/sh $BATS_TEST_TMPDIR/leftover.sh \"\$PWD/.git/config\" >/dev/null 2>&1 &
 echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
 "
 
