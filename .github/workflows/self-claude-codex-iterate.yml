@@ -14,7 +14,8 @@ permissions:
 
 jobs:
   iterate:
-    uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1
+    uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@52b1e48e86f792278dbe18254deb5e5b95a997ab
     with:
       runtime: shell
+      review_fixer: codex
     secrets: inherit
