@@ -243,7 +243,7 @@ sweep_ps_with_table() { # sweep_ps_with_table <我们是谁的 pid> <本次 run 
   local fake="$BATS_TEST_TMPDIR/table-ps"
   cat >"$fake" <<'EOF'
 #!/bin/sh
-# 两种问法答同一张表：-A 是快照（带 ppid），别的是清点自己要的格式。
+# 两种问法答同一张表：带 ppid 的那一句是筛选自己要的快照，别的是清点要的格式。
 #   1    launchd
 #   50   我们和隔壁共同的那个祖先（跑这一轮的那个 shell）—— 往上走到它就等于把隔壁
 #        整棵树认成自己，所以它必须进不了「自己」
@@ -252,7 +252,7 @@ sweep_ps_with_table() { # sweep_ps_with_table <我们是谁的 pid> <本次 run 
 #   400  我们的逃逸残留：被过继给 init，argv 里还带着本次 run 的临时目录
 #   500  macOS 按需拉起来的服务，600 机器上随便一个别的进程
 case " $* " in
-  *" -A "*) printf '%s\n' \
+  *pid=,ppid=,args=*) printf '%s\n' \
       '    1     0 /sbin/launchd' \
       '   50     1 bash /usr/local/bin/run-the-suites' \
       '  100    50 bash /opt/homebrew/libexec/bats-core/bats-exec-suite --x' \
@@ -302,9 +302,31 @@ EOF
 
 @test "the scoped ps still answers a leftover that escaped its process group" {
   # 这一条是整份筛选的要害。逃出去的残留换了会话、关光了描述符、被过继给 init，
-  # 父子链上认不回来，只剩 argv 里那个本次 run 的临时目录。少报它 = 清点看不见
+  # 父子链上认不回来，只剩命令行里那个本次 run 的临时目录。少报它 = 清点看不见
   # 「验证命令留下了活进程」= 那几条「必须红」的测试假绿，而假绿看不见。
   run sweep_ps_with_table 301 /tmp/bats-run-mine -U 501 -o pid=,args=
+  assert_equal "$status" 0
+  assert_contains "$output" '400 /bin/sh /tmp/bats-run-mine/escapee.sh'
+}
+
+@test "the scoped ps answers a leftover whose command line only the sweep could read" {
+  # macOS 的 ps 读不到某个进程的完整命令行时只给一个括号里的名字，而读得到读不到
+  # 是一瞬一瞬变的：同一个 pid，清点那一句读到了全路径，筛选那一句只读到 `(bash)`。
+  # 筛选必须拿清点自己那一行来比，不能只认快照里那份 —— 不然逃逸探针时不时认不
+  # 出来、清点跟着看不见它（本机并发实测过）。
+  # 这里把快照里那一行换成读不到的样子，清点那一行照旧带全路径。
+  local fake="$BATS_TEST_TMPDIR/unreadable-ps"
+  cat >"$fake" <<'EOF'
+#!/bin/sh
+case " $* " in
+  *pid=,ppid=,args=*) printf '%s
+'       '  300     1 bash /opt/homebrew/libexec/bats-core/bats-exec-test --mine'       '  301   300 bash /tmp/bats-run-mine/block-Verify.sh'       '  400     1 (bash)' ;;
+  *) printf '%s
+'       '  300 bash /opt/homebrew/libexec/bats-core/bats-exec-test --mine'       '  301 bash /tmp/bats-run-mine/block-Verify.sh'       '  400 /bin/sh /tmp/bats-run-mine/escapee.sh' ;;
+esac
+EOF
+  chmod +x "$fake"
+  run env GHWF_SWEEP_REAL_PS="$fake" GHWF_SWEEP_SELF=301       GHWF_SWEEP_RUN_TAG=/tmp/bats-run-mine GHWF_SWEEP_SELF_UID=501       "$SWEEP_BIN_DIR/ps" -U 501 -o pid=,args=
   assert_equal "$status" 0
   assert_contains "$output" '400 /bin/sh /tmp/bats-run-mine/escapee.sh'
 }

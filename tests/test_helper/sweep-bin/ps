@@ -63,10 +63,14 @@ self_uid="${GHWF_SWEEP_SELF_UID:-$(id -u)}"
 
 status=0
 out="$("$real" "$@")" || status=$?
-# 全机快照问不出来就什么都不筛：宁可把今天的噪声留着，也不要悄悄少报一个残留。
-# -ww 不许截断命令行：Linux 的 ps 在不是终端的时候按 80 列裁，裁掉路径就等于认错
-# 主人（本机不截断，看不出来）。
-snap="$("$real" -A -ww -o pid=,ppid=,args= 2>/dev/null)" || snap=''
+# 快照问不出来就什么都不筛：宁可把今天的噪声留着，也不要悄悄少报一个残留。
+# 选进程的条件跟清点自己那一句一模一样（`-U <同一个 uid>`），不用 `-A`：macOS 的
+# ps 用 `-A` 列表时读不到有些进程的完整命令行，只给一个括号里的名字（实测逃逸探针
+# 在 `-U` 下是 `/bin/sh …/escapee.sh`，在 `-A` 下是 `(bash)`）。那就等于认不出它是
+# 本次 run 的、于是清点看不见它 —— 本机并发时那几条「必须红」的测试因此假绿过。
+# -ww 不许截断命令行：Linux 的 ps 在不是终端的时候按 80 列裁，裁掉路径同样认错主人
+# （本机不截断，看不出来）。
+snap="$("$real" -U "$want_uid" -ww -o pid=,ppid=,args= 2>/dev/null)" || snap=''
 if [ -z "$snap" ] || [ -z "$out" ]; then
   [ -z "$out" ] || printf '%s\n' "$out"
   exit "$status"
@@ -124,8 +128,16 @@ filtered="$({
       }
       for (i = 1; i <= no; i++) {
         split(asked[i], g, " ")
-        # 清点问到的那一行压根不在快照里（它在两次 ps 之间起来的）同样算说不清，照答。
-        if (g[1] in ours || !(g[1] in parent)) print asked[i]
+        # 三种都答：
+        #   · 上面认出来是本次 run 的；
+        #   · 清点问到的这一行自己就带着本次 run 的临时目录 —— 这一条不能省：macOS 的
+        #     ps 读不到某个进程的完整命令行时只给一个括号里的名字，而读得到读不到是
+        #     一瞬一瞬变的（同一个 pid，清点那一句读到了全路径，筛选那一句只读到
+        #     `(bash)`）。只认快照里那份命令行的话，逃逸探针会时不时认不出来、清点
+        #     跟着看不见它，那几条「必须红」的测试于是假绿 —— 本机并发实测过。
+        #     清点自己那一句里本来就带着命令行，直接拿它比，读不到的那一瞬就绕过去了。
+        #   · 快照里压根没有这一行（它在两次 ps 之间起来的）—— 说不清，照答。
+        if (g[1] in ours || index(asked[i], tag) > 0 || !(g[1] in parent)) print asked[i]
       }
     }')" || {
   echo 'sweep-bin/ps: cannot tell this run apart; answering with the unfiltered sweep' >&2

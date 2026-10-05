@@ -707,11 +707,17 @@ reset_workspace() {
   printf 'v2 fixed by codex\n' >app.txt
   mkdir -p .review
   printf 'prefetched review\n' >.review/findings-99-1.md
-  # 探针自己的状态也要退回去。逃逸探针靠「pid 文件还空着」判断「它还没起来」，
-  # 让验证命令等它换完会话再退出；不清掉的话第二次尝试压根不等，刚起来的探针当场
-  # 被按组号收掉，清点于是什么都找不到 —— 整条链绿着跑完，而这几条要的是红。
+  # 探针自己也要退回去，两件事：
+  #   · 上一次那个还活着的先收掉。它 argv 里带着本次 run 的临时目录，清点认得出是
+  #     我们的，留着就会被后面别的测试数进去。
+  #   · pid 文件清空。逃逸探针靠「pid 文件还空着」判断「它还没起来」，让验证命令等
+  #     它换完会话再退出；不清掉的话第二次尝试压根不等，刚起来的探针当场被按组号
+  #     收掉，清点什么都找不到 —— 整条链绿着跑完，而这几条要的是红。
   # 清空、不删文件：删文件要跑 rm，池子里那是会弹权限窗的命令。
   for probe in escaped.pid leftover.pid; do
+    if [ -s "$BATS_TEST_TMPDIR/$probe" ]; then
+      kill -9 "$(cat "$BATS_TEST_TMPDIR/$probe")" 2>/dev/null || true
+    fi
     [ ! -e "$BATS_TEST_TMPDIR/$probe" ] || : >"$BATS_TEST_TMPDIR/$probe"
   done
 }
@@ -1356,8 +1362,12 @@ escaped_probe() { # escaped_probe [抄到凭据之后再干什么]
   cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
 #!/bin/sh
 echo "$$" >"$ESCAPE_PID"
+# 活得比那道门的容忍窗口长得多（它在 5 秒里只要撞见一个干净的瞬间就放行）。本机
+# 两套测试并发时，从探针起来到清点跑完能拖到十几秒 —— 原来写 200 次（约 10 秒）
+# 的话，探针会在窗口里自己死掉，于是清点真的看见了一个干净的瞬间、整条链绿着跑完，
+# 而这几条要的是红。测试跑完由 reap_escaped 收它，重跑前由 reset_workspace 收。
 i=0
-while [ "$i" -lt 200 ]; do
+while [ "$i" -lt 1200 ]; do
   if grep -q extraheader "$ESCAPE_CFG" 2>/dev/null; then
     cp "$ESCAPE_CFG" "$ESCAPE_LOOT"
     [ -z "$ESCAPE_AFTER" ] || sh -c "$ESCAPE_AFTER"
@@ -1496,7 +1506,7 @@ EOS
   cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
 #!/bin/sh
 echo "$$" >"$ESCAPE_PID"
-/bin/sleep 12
+/bin/sleep 60
 EOS
   push_workspace "$ESCAPE_VERIFY"
 
