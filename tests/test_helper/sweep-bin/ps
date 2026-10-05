@@ -2,31 +2,27 @@
 # 只给**测试**用的 ps。为什么需要它、以及它为什么不放宽任何判定，见
 # tests/test_helper/common.bash 里 scope_proc_sweep_to_this_run 的那段注释。
 #
-# 一句话：验证正文那道「按运行用户清点残留」问的是「这个 uid 名下有谁」，在 runner
-# 上这等于「本次 run 自己起的有谁」（进程表干净），在本机上不等于 —— 同一个用户名下
-# 还有隔壁 worker 的 `bats tests/`，以及 macOS 自己按需拉起来的服务
-# （networkserviceproxy、iCloudHelper、mdworker…）。这一份把答案收窄回 runner 上那个
-# 意思：只答本次 run 自己的进程。
+# 验证正文那道「按运行用户清点残留」问的是「这个 uid 名下有谁」。在 runner 上这等于
+# 「本次 run 自己起的有谁」（进程表干净）；本机上不等于 —— 同一个用户名下还有隔壁
+# worker 的 `bats tests/`，和 macOS 自己按需拉起来的服务。这一份把那两类的答案去掉。
 #
-# 「本次 run 自己的」按三条认，缺一条这道门就在本机上失效：
-#   1. 跑这一步的那个 shell，以及它到调用 ps 之间的那几层子 shell。认法是「argv 里
-#      带本次 run 的临时目录」—— 那个 shell 跑的就是该目录下的步骤脚本。往上走到
-#      第一个不带标记的祖先就停（那是 bats 自己），**绝不**一路走到 1 号进程：走上去
-#      就会碰到「我们和隔壁 worker 共同的那个祖先」，于是隔壁整棵树都被算成我们的，
-#      筛选变成空操作（实测踩过）。
-#   2. argv 里带本次 run 临时目录的其它进程。逃逸的残留靠这一条：它 setsid 换了会话、
-#      关光了描述符、被过继给 init，父子链上认不回来了，但它跑的还是本次 run 临时
-#      目录下那个探针脚本。探针故意写成「从一个带路径的文件起」就是为了这条认得出
-#      它 —— 认不出就等于清点看不见它，那几条「必须红」的测试会假绿，所以它们本身
-#      就是这条规则的自测。
-#   3. 上面那些的后代 —— 验证命令和它还连着的子孙都在这里。
+# 方向很重要：**只去掉认得出是别人的**，不是「只留认得出是我们的」。两者的失败方向
+# 相反 ——
+#   · 只留我们的：哪天认不出自己的探针（它故意换了会话、关光了描述符、被过继给
+#     init），清点就看不见它，那几条「必须红」的测试当场假绿，而假绿看不见。实测
+#     踩过两次。
+#   · 只去掉别人的：认不出就留着，于是噪声回来、并发重新变红 —— 看得见、好诊断，
+#     而且原来那个「噪声重跑」还在兜。
+# 所以下面先尽力把「本次 run 自己的」认出来（这些永远答），再把「positively 是别人的」
+# 去掉（别人的 bats run、OS 自带目录里的进程，以及挂在它们底下的），剩下认不出主人的
+# 一律照答。
 #
 # 另一个用户的 uid 一律原样放过：那是 runner 上那个专用账号（MEL-289），它名下本来
 # 一个进程都没有，收窄只会把「清点看得见它」那道正面自测弄假。
 #
 # GHWF_SWEEP_REAL_PS / GHWF_SWEEP_SELF / GHWF_SWEEP_RUN_TAG / GHWF_SWEEP_SELF_UID
-# 只给 tests/harness.bats 那几条用：进程表、「我们是谁」、本次标记全喂死，于是那几条
-# 在哪台机器上都是同一个答案，不靠真实 pid 撞不撞上表里的号码。
+# 只给 tests/harness.bats 那几条用：进程表、「我们是谁」、本次标记、uid 全喂死，于是
+# 那几条在哪台机器上都是同一个答案，不靠真实 pid 撞不撞上表里的号码。
 
 # 真正的 ps 只认绝对路径：这个目录就在 PATH 最前面，退回去按名字找会找回自己，
 # 变成无限递归。一个都找不到就红着停下 —— 清点问不出来，而静默空转比红了更糟。
@@ -58,18 +54,16 @@ self_uid="${GHWF_SWEEP_SELF_UID:-$(id -u)}"
 status=0
 out="$("$real" "$@")" || status=$?
 # 全机快照问不出来就什么都不筛：宁可把今天的噪声留着，也不要悄悄少报一个残留。
-# -ww 不许截断命令行：Linux 的 ps 在不是终端的时候按 80 列裁，裁掉探针脚本的路径
-# 就等于认不出它是本次 run 的（本机不截断，看不出来）。
+# -ww 不许截断命令行：Linux 的 ps 在不是终端的时候按 80 列裁，裁掉路径就等于认错
+# 主人（本机不截断，看不出来）。
 snap="$("$real" -A -ww -o pid=,ppid=,args= 2>/dev/null)" || snap=''
 if [ -z "$snap" ] || [ -z "$out" ]; then
   [ -z "$out" ] || printf '%s\n' "$out"
   exit "$status"
 fi
 
-# 筛完的答案先接住再交出去，不直接写 stdout：筛选本身要是挂了（awk 不在、输入噎着
-# 它、或者压根没找到本次 run 的标记），直接写就等于交出一份空的或半截的清点 ——
-# 而「空」正是放行条件，这道门于是静默变成空操作。接住之后筛不出来就原样交出未筛的
-# 那一份：噪声回来、并发重新变红，看得见、好诊断；静默假绿看不见。
+# 筛完的答案先接住再交出去，不直接写 stdout：筛选本身要是挂了，直接写就等于交出一份
+# 空的或半截的清点 —— 而「空」正是放行条件，这道门于是静默变成空操作。
 filtered="$({
   printf '%s\n' "$snap" | sed 's/^/S|/'
   printf '%s\n' "$out" | sed 's/^/O|/'
@@ -87,27 +81,40 @@ filtered="$({
       next
     }
     substr($0, 1, 2) == "O|" { asked[++no] = substr($0, 3); next }
+
+    function mine(p) { return (tag != "" && index(cmd[p], tag) > 0) }
+
+    # positively 是别人的，三类：
+    #   · 别人那次 bats run 的临时目录（我们自己那个先排掉）、bats 自己的那几个 exec
+    #     程序 —— 隔壁 worker 整棵树，连它放出去的探针。
+    #   · macOS 自己那些目录里的进程（按需拉起来的服务就在这儿）。
+    #   · 任何从 .app 包里跑起来的进程（Chrome 的渲染进程、Electron 应用…）。
+    # 这份名单只会认错一个方向：少认一类，那类噪声回来、并发重新变红，看得见；
+    # 它不可能让清点少报我们自己的探针 —— 测试从不把这些目录里的东西留成后台进程。
+    function elsewhere(p) {
+      if (mine(p)) return 0
+      if (index(cmd[p], "/bats-run-") > 0) return 1
+      if (index(cmd[p], "/libexec/bats-core/") > 0) return 1
+      if (index(cmd[p], ".app/Contents/") > 0) return 1
+      if (cmd[p] ~ /^ (\/System\/|\/Library\/|\/Applications\/|\/usr\/libexec\/|\/usr\/sbin\/|\/sbin\/)/) return 1
+      return 0
+    }
+
     END {
-      if (tag == "") exit 1
-      # 1. 跑这一步的那个 shell 和它到这里之间的几层子 shell。走到第一个不带标记的
-      #    祖先就停，别往共同祖先上走。
+      # ① 本次 run 自己的：跑这一步的 shell（argv 里带本次临时目录）、它到这里之间
+      #    的几层子 shell、所有带本次标记的进程，以及它们的后代。往上走到第一个不带
+      #    标记的祖先就停，**绝不**一路走到 1 号进程 —— 走上去会碰到「我们和隔壁
+      #    共同的那个祖先」，于是隔壁整棵树都被算成我们的（实测踩过）。
       p = self; hops = 0; found = 0
       while (p != "" && p != "0" && p != "1" && hops < 64) {
-        mark = (index(cmd[p], tag) > 0)
-        if (found && !mark) break
+        m = mine(p)
+        if (found && !m) break
         root[p] = 1
-        if (mark) found = 1
+        if (m) found = 1
         p = parent[p]
         hops++
       }
-      # 一个带标记的祖先都没有 = 这不是本次 run 的那一步在问，筛不出来。
-      if (!found) exit 1
-      # 2. 带标记的其它进程（逃逸的残留靠这一条认回来）
-      for (i = 1; i <= np; i++) {
-        p = seen[i]
-        if (index(cmd[p], tag) > 0) root[p] = 1
-      }
-      # 3. 上面那些的后代
+      for (i = 1; i <= np; i++) { p = seen[i]; if (mine(p)) root[p] = 1 }
       for (i = 1; i <= np; i++) {
         p = seen[i]; q = p; hops = 0
         while (q != "" && q != "0" && q != "1" && hops < 64) {
@@ -116,12 +123,26 @@ filtered="$({
           hops++
         }
       }
+      # ② 别人的：上面那几条认出来的，加上挂在它们底下的
+      for (i = 1; i <= np; i++) { p = seen[i]; if (!(p in ours) && elsewhere(p)) alien[p] = 1 }
+      for (i = 1; i <= np; i++) {
+        p = seen[i]
+        if (p in ours) continue
+        q = p; hops = 0
+        while (q != "" && q != "0" && q != "1" && hops < 64) {
+          if (q in alien) { hide[p] = 1; break }
+          q = parent[q]
+          hops++
+        }
+      }
+      # ③ 认不出主人的照答
       for (i = 1; i <= no; i++) {
         split(asked[i], g, " ")
-        if (g[1] in ours) print asked[i]
+        if (g[1] in hide) continue
+        print asked[i]
       }
     }')" || {
-  echo 'sweep-bin/ps: cannot tell this run apart; answering with the unfiltered sweep' >&2
+  echo 'sweep-bin/ps: the filter failed; answering with the unfiltered sweep' >&2
   printf '%s\n' "$out"
   exit "$status"
 }

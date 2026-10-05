@@ -230,14 +230,13 @@ YML
   assert_equal "$output" 1787569200
 }
 
-# ---------- 只认本次 run 的那份 ps（MEL-304） ----------
+# ---------- 去掉别人那些进程的那份 ps（MEL-304） ----------
 
 # 验证正文那道清点按运行用户问「名下有谁」。本机上那个名下还有隔壁 worker 的
-# `bats tests/`，以及 macOS 自己按需拉起来的一堆服务，它们会被当成「验证命令留下的」，
-# 整套测试随机变红。tests 里那份 ps（tests/test_helper/sweep-bin/ps）把答案收窄回
-# runner 上那个意思：只答本次 run 自己的进程。
-# 下面四条钉住边界:自己那一步答全、隔壁和系统服务一个不答、逃出去的残留必须照答、
-# 按进程组和按别的 uid 那两种问法一个字不许改。
+# `bats tests/` 和 macOS 按需拉起来的服务，它们会被当成「验证命令留下的」，整套测试
+# 随机变红。tests 里那份 ps（tests/test_helper/sweep-bin/ps）把那两类的答案去掉。
+# 下面四条钉住边界，其中第二条是要害：认不出主人的必须照答 —— 反过来（只留认得出
+# 是我们的）会让认不出的探针静默消失，那几条「必须红」的测试当场假绿。
 # 进程表、「我们是谁」、本次标记、uid 全是喂进去的，所以在哪台机器上都是同一个答案。
 sweep_ps_with_table() { # sweep_ps_with_table <我们是谁的 pid> <本次 run 的标记> <args…>
   local fake="$BATS_TEST_TMPDIR/table-ps"
@@ -245,37 +244,42 @@ sweep_ps_with_table() { # sweep_ps_with_table <我们是谁的 pid> <本次 run 
 #!/bin/sh
 # 两种问法答同一张表：-A 是快照（带 ppid），别的是清点自己要的格式。
 #   1    launchd
-#   50   我们和隔壁共同的那个祖先（跑测试的那个 shell）—— 往上走到它就等于把隔壁
+#   50   我们和隔壁共同的那个祖先（跑这一轮的那个 shell）—— 往上走到它就等于把隔壁
 #        整棵树认成自己，所以它必须进不了「自己」
 #   100  隔壁那次 run 的 bats，101 它的测试进程，201 它那一步的 shell，202 它的子进程
 #   300  我们这次 run 的 bats，301 我们这一步的 shell（清点从这儿问出来），302 它的子进程
 #   400  我们的逃逸残留：被过继给 init，argv 里还带着本次 run 的临时目录
-#   500  macOS 按需拉起来的服务：谁的后代都不是、也不带标记
+#   500  macOS 按需拉起来的服务，700 从 .app 包里跑起来的桌面应用
+#   600  认不出主人的一个进程：既不带任何 bats 标记，也不在 OS 自带目录里
 case " $* " in
   *" -A "*) printf '%s\n' \
       '    1     0 /sbin/launchd' \
       '   50     1 bash /usr/local/bin/run-the-suites' \
-      '  100    50 bash /opt/bats-core/libexec/bats-core/bats-exec-suite --x' \
-      '  101   100 bash /opt/bats-core/libexec/bats-core/bats-exec-test --x' \
-      '  201   101 bash /tmp/run-theirs/block-Verify.sh' \
+      '  100    50 bash /opt/homebrew/libexec/bats-core/bats-exec-suite --x' \
+      '  101   100 bash /opt/homebrew/libexec/bats-core/bats-exec-test --x' \
+      '  201   101 bash /tmp/bats-run-theirs/block-Verify.sh' \
       '  202   201 git status' \
-      '  300    50 bash /opt/bats-core/libexec/bats-core/bats-exec-test --mine' \
-      '  301   300 bash /tmp/run-mine/block-Verify.sh' \
+      '  300    50 bash /opt/homebrew/libexec/bats-core/bats-exec-test --mine' \
+      '  301   300 bash /tmp/bats-run-mine/block-Verify.sh' \
       '  302   301 git status' \
-      '  400     1 /bin/sh /tmp/run-mine/escapee.sh' \
-      '  500     1 /usr/libexec/networkserviceproxy' ;;
+      '  400     1 /bin/sh /tmp/bats-run-mine/escapee.sh' \
+      '  500     1 /usr/libexec/networkserviceproxy' \
+      '  600     1 /bin/sleep 12' \
+      '  700     1 /Applications/Some Browser.app/Contents/MacOS/Helper --type=renderer' ;;
   *) printf '%s\n' \
       '    1 /sbin/launchd' \
       '   50 bash /usr/local/bin/run-the-suites' \
-      '  100 bash /opt/bats-core/libexec/bats-core/bats-exec-suite --x' \
-      '  101 bash /opt/bats-core/libexec/bats-core/bats-exec-test --x' \
-      '  201 bash /tmp/run-theirs/block-Verify.sh' \
+      '  100 bash /opt/homebrew/libexec/bats-core/bats-exec-suite --x' \
+      '  101 bash /opt/homebrew/libexec/bats-core/bats-exec-test --x' \
+      '  201 bash /tmp/bats-run-theirs/block-Verify.sh' \
       '  202 git status' \
-      '  300 bash /opt/bats-core/libexec/bats-core/bats-exec-test --mine' \
-      '  301 bash /tmp/run-mine/block-Verify.sh' \
+      '  300 bash /opt/homebrew/libexec/bats-core/bats-exec-test --mine' \
+      '  301 bash /tmp/bats-run-mine/block-Verify.sh' \
       '  302 git status' \
-      '  400 /bin/sh /tmp/run-mine/escapee.sh' \
-      '  500 /usr/libexec/networkserviceproxy' ;;
+      '  400 /bin/sh /tmp/bats-run-mine/escapee.sh' \
+      '  500 /usr/libexec/networkserviceproxy' \
+      '  600 /bin/sleep 12' \
+      '  700 /Applications/Some Browser.app/Contents/MacOS/Helper --type=renderer' ;;
 esac
 EOF
   chmod +x "$fake"
@@ -283,55 +287,55 @@ EOF
     GHWF_SWEEP_SELF_UID=501 "$SWEEP_BIN_DIR/ps" "${@:3}"
 }
 
-@test "the scoped ps answers with this run's own processes and nothing else" {
-  run sweep_ps_with_table 301 /tmp/run-mine -U 501 -o pid=,args=
+@test "the scoped ps drops the neighbouring run and the OS's own services" {
+  run sweep_ps_with_table 301 /tmp/bats-run-mine -U 501 -o pid=,args=
   assert_equal "$status" 0
-  # 我们这一步的 shell 和它的子进程
-  assert_contains "$output" '301 bash /tmp/run-mine/block-Verify.sh'
-  assert_contains "$output" '302 git status'
-  # 逃出去、被过继给 init 的那个残留 —— 父子链上认不回来，靠 argv 里的本次标记。
-  # 少报它就等于本机上这道门整个空转，所以这一条是整份筛选的要害。
-  assert_contains "$output" '400 /bin/sh /tmp/run-mine/escapee.sh'
-  # 隔壁那次 run、共同的那个祖先、macOS 按需拉起来的服务，一个都不答
-  refute_contains "$output" 'run-the-suites'
+  # 隔壁那次 run 整棵树（bats 自己的进程、它那一步的 shell、它的子进程）
   refute_contains "$output" 'bats-exec-suite --x'
-  refute_contains "$output" 'run-theirs'
+  refute_contains "$output" 'bats-run-theirs'
   refute_contains "$output" '202 git status'
+  # macOS 按需拉起来的服务，和从 .app 包里跑起来的桌面应用（Chrome 的渲染进程这类）
   refute_contains "$output" 'networkserviceproxy'
-  refute_contains "$output" 'launchd'
+  refute_contains "$output" 'Some Browser.app'
+  # 我们这一步的 shell 和它的子进程照答
+  assert_contains "$output" '301 bash /tmp/bats-run-mine/block-Verify.sh'
+  assert_contains "$output" '302 git status'
+}
+
+@test "the scoped ps still answers anything it cannot pin on someone else" {
+  # 这一条是整份筛选的要害，方向也是整份筛选的设计：**只去掉认得出是别人的**。
+  # 逃出去的残留（换了会话、被过继给 init）和认不出主人的进程都必须照答 —— 少报
+  # 一个，那几条「必须红」的测试就假绿，而假绿看不见。
+  run sweep_ps_with_table 301 /tmp/bats-run-mine -U 501 -o pid=,args=
+  assert_equal "$status" 0
+  assert_contains "$output" '400 /bin/sh /tmp/bats-run-mine/escapee.sh'
+  assert_contains "$output" '600 /bin/sleep 12'
+  assert_contains "$output" '1 /sbin/launchd'
+  # 连「我们和隔壁共同的那个祖先」也照答：认不出就留着，宁可噪声回来
+  assert_contains "$output" 'run-the-suites'
 }
 
 @test "the scoped ps gives each run only its own side of the same table" {
-  # 对称的那一半：换成隔壁那次 run 来问（它那一步的 shell 是 201，标记是它自己的
-  # 目录），答的就只有它那一边。两次问同一张表，两边各自只看见自己 —— 这就是
-  # 「同机并发两套测试互不干扰」在筛选这一层的全部含义。
-  run sweep_ps_with_table 201 /tmp/run-theirs -U 501 -o pid=,args=
+  # 对称的那一半：换成隔壁那次 run 来问（它那一步的 shell 是 201，标记是它的目录），
+  # 答的就只有它那一边。两次问同一张表，两边各自看不见对方 —— 这就是「同机并发两套
+  # 测试互不干扰」在筛选这一层的全部含义。
+  run sweep_ps_with_table 201 /tmp/bats-run-theirs -U 501 -o pid=,args=
   assert_equal "$status" 0
-  assert_contains "$output" '201 bash /tmp/run-theirs/block-Verify.sh'
+  assert_contains "$output" '201 bash /tmp/bats-run-theirs/block-Verify.sh'
   assert_contains "$output" '202 git status'
-  refute_contains "$output" 'run-mine'
+  refute_contains "$output" 'bats-run-mine'
   refute_contains "$output" '302 git status'
-  refute_contains "$output" 'run-the-suites'
   refute_contains "$output" 'networkserviceproxy'
-}
-
-@test "the scoped ps hands back the unfiltered sweep when it cannot tell the runs apart" {
-  # 认不出本次 run 就原样交出全机那一份：噪声回来、并发重新变红，看得见、好诊断。
-  # 反过来（交一份空的）会让这道门静默放行 —— 那是唯一不能接受的失败方向。
-  run sweep_ps_with_table 101 /tmp/nowhere -U 501 -o pid=,args=
-  assert_equal "$status" 0
-  assert_contains "$output" 'networkserviceproxy'
-  assert_contains "$output" '302 git status'
 }
 
 @test "the scoped ps leaves the other two ways of asking alone" {
   # 按进程组那一下只看我们自己那个组号；问别的 uid 的是 runner 上那个专用账号
   # （它名下本来一个进程都没有）。两种本来都不会数到外人，所以一个字都不许改。
-  run sweep_ps_with_table 301 /tmp/run-mine -e -o pgid=,pid=,stat=
+  run sweep_ps_with_table 301 /tmp/bats-run-mine -e -o pgid=,pid=,stat=
   assert_equal "$status" 0
   assert_contains "$output" 'networkserviceproxy'
-  run sweep_ps_with_table 301 /tmp/run-mine -U 4242 -o pid=,args=
+  run sweep_ps_with_table 301 /tmp/bats-run-mine -U 4242 -o pid=,args=
   assert_equal "$status" 0
   assert_contains "$output" 'networkserviceproxy'
-  assert_contains "$output" 'run-theirs'
+  assert_contains "$output" 'bats-run-theirs'
 }
