@@ -49,7 +49,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `pr-guard: fix-round head=H round=N` | GITHUB_TOKEN | 第 N 轮修复已推送（轮数不靠召唤是否成功） |
 | `pr-guard: alert head=H reason=R until=T` | 各环节 | 已告警 R，同一 head 同一原因只推一次 |
 
-告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
+告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `verify-failed` `push-failed` `stale-workflow` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
 
 ### 修满轮数之后（2026-10-04）
 
@@ -64,6 +64,8 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 - 放行之后没合上（多半是当时 CI 还没绿）：巡检不把点名的那几条当成没修的意见去重修，而是空闲 60 分钟后把同一条放行标记再发一次，让合并检查重跑；补 2 次还没合上就告警 `stalled`。
 
 Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根目录是受信任的 base，主人的 PAT 只在最后发结论那一步。
+
+改好了却没推上去时，PR 上也一定有一句话（2026-10-05）：验证命令没过 → `verify-failed`；提交了但 push 被拒 → `push-failed`，告警里直接说是哪一种拒（令牌不许改 workflow 文件 / 分支保护 / 分支落后），两条都带 run 链接。`claude-code-action` 因为「PR 分支上的调用桩跟默认分支不一样」把自己整步跳过时 → `stale-workflow`，告警直接写「点 Update branch」。这三种以前在 PR 上一个字都没有，只能等巡检重试两次之后收到一条不说原因的 `retry-exhausted`。
 
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
 

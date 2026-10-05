@@ -543,6 +543,56 @@ outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
   assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
 }
 
+# claude-code-action 的第三种结局：它把自己整步跳过了（PR 分支上的调用桩跟默认分支上
+# 的那份不一样）。跳过的长相跟「跑过但什么都没落地」一模一样，以前两种都只换来一条
+# 笼统的「自动修复没跑成」，看不出该去点 Update branch（MEL-293）。
+stale_env() { # stale_env <默认分支上那份文件的内容>
+  export WORKFLOW_REF='o/r/.github/workflows/claude-codex-iterate.yml@refs/pull/7/merge'
+  export DEFAULT_BRANCH=develop
+  mkdir -p .github/workflows
+  printf 'uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1\n' \
+    >.github/workflows/claude-codex-iterate.yml
+  fake_route 'repos/o/r/contents/.github/workflows/claude-codex-iterate.yml?ref=develop' "$1"
+}
+
+@test "outcome: the action skipped itself -> the alert says to click Update branch" {
+  outcome_env success ''
+  live_head "$H"
+  stale_env 'uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1 还多一行'
+  outcome
+  assert_equal "$status" 1
+  assert_equal "$(fake_last_body "gh pr comment")" "PR 分支落后于默认分支上的流水线文件，自动修复那一步被整个跳过了；在 PR 页点 Update branch，之后巡检会自动再审一次。
+
+<!-- pr-guard: alert head=$H reason=stale-workflow until=- -->"
+}
+
+@test "outcome: a caller workflow file that already matches keeps the plain fix-failed alert" {
+  outcome_env success ''
+  live_head "$H"
+  stale_env 'uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1'
+  outcome
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
+}
+
+# 判据是那两份文件，不是日志里那句 `Workflow validation failed`：同一份日志原样带着
+# Codex 的 review 正文（外部输入），照抄那句报错就能骗出一条错的告警。有执行记录就说明
+# Claude 真跑过，这次连文件都不比。
+@test "outcome: a result text quoting the validation error buys no Update-branch alert" {
+  exec_file="$BATS_TEST_TMPDIR/exec-quoted.json"
+  jq -n '[{type:"result",subtype:"error",is_error:true,
+           result:"Workflow validation failed. The workflow file must exist and have identical content to the version on the default branch."}]' \
+    >"$exec_file"
+  outcome_env failure ''
+  export EXEC_FILE="$exec_file"
+  live_head "$H"
+  stale_env '跟 PR 分支上那份完全不一样的内容'
+  outcome
+  assert_equal "$status" 1
+  assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
+  refute_called 'contents/.github/workflows'
+}
+
 @test "outcome: success without structured output is never 'no-fix' (classified from the SDK)" {
   outcome_env success '' exec-success-no-structured.json
   live_head "$H"
@@ -709,6 +759,119 @@ outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
   trust_fake_bin
   FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_block "$WF" "Check the fix outcome"
   assert_planted_runs_when_trusted
+}
+
+# ---------- 这一轮什么都没推上去：PR 上得有人说一句为什么 ----------
+#
+# 以前这两种结局在 PR 上一个字都没有：验证红了，判结局那一步被 GitHub 隐式的 success()
+# 跳过，裁决那一步只沿用那个红、不发告警；推送被拒也一样。主人只能等巡检重试两次之后
+# 收到一条不说原因的 retry-exhausted（MEL-293）。
+
+stuck_env() {
+  export HEAD_SHA="$H" RUN_URL=https://x/actions/runs/9
+  export CLAUDE_VERIFY='' CODEX_VERIFY='' CLAUDE_PUSH='' CODEX_PUSH=''
+  export CLAUDE_BLOCKED='' CODEX_BLOCKED=''
+}
+
+stuck() { trust_fake_bin; run run_block "$WF" "Say why this round pushed nothing"; }
+
+@test "stuck: a failed verification says the verify command did not pass, with the run link" {
+  stuck_env
+  export CLAUDE_VERIFY=failure
+  stuck
+  assert_equal "$status" 0
+  assert_equal "$(fake_last_body "gh pr comment")" "本仓库的验证命令（lint 或测试）没过，改好的改动没推上去：https://x/actions/runs/9
+
+<!-- pr-guard: alert head=$H reason=verify-failed until=- -->"
+  assert_called "curl " 1
+}
+
+@test "stuck: the Codex half of the round is covered by the same step" {
+  stuck_env
+  export CODEX_VERIFY=failure
+  stuck
+  assert_contains "$(fake_last_body "gh pr comment")" "reason=verify-failed until=- -->"
+}
+
+@test "stuck: the same head and reason is never alerted twice" {
+  stuck_env
+  export CLAUDE_VERIFY=failure
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 'github-actions[bot]' NONE "x $(m6_marker "$H" verify-failed)")")"
+  stuck
+  assert_equal "$status" 0
+  refute_called "gh pr comment"
+  refute_called "curl "
+}
+
+# 「改好了却推不上去」要说实话，而且要说清是哪一种拒。2026-10-04 这个仓库自己的四条
+# 红 run 就是 workflow-permission 那一种，当时 PR 上全程没有一个字。
+@test "stuck: a refused push says the fix is ready but cannot be pushed, and names which refusal" {
+  stuck_env
+  export CLAUDE_PUSH=failure CLAUDE_BLOCKED=workflow-permission
+  stuck
+  assert_equal "$status" 0
+  assert_equal "$(fake_last_body "gh pr comment")" "改好了，但推不上去：机器人的令牌不许改 workflow 文件，这一笔得人来推。https://x/actions/runs/9
+
+<!-- pr-guard: alert head=$H reason=push-failed until=- -->"
+}
+
+@test "stuck: every push refusal class gets its own wording, unknown ones point at the log" {
+  for class in protected-branch:分支保护 non-fast-forward:别人的新提交 :原因在这次运行的日志里; do
+    : >"$FAKE_LOG"
+    fake_route "$COMMENTS" '[]'
+    stuck_env
+    export CODEX_PUSH=failure CODEX_BLOCKED="${class%%:*}"
+    stuck
+    assert_equal "$status" 0
+    assert_contains "$(fake_last_body "gh pr comment")" "改好了，但推不上去："
+    assert_contains "$(fake_last_body "gh pr comment")" "${class#*:}"
+  done
+}
+
+# 别的步骤红掉时这一步必须闭嘴：那些结局各自已经发过自己的告警，再补一条就是两条。
+@test "stuck: a round that went red somewhere else says nothing here" {
+  stuck_env
+  export CLAUDE_VERIFY=success CLAUDE_PUSH=skipped
+  stuck
+  assert_equal "$status" 0
+  assert_contains "$output" 'neither the verify nor the push step failed'
+  refute_called "gh pr comment"
+  refute_called "curl "
+}
+
+@test "stuck: a round that died before the gate named a head says nothing either" {
+  stuck_env
+  export HEAD_SHA='' CLAUDE_VERIFY=failure
+  stuck
+  assert_equal "$status" 0
+  refute_called "gh pr comment"
+}
+
+# 这一步手上有 github.token 和 Pushover 两个密钥，而它排在跑被审 PR 命令那一步之后：
+# 假 gh 一旦被它调到，令牌就递过去了。摘掉那段 PATH 过滤，这一条当场红。
+@test "stuck: a gh planted on a writable PATH entry never gets the alert token" {
+  plant_fake_tools "$BATS_TEST_TMPDIR/plantable-bin" gh jq date curl
+  stuck_env
+  export CLAUDE_VERIFY=failure GH_TOKEN=write-token GH_HOST=127.0.0.1
+
+  run run_block "$WF" "Say why this round pushed nothing"
+
+  refute_planted_ran
+  [ "$status" -ne 0 ] || { echo 'the step went green without posting the alert' >&2; return 1; }
+
+  trust_fake_bin
+  FAKE_BIN_DIR="$BATS_TEST_TMPDIR/plantable-bin" run run_block "$WF" "Say why this round pushed nothing"
+  assert_planted_runs_when_trusted
+}
+
+@test "stuck: without the helpers from the Define step the alert goes red instead of silent" {
+  stuck_env
+  export CLAUDE_VERIFY=failure PR_GUARD=''
+  stuck
+  assert_equal "$status" 1
+  assert_contains "$output" 'pr-guard helpers did not arrive'
+  refute_called "gh pr comment"
 }
 
 # ---------- 召唤 ----------
