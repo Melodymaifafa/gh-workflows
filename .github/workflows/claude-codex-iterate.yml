@@ -1216,6 +1216,27 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 这一条 push 用哪一份写权限凭据 —— 只打印名字，值由下面按名字取，绝不打印。
+          # GitHub 不许没有 Workflows 权限的令牌推 `.github/workflows/` 下的改动，而本仓库
+          # 的 PR 几乎都改这些文件：2026-09-26 到 10-01，17 / 18 / 19 号 PR 为此停了 4 次。
+          # 所以本仓库单独配一把带 Workflows 权限的 PAT（`SELF_WORKFLOWS_TOKEN`，只设在这
+          # 一个仓库、不走 onboard.sh / secrets.env，否则会刷到所有仓库去）。两个条件同时
+          # 成立才用它：
+          #   1. 跑在 Melodymaifafa/gh-workflows —— 别的仓库万一也设了同名密钥，一样不许用；
+          #   2. 密钥非空 —— 没设就照旧走 github.token，行为跟今天一字不差，不报错。
+          # 它能改所有仓库共用的流水线，所以只交给这一条 push：同一步里的 gh pr comment
+          # 照旧用 github.token（M7 标记于是仍由 github-actions[bot] 署名，可信作者不变），
+          # 验证那一步、跑被审 PR 代码的步骤、Claude / Codex 那一步一律拿不到它。
+          push_credential_source() {
+            if [ "${REPO:-}" = Melodymaifafa/gh-workflows ] &&
+              [ -n "${SELF_WORKFLOWS_TOKEN:-}" ]
+            then
+              echo self-workflows
+            else
+              echo github-token
+            fi
+          }
+
           commit_and_push_the_fix() {
             set -euo pipefail
 
@@ -1286,8 +1307,9 @@ jobs:
             }
 
             # 写权限凭据这一轮只在这里出现，而且只出现在这一条 push 的环境里：
-            # 上一步把 checkout 留在 .git/config 里那份摘掉就没还回去，我们用手上的
-            # GH_TOKEN 现造一份（actions/checkout 写进去的就是这一串）。
+            # 上一步把 checkout 留在 .git/config 里那份摘掉就没还回去，我们用手上的令牌
+            # 现造一份（actions/checkout 写进去的就是这一串）。哪一份见
+            # push_credential_source —— 本仓库配了专用令牌就用它，否则还是 GH_TOKEN。
             # 不落 .git/config：落了就是一份谁都能轮询的文件，而这正是「按进程组收尾
             # 挡不住 setsid」留下的那条路（MEL-255）。凭据只活在这一条 push 的环境里，
             # 它的命门跟这一步的 GH_TOKEN 一样 —— 见上面那段：靠的是「上一步证明了没有
@@ -1295,7 +1317,14 @@ jobs:
             # 也不上命令行：argv 在 /proc 里是公开的，-c 等于把凭据贴到进程表上。
             # printf 是 bash 内建，令牌不会出现在任何一个进程的 argv 里；GNU 的 base64
             # 默认按 76 列折行，所以 tr 掉换行。
-            push_auth="AUTHORIZATION: basic $(printf '%s' "x-access-token:$GH_TOKEN" | base64 | tr -d '\n')"
+            push_credential="$(push_credential_source)"
+            case "$push_credential" in
+              self-workflows) push_secret="$SELF_WORKFLOWS_TOKEN" ;;
+              *)              push_secret="$GH_TOKEN" ;;
+            esac
+            # 推不动时一眼看出手上是哪一份凭据。打印的是名字，不是值。
+            echo "the fix push uses the $push_credential credential"
+            push_auth="AUTHORIZATION: basic $(printf '%s' "x-access-token:$push_secret" | base64 | tr -d '\n')"
             credentialed_git() {
               GIT_CONFIG_COUNT=1 \
               GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
@@ -1344,7 +1373,7 @@ jobs:
 
           {
             echo 'push<<__FIX_PUSH_GUARD_EOF__'
-            declare -f commit_and_push_the_fix
+            declare -f push_credential_source commit_and_push_the_fix
             echo '__FIX_PUSH_GUARD_EOF__'
           } >>"$GITHUB_OUTPUT"
 
@@ -1828,13 +1857,18 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
+          # 本仓库专用的写权限令牌（带 Workflows 权限）。只有这一步、Codex 那条路的同名
+          # 步骤和合并那一步拿得到；别的仓库没设这个密钥，取到空串就照旧走 github.token。
+          # 判定在 push_credential_source 里。
+          SELF_WORKFLOWS_TOKEN: ${{ secrets.SELF_WORKFLOWS_TOKEN }}
         run: |
           set -euo pipefail
 
           # 同上一步：正文从 Define the fix push guard 的 output 取，两条路
           # 共用同一份（MEL-262）。这一步手上有写权限令牌，所以没拿到正文就红着停下。
           eval "${FIX_PUSH_GUARD:-}"
-          declare -F commit_and_push_the_fix >/dev/null || {
+          declare -F push_credential_source >/dev/null &&
+            declare -F commit_and_push_the_fix >/dev/null || {
             echo '::error::the push guard did not arrive from the Define step; refusing to run a credentialed git command'
             exit 1
           }
@@ -2780,13 +2814,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ROUND: ${{ steps.gate.outputs.round }}
+          # 同 Claude 那条路：本仓库专用的写权限令牌，只给这一条 push 用。
+          SELF_WORKFLOWS_TOKEN: ${{ secrets.SELF_WORKFLOWS_TOKEN }}
         run: |
           set -euo pipefail
 
           # 同上一步：正文从 Define the fix push guard 的 output 取，两条路
           # 共用同一份（MEL-262）。这一步手上有写权限令牌，所以没拿到正文就红着停下。
           eval "${FIX_PUSH_GUARD:-}"
-          declare -F commit_and_push_the_fix >/dev/null || {
+          declare -F push_credential_source >/dev/null &&
+            declare -F commit_and_push_the_fix >/dev/null || {
             echo '::error::the push guard did not arrive from the Define step; refusing to run a credentialed git command'
             exit 1
           }
