@@ -40,7 +40,8 @@
 # 只给 tests/harness.bats 那几条用：进程表、「我们是谁」、本次标记、uid 全喂死，于是
 # 那几条在哪台机器上都是同一个答案，不靠真实 pid 撞不撞上表里的号码。
 # GHWF_SWEEP_PROBE_PIDFILE 是上面第 3 条的那些文件，冒号分隔，由跑探针的那两个套件
-# 在 setup 里一次设好（见 common.bash 里 scope_proc_sweep_to_this_run 旁边那段）。
+# 在 setup 里设好、单条测试可以再往后接自己的（见 common.bash 里
+# scope_proc_sweep_to_this_run 旁边那段）。
 # 文件不存在、是空的、里面不是数字，都当没报 —— 这一条只往「多认」那边加。
 
 # 真正的 ps 只认绝对路径：这个目录就在 PATH 最前面，退回去按名字找会找回自己，

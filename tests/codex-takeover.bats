@@ -39,9 +39,10 @@ setup() {
   # 残留清点按运行用户问「名下有谁」，本机上那等于「这台 Mac 上这个用户有谁」——
   # 隔壁 worker 的 bats 一起数进来。把回答这个问题的 ps 换成只认本次 run 的那一份
   # （见 common.bash 里 scope_proc_sweep_to_this_run）。
-  # 探针起来时都会把自己的号码写进这两个文件之一；那份 ps 按号码也认一次，所以
-  # argv 里的标记没了（exec 掉了、或者 macOS 这一瞬读不到命令行）也还认得出它是
-  # 我们的。文件这会儿还不存在，不要紧。
+  # 探针起来时都会把自己的号码写下来；那份 ps 按号码也认一次，所以 argv 里的标记没了
+  # （exec 掉了、或者 macOS 这一瞬读不到命令行）也还认得出它是我们的。文件这会儿还不
+  # 存在，不要紧。单条测试可以往这串后面再接一个自己的号码文件 —— 噪声重跑那一条就是
+  # 这么做的，它那个进程不能进这两个文件（is_machine_noise 读的就是它们）。
   export GHWF_SWEEP_PROBE_PIDFILE="$BATS_TEST_TMPDIR/escaped.pid:$BATS_TEST_TMPDIR/leftover.pid"
   scope_proc_sweep_to_this_run
   : >"$GITHUB_OUTPUT"
@@ -1806,8 +1807,23 @@ settle_touched_units() {
 @test "harness: a noise retry restarts from a clean workspace, so the smuggled file is still caught" {
   export NOISE_MARK="$BATS_TEST_TMPDIR/noise.mark"
   export NOISY_DAEMON="$BATS_TEST_TMPDIR/noisy-daemon.sh"
+  # 这个守护进程照 escaped_probe 那一套来：起来第一件事报自己的号码，验证命令等它报完
+  # 再退出。两件事各挡住一个实测过的漏法（MEL-304 第 2 轮，原来这两样都没有，约 5%
+  # 的概率清点报不出它、重跑压根不发生、这一条当场红在前置门上）：
+  #   · 报号码。它被过继给 1 号进程，父子链上认不回来，于是只剩「argv 里带本次 run 的
+  #     临时目录」一条认法；macOS 的 ps 读不到某个进程的命令行时只给一个括号里的名字，
+  #     清点那一句和筛选那一句同时读不到，它就被筛掉。而那道门在 5 秒里撞见一个干净的
+  #     瞬间就放行 —— 也就是有 50 次机会漏，「大概率认得出」不够用，按号码认才是确定的。
+  #   · 等它报完再走。perl 还没 setsid 完验证命令就退出的话，按组号那一下把它正当收掉，
+  #     压根没有残留可报。原来写死 /bin/sleep 1，并发负载下不保证够。
+  # 号码写进第三个文件，不是 is_machine_noise 读的那两个（escaped.pid / leftover.pid）：
+  # 那份 ps 要认得出它是我们的，而 is_machine_noise 必须继续把它当成「没种过的机器
+  # 噪声」—— 写进那两个里，重跑就不触发了，这一条照样红。
+  export NOISE_PID="$BATS_TEST_TMPDIR/noise.pid"
+  export GHWF_SWEEP_PROBE_PIDFILE="$GHWF_SWEEP_PROBE_PIDFILE:$NOISE_PID"
   cat >"$NOISY_DAEMON" <<'EOS'
 #!/bin/sh
+echo "$$" >"$NOISE_PID"
 i=0
 while [ "$i" -lt 600 ] && [ ! -e "$NOISE_MARK.stop" ]; do
   /bin/sleep 0.1
@@ -1821,7 +1837,14 @@ if [ -e "$NOISE_MARK" ]; then
 else
   : >"$NOISE_MARK"
   perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec("/bin/sh", $ENV{NOISY_DAEMON});' >/dev/null 2>&1 &
-  /bin/sleep 1
+  # 等它换完会话、exec 完、把号码写下来再让验证命令退出（同 escape.sh）。定长 sleep
+  # 在并发负载下不保证够，而慢一步就等于这一轮压根没有噪声进程。
+  # 走 /bin/sleep 的绝对路径：PATH 上那个假 sleep 压根不睡。
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -s "$NOISE_PID" ]; do
+    /bin/sleep 0.05
+    i=$((i + 1))
+  done
 fi
 printf run >>"$NOISE_MARK.runs"
 printf 'backdoor\n' >planted.txt
@@ -1837,7 +1860,14 @@ EOS
 
   # 真的重跑过：载荷每跑一次记三个字节
   runs="$(wc -c <"$NOISE_MARK.runs" | tr -d ' ')"
-  [ "$runs" -ge 6 ] || { echo "the chain ran only $((runs / 3)) time(s); the retry never happened" >&2; return 1; }
+  [ "$runs" -ge 6 ] || {
+    echo "the chain ran only $((runs / 3)) time(s); the retry never happened" >&2
+    noise_pid="$(cat "$NOISE_PID" 2>/dev/null || true)"
+    echo "# noise daemon: pid=${noise_pid:-none}" \
+         "alive=$(kill -0 "${noise_pid:-0}" 2>/dev/null && echo yes || echo no)" \
+         "ps=[$(ps -p "${noise_pid:-0}" -o args= 2>/dev/null || true)]" >&2
+    return 1
+  }
   assert_equal "$status" 1
   # 两半都要在重跑之后照旧抓到：工作区那半（夹带的文件）和 .git 那半（种的钩子）。
   # 重跑前不把 .git 换回去的话，红的原因会变成前者、后者静默失效。
