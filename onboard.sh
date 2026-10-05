@@ -53,6 +53,13 @@ verify_line() {
 # 没覆盖的那几条用跟 ci.yml 逐字相同的默认值填齐 —— verify_cmd 是整份替换、
 # 不是逐行合并，只写被覆盖的那一条会让另两条从修复那一轮里整个消失（MEL-303）。
 # 三条都没覆盖就什么都不打印，让中央仓库的默认值生效。
+#
+# 每条各包进一个子 shell：ci.yml 里装 / lint / 测是三个独立的 step，中央仓库却把整块
+# verify_cmd 当一个脚本跑（bash -euo pipefail -c）。不隔开的话，装依赖那条的
+# `cd frontend && npm ci` 会把后两条带进 frontend（它们自己的 `cd frontend` 当场失败
+# = CI 绿着、修复那一轮红），一条 `exit 0` 会让后面几条整个不跑（= 没验证就推）。
+# 括号各占一行而不是 `( cmd )`：覆盖值末尾带 # 注释时 ci.yml 的 eval 照跑，同一行的
+# 右括号却会被注释吃掉、整块语法错。
 iterate_verify_cmd() {
   local runtime="$1"
   local default_install default_lint default_test
@@ -79,7 +86,7 @@ iterate_verify_cmd() {
   [ -n "${INSTALL_CMD:-}${LINT_CMD:-}${TEST_CMD:-}" ] || return 0
 
   printf '      verify_cmd: |\n'
-  printf '        %s\n' \
+  printf '        (\n          %s\n        )\n' \
     "$(verify_line install "${INSTALL_CMD:-$default_install}")" \
     "$(verify_line lint "${LINT_CMD:-$default_lint}")" \
     "$(verify_line test "${TEST_CMD:-$default_test}")"

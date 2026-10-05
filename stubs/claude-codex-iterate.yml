@@ -33,6 +33,8 @@ jobs:
       # 验证命令跑的是仓库自己装不上的那套默认命令。onboard.sh 在 INSTALL_CMD /
       # LINT_CMD / TEST_CMD 任意一个有值时会把这一段自动写出来，手改 ci.yml 的覆盖值
       # 时要记得一起改这里。整份替换，不是逐行合并：写了就得把三条都写齐。
+      # 整块是当一个脚本跑的，不像 ci.yml 那样每条一个 step：哪条带 cd 或 exit，
+      # 就把它单独用一对独占一行的 ( ) 括起来，免得带到后面几条（onboard.sh 写出来的就是这样）。
       # verify_cmd: |
       #   uv sync --dev
       #   uv run ruff check .

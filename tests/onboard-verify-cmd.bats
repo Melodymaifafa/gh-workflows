@@ -39,7 +39,7 @@ load test_helper/common
 
 # ---------- 给了覆盖值 → 桩里有对应的 verify_cmd ----------
 
-@test "all three overridden: verify_cmd is those three commands, one per line" {
+@test "all three overridden: verify_cmd is those three commands, in order" {
   OV_INSTALL='make deps' OV_LINT='make lint' OV_TEST='make test' onboard_render node
   assert_equal "$(rendered_verify_line 1)" 'make deps'
   assert_equal "$(rendered_verify_line 2)" 'make lint'
@@ -123,8 +123,39 @@ load test_helper/common
   assert_contains "$(rendered_verify_line 2)" 'lint skipped by caller'
   assert_contains "$(rendered_verify_line 3)" 'test skipped by caller'
   # 中央仓库是把整块当一个脚本跑的（bash -euo pipefail -c），所以整块也得跑得过。
-  run bash -euo pipefail -c "$(printf '%s\n%s\n%s\n' \
-    "$(rendered_verify_line 1)" "$(rendered_verify_line 2)" "$(rendered_verify_line 3)")"
+  run bash -euo pipefail -c "$(rendered_verify_block)"
+  assert_equal "$status" 0
+}
+
+# ---------- 每条命令各占一个 shell，跟 ci.yml 里各是一个 step 对齐 ----------
+
+# ci.yml 里装 / lint / 测是三个 step，各自一个 shell；中央仓库却把整块 verify_cmd
+# 当一个脚本跑。monorepo 的覆盖值三条都写 `cd frontend && ...`：不隔开的话，第一条
+# 把后两条带进 frontend，它们自己的 `cd frontend` 就找不到目录 —— CI 绿、修复那一轮红。
+@test "a cd in one command does not carry over into the next, as with ci.yml's separate steps" {
+  OV_INSTALL='cd frontend && touch installed' \
+  OV_LINT='cd frontend && test -f installed' \
+  OV_TEST='cd frontend && test -f installed' \
+    onboard_render node
+  mkdir -p "$BATS_TEST_TMPDIR/work/frontend"
+  cd "$BATS_TEST_TMPDIR/work"
+  run bash -euo pipefail -c "$(rendered_verify_block)"
+  assert_equal "$status" 0
+}
+
+# 反方向更糟：一条 `exit 0` 不隔开就让后面几条整个不跑，修复没验证就推上去。
+# ci.yml 里它只结束自己那一步，后面的 step 照跑。
+@test "an exit 0 in one command does not skip the commands after it" {
+  OV_INSTALL='exit 0' OV_LINT='true' OV_TEST='false' onboard_render node
+  run bash -euo pipefail -c "$(rendered_verify_block)"
+  assert_equal "$status" 1
+}
+
+# ci.yml 是 eval 覆盖值的，末尾的 # 注释它照跑。括号要是跟命令写在同一行，
+# 右括号就被注释吃掉、整块语法错。
+@test "a trailing comment in an override does not swallow the subshell's closing paren" {
+  OV_INSTALL='true # deps come from the image' OV_LINT=skip OV_TEST=skip onboard_render node
+  run bash -euo pipefail -c "$(rendered_verify_block)"
   assert_equal "$status" 0
 }
 
@@ -150,7 +181,7 @@ load test_helper/common
 
 # ---------- 渲染出来的桩得是合法 YAML ----------
 
-@test "the rendered iterate stub parses as YAML with verify_cmd as three lines" {
+@test "the rendered iterate stub parses as YAML with verify_cmd as three subshells" {
   OV_INSTALL='make deps' OV_LINT=skip OV_TEST='make test' onboard_render node
   run python3 -c '
 import sys, pathlib
@@ -159,10 +190,13 @@ try:
 except ImportError:
     sys.exit(99)
 d = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
-got = d["jobs"]["iterate"]["with"]["verify_cmd"].splitlines()
-assert len(got) == 3, got
-assert got[0] == "make deps", got
-assert got[2] == "make test", got
+got = d["jobs"]["iterate"]["with"]["verify_cmd"]
+want = (
+    "(\n  make deps\n)\n"
+    "(\n  echo \"::notice::lint skipped by caller\"\n)\n"
+    "(\n  make test\n)\n"
+)
+assert got == want, repr(got)
 print("ok")
 ' "$BATS_TEST_TMPDIR/out/.github/workflows/claude-codex-iterate.yml"
   [ "$status" -eq 99 ] && skip 'pyyaml not installed'

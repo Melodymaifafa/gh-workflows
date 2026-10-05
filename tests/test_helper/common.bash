@@ -106,13 +106,25 @@ rendered_stub() { # rendered_stub <ci.yml|claude-codex-iterate.yml|...>
 }
 
 # 渲染出来的 iterate 桩里 verify_cmd 块的第 n 条命令（n 从 1 起，去掉缩进）。
-# 注释行（# verify_cmd:）不算：只认行首就是 verify_cmd 的那一行。
+# 注释行（# verify_cmd:）不算：只认行首就是 verify_cmd 的那一行。每条命令各自包在
+# 一对独占一行的括号里（子 shell），括号行跳过，只认括号里面多缩进一级的那一行。
 rendered_verify_line() { # rendered_verify_line <n>
+  awk '
+    /^      verify_cmd: \|$/ { f = 1; next }
+    f && /^        [()]$/ { next }
+    f && /^          / { sub(/^          /, ""); print; next }
+    f { exit }
+  ' "$BATS_TEST_TMPDIR/out/.github/workflows/claude-codex-iterate.yml" | sed -n "${1}p"
+}
+
+# 渲染出来的 verify_cmd 整块（去掉块缩进），就是中央仓库交给 bash -euo pipefail -c
+# 的那个脚本。
+rendered_verify_block() {
   awk '
     /^      verify_cmd: \|$/ { f = 1; next }
     f && /^        / { sub(/^        /, ""); print; next }
     f { exit }
-  ' "$BATS_TEST_TMPDIR/out/.github/workflows/claude-codex-iterate.yml" | sed -n "${1}p"
+  ' "$BATS_TEST_TMPDIR/out/.github/workflows/claude-codex-iterate.yml"
 }
 
 # 断言写成函数，不要在测试里直接写 `[[ ... ]]`：
