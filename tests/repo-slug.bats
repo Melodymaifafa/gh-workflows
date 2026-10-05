@@ -28,6 +28,38 @@ setup() {
   [ "$output" = "Melodymaifafa/gh-workflows" ]
 }
 
+@test "host is matched case-insensitively, owner/repo keeps its case" {
+  run "$SCRIPT" https://GitHub.com/Melodymaifafa/gh-workflows.git
+  [ "$status" -eq 0 ]
+  [ "$output" = "Melodymaifafa/gh-workflows" ]
+
+  run "$SCRIPT" git@GITHUB.COM:Melodymaifafa/gh-workflows.git
+  [ "$status" -eq 0 ]
+  [ "$output" = "Melodymaifafa/gh-workflows" ]
+}
+
+@test "uppercase lookalike host is still an error" {
+  run "$SCRIPT" https://NOTGITHUB.COM/o/r.git
+  [ "$status" -eq 1 ]
+}
+
+@test "dot-only components are an error" {
+  run "$SCRIPT" https://github.com/../victim.git
+  [ "$status" -eq 1 ]
+
+  run "$SCRIPT" https://github.com/o/..
+  [ "$status" -eq 1 ]
+
+  run "$SCRIPT" git@github.com:./r.git
+  [ "$status" -eq 1 ]
+}
+
+@test "dots inside a repo name are fine" {
+  run "$SCRIPT" https://github.com/o/my.repo.git
+  [ "$status" -eq 0 ]
+  [ "$output" = "o/my.repo" ]
+}
+
 @test "no url is an error" {
   run "$SCRIPT"
   [ "$status" -eq 1 ]

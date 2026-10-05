@@ -18,22 +18,33 @@ if [ -z "$url" ]; then
   exit 1
 fi
 
-case "$url" in
-  https://github.com/*)   slug="${url#https://github.com/}" ;;
-  ssh://git@github.com/*) slug="${url#ssh://git@github.com/}" ;;
-  git@github.com:*)       slug="${url#git@github.com:}" ;;
+# 主机名不分大小写（GitHub.com 也是 github.com），所以拿小写版认前缀；
+# 切的还是原 URL，owner/repo 的大小写原样保留。
+lower="$(tr '[:upper:]' '[:lower:]' <<<"$url")"
+case "$lower" in
+  https://github.com/*)   prefix="https://github.com/" ;;
+  ssh://git@github.com/*) prefix="ssh://git@github.com/" ;;
+  git@github.com:*)       prefix="git@github.com:" ;;
   *)
     echo "::error::not a github.com remote: '$url'"
     exit 1
     ;;
 esac
 
+slug="${url:${#prefix}}"
 slug="${slug%.git}"
 
-# 剩下的必须正好是 owner/repo 两段，多一段少一段都不是仓库地址。
+# 剩下的必须正好是 owner/repo 两段，多一段少一段都不是仓库地址；
+# 「.」「..」也不是名字，放过去调用方拿它拼路径就跳出了日志目录。
 if ! [[ "$slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
   echo "::error::cannot read owner/repo from '$url'"
   exit 1
 fi
+case "/$slug/" in
+  */./* | */../*)
+    echo "::error::cannot read owner/repo from '$url'"
+    exit 1
+    ;;
+esac
 
 printf '%s\n' "$slug"
