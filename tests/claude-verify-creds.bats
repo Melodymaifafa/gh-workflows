@@ -1073,6 +1073,58 @@ EOS
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
 }
 
+# ---------- 推不上去：远端的原话归成一个类名交出去 ----------
+
+# 「改好了，但推不上去」以前在 PR 上一个字都没有（2026-10-04 这个仓库自己四条红 run，
+# 令牌不许改 workflow 文件）。收尾那一步要据此说清是哪一种拒，所以这一步必须把类名
+# 交出来；远端的原话一个字都不往外带 —— 它是远端说的话，照抄进告警就等于让它写告警。
+reject_push_with() { # reject_push_with <远端 stderr 的那一行>
+  printf '#!/bin/sh\nprintf "%%s\\n" "%s" >&2\nexit 1\n' "$1" \
+    >"$BATS_TEST_TMPDIR/origin.git/hooks/pre-receive"
+  chmod +x "$BATS_TEST_TMPDIR/origin.git/hooks/pre-receive"
+}
+
+@test "claude: a push GitHub refuses over a workflow file comes back as workflow-permission" {
+  push_workspace 'true'
+  reject_push_with 'refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission'
+
+  run_chain_trusted_push
+
+  assert_equal "$status" 1
+  assert_equal "$(step_output blocked)" workflow-permission
+  assert_contains "$output" 'the push was refused (workflow-permission)'
+  # 提交留在本地、远端没动：这一轮确实「改好了但没推上去」
+  assert_equal "$(git rev-parse HEAD)" "$(git rev-parse refs/heads/topic)"
+  [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/topic)" ]
+}
+
+@test "claude: a protected branch and a stale branch each get their own class" {
+  push_workspace 'true'
+  reject_push_with 'GH006: Protected branch update failed for refs/heads/topic'
+  run_chain_trusted_push
+  assert_equal "$status" 1
+  assert_equal "$(step_output blocked)" protected-branch
+
+  : >"$GITHUB_OUTPUT"
+  reset_workspace
+  reject_push_with 'hint: Updates were rejected because the tip of your current branch is behind (non-fast-forward)'
+  run_chain_trusted_push
+  assert_equal "$status" 1
+  assert_equal "$(step_output blocked)" non-fast-forward
+}
+
+@test "claude: a refusal we do not recognise is still reported, as unknown" {
+  push_workspace 'true'
+  reject_push_with 'remote: something nobody has seen before'
+
+  run_chain_trusted_push
+
+  assert_equal "$status" 1
+  assert_equal "$(step_output blocked)" unknown
+  # 原话照旧进日志（排障要它），只是不进告警正文
+  assert_contains "$output" 'something nobody has seen before'
+}
+
 # ---------- 总结评论 ----------
 
 # 总结由外层步骤发，文本走结构化输出：Claude 自己发就得在跑验证的同一步里握着令牌。
@@ -1139,14 +1191,15 @@ EOS
 # 跑验证那两步的块里多一行 verify_path="$PATH"（原样那份要留给验证命令自己用），
 # 所以整块比不了；能比的是判定本身 —— 十步都得是同一个 path_is_protected。
 # 少了这一条，新加一步时照抄漏一行（比如漏掉「相对项不认」那句）没人拦。
-@test "claude: all ten credentialed steps run one and the same path guard" {
+@test "claude: all eleven credentialed steps run one and the same path guard" {
   guard=''
   for step in 'Verify the Claude fix' 'Commit and push the Claude fix' \
               'Post the Claude summary comment' 'Check the fix outcome' \
               'Decide the takeover' 'Ask Codex for the fix as a patch' \
               'Verify the Codex fix' 'Commit and push the Codex fix' \
               'Request Codex re-review after a new commit' \
-              'Post the Codex verification note'; do
+              'Post the Codex verification note' \
+              'Say why this round pushed nothing'; do
     this="$(step_path_guard "$step")"
     [ -n "$this" ] || { echo "no PATH filter in: $step" >&2; return 1; }
     if [ -z "$guard" ]; then guard="$this"; continue; fi
@@ -1232,6 +1285,28 @@ claude_mode_context() {
   gate_skipped 'Check the fix outcome'
   # 裁决点照跑：它看到 outcome 没走完就把这一轮打红，也不会换 Codex 上
   gate_ran 'Decide the takeover'
+  # 告警也照跑：以前这一整条链到这里就没人说话了，PR 上一个字都没有（MEL-293）
+  gate_ran 'Say why this round pushed nothing'
+}
+
+# 推送被拒：同样一个字都没人说过，同样得有人说。
+@test "gating: a refused push still reaches the step that explains it" {
+  claude_mode_context
+  gate_fails 'Commit and push the Claude fix'
+  gate_trace "$WF"
+
+  gate_skipped 'Post the Claude summary comment'
+  gate_skipped 'Check the fix outcome'
+  gate_ran 'Say why this round pushed nothing'
+}
+
+# 一轮顺利收工时它不许跑：它只在 job 红了之后补一句为什么。
+@test "gating: a green round never reaches the step that explains a failure" {
+  claude_mode_context
+  gate_trace "$WF"
+
+  gate_ran 'Check the fix outcome'
+  gate_skipped 'Say why this round pushed nothing'
 }
 
 # review_fixer=codex：Claude 没上，它这三步一个都不许跑（否则会拿 Codex 的改动

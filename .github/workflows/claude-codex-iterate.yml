@@ -1304,7 +1304,29 @@ jobs:
             }
 
             authored_git commit -q -m "fix: apply the review feedback on PR #$PR_NUMBER ($FIXER)"
-            credentialed_git push -q origin "HEAD:$HEAD_REF"
+
+            # push 被拒时把 git 的原话收下来，归成一个固定的类名交出去（blocked=…）：
+            # 收尾那一步靠它告诉主人「改好了，但推不上去：<原因>」，而不是让这一轮静默
+            # 红掉（2026-10-04 这个仓库自己的四条红 run 就是这样，PR 上一个字都没有）。
+            # 原话一个字都不往告警里带：措辞按类名固定，远端回一行什么都伪造不出来。
+            # 落点用 mktemp 现造的随机名 —— $RUNNER_TEMP 验证命令写得动，固定名字它提前
+            # 放一份就能把归类骗走（它早已退出，猜不到这个名字）。
+            push_log="$(mktemp "$RUNNER_TEMP/push-stderr-XXXXXX")"
+            push_status=0
+            credentialed_git push -q origin "HEAD:$HEAD_REF" 2>"$push_log" || push_status=$?
+            push_err="$(<"$push_log")"
+            [ -z "$push_err" ] || printf '%s\n' "$push_err" >&2
+            if [ "$push_status" -ne 0 ]; then
+              blocked=unknown
+              case "$push_err" in
+                *'workflows` permission'* | *'create or update workflow'*) blocked=workflow-permission ;;
+                *'protected branch'* | *GH006*) blocked=protected-branch ;;
+                *non-fast-forward* | *'fetch first'*) blocked=non-fast-forward ;;
+              esac
+              echo "blocked=$blocked" >>"$GITHUB_OUTPUT"
+              echo "::error::the $FIXER fix was committed but the push was refused ($blocked)"
+              exit 1
+            fi
             new_head="$(sealed_git rev-parse HEAD)"
             echo 'pushed=true' >>"$GITHUB_OUTPUT"
             # 召唤复审那一步只批这个提交上被 GitHub 扣住的 CI（MEL-292）。
@@ -1650,7 +1672,11 @@ jobs:
               default_verify=$'uv sync --dev\nuv run ruff check .\nuv run pytest'
                 ;;
             node)
-              default_verify=$'npm ci || npm install\nnpm run lint --if-present\nnpm test'
+              # 逐字跟 ci.yml 的 node 默认值对齐（装 / lint / 测三条）。差一个字都不行：
+              # 没有 package-lock.json 的仓库 `npm ci` 直接失败，没有 test 脚本的仓库
+              # `npm test` 报 Missing script —— 两样 CI 都绿着放过，修复那一轮却必然红，
+              # 于是「改好了但验证没过」成了常态（MEL-293）。
+              default_verify=$'if [ -f package-lock.json ]; then npm ci; else npm install; fi\nnpm run lint --if-present\nnpm run test --if-present'
                 ;;
             shell)
               default_verify=$'actionlint\ngit ls-files \'*.sh\' | xargs -r shellcheck\nbats tests/'
@@ -1938,6 +1964,10 @@ jobs:
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
           PR_GUARD: ${{ steps.helpers.outputs.script }}
+          # 调用方那份工作流文件的路径，和它该跟哪个分支上的版本一致 —— 认出
+          # claude-code-action 把自己整步跳过的那种结局（见下面 stale_caller_workflow）。
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
@@ -1992,6 +2022,32 @@ jobs:
 
           H="$HEAD_SHA"
           live_head() { gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha; }
+
+          # claude-code-action 还有一种结局是「整步跳过」：PR 分支上的调用桩跟默认分支
+          # 上的那份不一样时它一个字都不改，只在日志里留一句 Workflow validation failed。
+          # 跳过的长相跟「跑过、但什么都没落地」一模一样（没有结构化结果、没有执行记录），
+          # 于是两种都只换来一条笼统的「自动修复没跑成」，主人看不出该去点 Update branch。
+          # 判据故意不去读那句日志：同一份日志里原样带着 Codex 的 review 正文（外部输入），
+          # 照抄那句报错就能骗出一条错的告警（同 classify-claude-failure.sh 开头那条规矩）。
+          # 改成直接比它比的那两份文件 —— 这是伪造不了的，而且用不着 actions 读日志的权限。
+          no_claude_record() {
+            [ -z "${STRUCTURED:-}" ] || return 1
+            [ -z "${EXEC_FILE:-}" ] || [ ! -f "$EXEC_FILE" ]
+          }
+          # github.workflow_ref 在被调用的工作流里指的是调用方那份文件，形如
+          # owner/repo/.github/workflows/x.yml@refs/pull/10/merge。
+          stale_caller_workflow() {
+            local path remote
+            path="${WORKFLOW_REF:-}"
+            path="${path%@*}"
+            path="${path#*/*/}"
+            [ -n "${DEFAULT_BRANCH:-}" ] || return 1
+            case "$path" in .github/workflows/*) ;; *) return 1 ;; esac
+            [ -f "$path" ] || return 1
+            remote="$(gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/$REPO/contents/$path?ref=$DEFAULT_BRANCH" 2>/dev/null)" || return 1
+            [ "$remote" != "$(<"$path")" ]
+          }
 
           pushed=""
           if [ "$FIX_OUTCOME" = success ] && [ -n "$STRUCTURED" ]; then
@@ -2049,6 +2105,16 @@ jobs:
                 else "fix-failed -" end' "${EXEC_FILE:-/dev/null}" 2>/dev/null || echo "fix-failed -"
           )"
 
+          # jq 读一份空的（或压根没有的）执行记录时一个字都不输出，reason 于是是空串。
+          # 空串跟 fix-failed 是同一件事，在这里一次补齐，别让后面每个判据各自兜一遍。
+          [ -n "$reason" ] || { reason=fix-failed; until=-; }
+
+          # 没留下任何「Claude 跑过」的痕迹时，先问一句是不是上面那种整步跳过。
+          if [ "$reason" = fix-failed ] && no_claude_record && stale_caller_workflow; then
+            reason=stale-workflow
+            echo 'the fixer step was skipped by the action: the caller workflow file differs from the default branch'
+          fi
+
           # review_fixer 允许换人时，结论不在这里下：Decide the takeover 才是这条链
           # 的裁决点，它用 classify-claude-failure.sh 分清 provider 侧失败还是业务
           # 失败，该换 Codex 就换、该红就红。这里先把 SDK 认定的原因交出去，也先
@@ -2070,6 +2136,9 @@ jobs:
               ;;
             auth)
               alert_once "$H" auth - "Claude 令牌失效，自动修复停了；请重新生成 CLAUDE_CODE_OAUTH_TOKEN 并更新仓库 secret。"
+              ;;
+            stale-workflow)
+              alert_once "$H" stale-workflow - "PR 分支落后于默认分支上的流水线文件，自动修复那一步被整个跳过了；在 PR 页点 Update branch，之后巡检会自动再审一次。"
               ;;
             *)
               alert_once "$H" fix-failed - "Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。"
@@ -2185,6 +2254,14 @@ jobs:
             # 推了、或看完觉得都不用改 —— 两种结局都由 Check the fix outcome 处理完了。
             fixer=claude
             why='Claude finished this round'
+          elif [ "${OUTCOME_REASON:-}" = stale-workflow ]; then
+            # action 把自己整步跳过了（PR 分支上的调用桩落后于默认分支）。换谁上都一样
+            # 跳过，所以不走分类器、不换人：说清要点 Update branch，然后红着停下。
+            fixer=claude
+            why='claude-code-action skipped itself: the caller workflow file on the PR branch differs from the default branch'
+            fatal="$why"
+            alert_reason=stale-workflow
+            alert='PR 分支落后于默认分支上的流水线文件，自动修复那一步被整个跳过了；在 PR 页点 Update branch，之后巡检会自动再审一次。'
           else
             # 只把「这次运行的终态字段」喂给分类器，绝不喂整份对话记录：记录里
             # 原样带着 Codex 的 review 正文（外部输入），照抄一句额度报错就能骗
@@ -2922,6 +2999,110 @@ jobs:
           printf '%s\n' "$body" |
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - >/dev/null ||
             echo '::warning::the Codex verification note was not posted'
+
+      # 验证红了、或者改动提交了却推不上去时，这条链到这里就没人说话了：Check the fix
+      # outcome 的 if 不写状态函数，GitHub 隐式补 success()，它被跳过；Decide the takeover
+      # 只沿用那个红、不发告警（Codex 那条路连 Decide 都已经跑过了）。于是 PR 上一个字
+      # 都没有，只有 Actions 里一条红的 run —— 要等巡检重试两次（每次隔几小时）之后才
+      # 告警 retry-exhausted，而且不说原因。两种长相都真实发生过：验证命令在调用方仓库
+      # 跑不通（wechat-mimic-finetune，2026-10-01），以及这个仓库自己「改好了但推不上去」
+      # （令牌不许改 workflow 文件，2026-10-04 四条红 run，PR 上全程没有一个字）。
+      # 本步只补说明，不再额外打红：job 早已经红了。同一个 head 同一原因只发一次。
+      - name: Say why this round pushed nothing
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.gate.outputs.head }}
+          CLAUDE_VERIFY: ${{ steps.claude_verify.outcome }}
+          CODEX_VERIFY: ${{ steps.codex_verify.outcome }}
+          CLAUDE_PUSH: ${{ steps.claude_push.outcome }}
+          CODEX_PUSH: ${{ steps.codex_push.outcome }}
+          CLAUDE_BLOCKED: ${{ steps.claude_push.outputs.blocked }}
+          CODEX_BLOCKED: ${{ steps.codex_push.outputs.blocked }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          PR_GUARD: ${{ steps.helpers.outputs.script }}
+        run: |
+          set -euo pipefail
+
+          # 同前面几步：这一步手上有 github.token 和 Pushover 两个密钥，而前面跑验证那一步
+          # 跑的是被审 PR 自己的代码 —— 往它写得动的 PATH 目录里放一个假 gh，令牌就递过去了。
+          # 所以命令只从我们写不动的目录里找。下面那段挑原因的代码只用 shell 内建，排在
+          # 过滤之后仍然一条外部命令都没跑。
+          path_is_protected() {
+            local dir="$1"
+            # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
+            # 副本；下面逐级往上剥的循环碰到不带 / 的相对项也会原地打转，整步挂到超时。
+            case "$dir" in /*) ;; *) return 1 ;; esac
+            [ -d "$dir" ] || return 1
+            while :; do
+              [ ! -w "$dir" ] || return 1
+              [ "$dir" != / ] || return 0
+              dir="${dir%/*}"
+              [ -n "$dir" ] || dir=/
+            done
+          }
+          trusted_path=''
+          saved_ifs="${IFS-}"
+          IFS=:
+          # shellcheck disable=SC2086  # 就是要按 IFS=: 拆开 PATH
+          set -- $PATH
+          IFS="$saved_ifs"
+          for dir in "$@"; do
+            path_is_protected "$dir" || continue
+            trusted_path="${trusted_path:+$trusted_path:}$dir"
+          done
+          PATH="$trusted_path"
+
+          # Gate 还没判出 head（它自己红的、或更早的步骤红的）就没有可去重的对象：
+          # 那种红跟「这一轮没推上去」不是一回事，这里不说话。
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo 'no head from the gate step; nothing to explain here'
+            exit 0
+          fi
+
+          reason=''
+          msg=''
+          if [ "${CLAUDE_VERIFY:-}" = failure ] || [ "${CODEX_VERIFY:-}" = failure ]; then
+            reason=verify-failed
+            msg="本仓库的验证命令（lint 或测试）没过，改好的改动没推上去：$RUN_URL"
+          elif [ "${CLAUDE_PUSH:-}" = failure ] || [ "${CODEX_PUSH:-}" = failure ]; then
+            # 「改好了却推不上去」要说实话。以前这种结局连告警都没有，更早的版本则只会
+            # 落到一条笼统的「没跑成」上，读起来像「Claude 看完觉得都不用改」。
+            blocked="${CLAUDE_BLOCKED:-}"
+            [ -n "$blocked" ] || blocked="${CODEX_BLOCKED:-}"
+            case "$blocked" in
+              workflow-permission) why='机器人的令牌不许改 workflow 文件，这一笔得人来推' ;;
+              protected-branch) why='分支保护拦住了这次推送' ;;
+              non-fast-forward) why='分支上有别人的新提交，要先同步再推' ;;
+              *) why='原因在这次运行的日志里' ;;
+            esac
+            reason=push-failed
+            msg="改好了，但推不上去：$why。$RUN_URL"
+          else
+            echo 'neither the verify nor the push step failed; whoever went red already said why'
+            exit 0
+          fi
+
+          # 少了哪一样这条告警就发不出去 —— 红着停下（job 本来就是红的），别静默空转。
+          for tool in gh jq curl date; do
+            command -v "$tool" >/dev/null 2>&1 && continue
+            echo "::error::$tool is not available from a write-protected PATH entry; cannot post the $reason alert"
+            exit 1
+          done
+
+          # 告警函数从 Define pr-guard helpers 的 output 取，不读 $RUNNER_TEMP 里那份文件：
+          # 那个文件验证命令写得动，往里塞一行就在这一步里、带着令牌跑起来。没拿到就红着停下。
+          eval "${PR_GUARD:-}"
+          declare -F pushover trusted_comments alert_once >/dev/null || {
+            echo '::error::the pr-guard helpers did not arrive from the Define step; cannot post this alert'
+            exit 1
+          }
+
+          alert_once "$HEAD_SHA" "$reason" - "$msg"
 
   # 修满 max_fix_rounds 轮、当前 head 上还有意见时，Claude 逐条重判这些意见拦不拦合并。
   # 形状同 codex-approved-merge 的 claude-review：Claude 只读文件、拿只读令牌，根目录是受信任

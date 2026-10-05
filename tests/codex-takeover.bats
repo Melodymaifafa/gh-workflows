@@ -1856,6 +1856,19 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   refute_called "gh pr comment"
 }
 
+# claude-code-action 把自己整步跳过了（PR 分支上的调用桩落后于默认分支，判据见
+# iterate-gate.bats 的 stale_caller_workflow）。换谁上都一样被跳过，所以这里不问分类器、
+# 不换人：说清要去点 Update branch，然后红着停下。以前它落到一条笼统的「没跑成」上。
+@test "takeover: a stale caller workflow is fatal, says Update branch, and hands nothing over" {
+  decide claude true stale-workflow
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+  body="$(fake_last_body "gh pr comment")"
+  assert_contains "$body" 'Update branch'
+  assert_contains "$body" "reason=stale-workflow until=- -->"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" 'claude-code-action skipped itself'
+}
+
 # 两步的 run 块里都不许再出现那个文件名：谁把 source 加回来，这一条当场红。
 @test "structure: no step after the verify command loads its alert helpers from RUNNER_TEMP" {
   for step in 'Check the fix outcome' 'Decide the takeover'; do
