@@ -25,10 +25,22 @@ load test_helper/common
   refute_contains "$stub" '__OVERRIDES__'
 }
 
+# ci.yml 的 Resolve commands 把 INSTALL_CMD / LINT_CMD / TEST_CMD 写进 $GITHUB_ENV，
+# 所以这个套件在 CI 里跑的时候，环境里本来就有这三个值（装 actionlint、跑 bats 那套）。
+# 渲染必须只看测试给的值，不看环境里捡到的 —— 否则上面那两条「没传覆盖值」本机绿、
+# CI 红，而红的是测试不是产品，最难看懂。
+@test "the CI job's own INSTALL_CMD in the environment does not leak into the rendering" {
+  export INSTALL_CMD='leaked-install' LINT_CMD='leaked-lint' TEST_CMD='leaked-test' RUNS_ON='leaked-runner'
+  onboard_render python
+  refute_contains "$(rendered_stub ci.yml)" leaked
+  refute_contains "$(rendered_stub claude-codex-iterate.yml)" leaked
+  refute_contains "$(rendered_stub claude-codex-iterate.yml)" $'\n      verify_cmd:'
+}
+
 # ---------- 给了覆盖值 → 桩里有对应的 verify_cmd ----------
 
 @test "all three overridden: verify_cmd is those three commands, one per line" {
-  INSTALL_CMD='make deps' LINT_CMD='make lint' TEST_CMD='make test' onboard_render node
+  OV_INSTALL='make deps' OV_LINT='make lint' OV_TEST='make test' onboard_render node
   assert_equal "$(rendered_verify_line 1)" 'make deps'
   assert_equal "$(rendered_verify_line 2)" 'make lint'
   assert_equal "$(rendered_verify_line 3)" 'make test'
@@ -36,7 +48,7 @@ load test_helper/common
 }
 
 @test "the override also lands in ci.yml, so both sides say the same thing" {
-  INSTALL_CMD='make deps' LINT_CMD='make lint' TEST_CMD='make test' onboard_render node
+  OV_INSTALL='make deps' OV_LINT='make lint' OV_TEST='make test' onboard_render node
   ci="$(rendered_stub ci.yml)"
   assert_contains "$ci" "install_cmd: 'make deps'"
   assert_contains "$ci" "lint_cmd: 'make lint'"
@@ -46,14 +58,14 @@ load test_helper/common
 # verify_cmd 是整份替换，不是逐行合并。只写被覆盖的那一条，另两条会从修复那一轮里
 # 整个消失 —— 装依赖没了，后面两条必然红。这条是这张票最容易写错的地方。
 @test "one override only: the other two lines are filled with ci.yml's defaults" {
-  TEST_CMD='pytest -x' onboard_render python
+  OV_TEST='pytest -x' onboard_render python
   assert_equal "$(rendered_verify_line 1)" 'uv sync --dev'
   assert_equal "$(rendered_verify_line 2)" 'uv run ruff check .'
   assert_equal "$(rendered_verify_line 3)" 'pytest -x'
 }
 
 @test "runs_on alone is not a verify command and writes no verify_cmd" {
-  RUNS_ON='macos-latest' onboard_render node
+  OV_RUNS_ON='macos-latest' onboard_render node
   refute_contains "$(rendered_stub claude-codex-iterate.yml)" $'\n      verify_cmd:'
   assert_contains "$(rendered_stub ci.yml)" "runs_on: 'macos-latest'"
 }
@@ -63,7 +75,7 @@ load test_helper/common
 # 第三份拷贝（ci.yml、中央 iterate、onboard.sh）就得有第三条判定钉住它。
 # 差一个字的后果跟 MEL-293 一样：CI 绿着、修复那一轮必然红。
 @test "pinned: the python defaults onboard fills in are ci.yml's, verbatim" {
-  TEST_CMD=skip onboard_render python
+  OV_TEST=skip onboard_render python
   line1="$(rendered_verify_line 1)"
   line2="$(rendered_verify_line 2)"
   resolve_commands python                      # 这一句会重写 $GITHUB_ENV，所以先读完上面
@@ -72,7 +84,7 @@ load test_helper/common
 }
 
 @test "pinned: the node defaults onboard fills in are ci.yml's, verbatim" {
-  INSTALL_CMD=skip onboard_render node
+  OV_INSTALL=skip onboard_render node
   line2="$(rendered_verify_line 2)"
   line3="$(rendered_verify_line 3)"
   resolve_commands node
@@ -85,7 +97,7 @@ load test_helper/common
 # 这一条不比「跟 ci.yml 一致」，它盯着 MEL-293 那个坑本身：没有 lockfile 的仓库
 # 碰上裸 `npm ci` 直接失败，而 CI 绿着。免得哪天 ci.yml 先退化、两边一起错。
 @test "pinned: the node install default survives a repo with no lockfile" {
-  TEST_CMD=skip onboard_render node
+  OV_TEST=skip onboard_render node
   install="$(rendered_verify_line 1)"
   assert_contains "$install" 'if [ -f package-lock.json ]'
   refute_contains "$install" 'npm ci || npm install'
@@ -96,7 +108,7 @@ load test_helper/common
 # ci.yml 的 skip 在那一步里是「打一条 notice 然后退出 0」。原样把 skip 写进
 # verify_cmd 会被当成命令：找不到就 127，整轮红。
 @test "skip becomes a notice, never the bare word skip" {
-  LINT_CMD=skip onboard_render python
+  OV_LINT=skip onboard_render python
   assert_equal "$(rendered_verify_line 2)" 'echo "::notice::lint skipped by caller"'
   run bash -euo pipefail -c "$(rendered_verify_line 2)"
   assert_equal "$status" 0
@@ -104,7 +116,7 @@ load test_helper/common
 }
 
 @test "skip on every line still leaves a non-empty verify_cmd" {
-  INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip onboard_render node
+  OV_INSTALL=skip OV_LINT=skip OV_TEST=skip onboard_render node
   # 空的 verify_cmd 会让中央仓库判定「没有验证命令」、红着拒绝推送，
   # 于是这个仓库的修复一轮也走不完。三条 notice 跑得过，而且说得出跳了什么。
   assert_contains "$(rendered_verify_line 1)" 'install skipped by caller'
@@ -118,12 +130,12 @@ load test_helper/common
 
 # 三条全 skip = 修复不经任何检查就推。接入这一刻不说，之后没人会再看生成的桩。
 @test "skip on every line warns at onboard time that nothing gets verified" {
-  INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip
+  OV_INSTALL=skip OV_LINT=skip OV_TEST=skip
   assert_contains "$(onboard_coverage_warning)" '都不会真验证任何东西'
 }
 
 @test "a repo that verifies something is not warned" {
-  INSTALL_CMD=skip LINT_CMD=skip TEST_CMD='pytest'
+  OV_INSTALL=skip OV_LINT=skip OV_TEST='pytest'
   assert_equal "$(onboard_coverage_warning)" ''
 }
 
@@ -139,7 +151,7 @@ load test_helper/common
 # ---------- 渲染出来的桩得是合法 YAML ----------
 
 @test "the rendered iterate stub parses as YAML with verify_cmd as three lines" {
-  INSTALL_CMD='make deps' LINT_CMD=skip TEST_CMD='make test' onboard_render node
+  OV_INSTALL='make deps' OV_LINT=skip OV_TEST='make test' onboard_render node
   run python3 -c '
 import sys, pathlib
 try:

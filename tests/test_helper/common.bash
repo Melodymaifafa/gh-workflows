@@ -74,24 +74,29 @@ resolved() {
 # ---------------------------------------------------------------------------
 # onboard.sh 的调用桩渲染。source 它只会拿到那几个函数：主流程（动远端仓库那段）
 # 被 BASH_SOURCE 判定挡住了，所以这里跑的是 onboard.sh 里的真代码。
-# 三个 *_CMD 对应 onboard.sh 的那三个环境变量，默认空串 = 调用方没覆盖。
+#
+# 测试要覆盖哪条就设 OV_INSTALL / OV_LINT / OV_TEST / OV_RUNS_ON，**不要**直接设
+# onboard.sh 读的那四个名字：`ci.yml` 的 Resolve commands 会把 INSTALL_CMD /
+# LINT_CMD / TEST_CMD 写进 $GITHUB_ENV，于是这个套件在 CI 里跑时环境里本来就有值。
+# 继承它们的话，「没传覆盖值」那几条判定在本机绿、在 CI 红（PR #48 第一版踩过）。
+# 下面每次都把那四个名字完整赋一遍，子进程看到的值只由 OV_* 决定。
 # ---------------------------------------------------------------------------
 
 # 渲染四个调用桩到 $BATS_TEST_TMPDIR/out/.github/workflows/。
 onboard_render() { # onboard_render <python|node>
-  INSTALL_CMD="${INSTALL_CMD:-}" \
-  LINT_CMD="${LINT_CMD:-}" \
-  TEST_CMD="${TEST_CMD:-}" \
-  RUNS_ON="${RUNS_ON:-}" \
+  INSTALL_CMD="${OV_INSTALL-}" \
+  LINT_CMD="${OV_LINT-}" \
+  TEST_CMD="${OV_TEST-}" \
+  RUNS_ON="${OV_RUNS_ON-}" \
     bash -c '. "$1"; render_stubs "$2" "$3"' \
       _ "$REPO_ROOT/onboard.sh" "$1" "$BATS_TEST_TMPDIR/out"
 }
 
 # 只跑「三条全 skip 就警告」那一段，stderr 并进 stdout 好断言。
 onboard_coverage_warning() {
-  INSTALL_CMD="${INSTALL_CMD:-}" \
-  LINT_CMD="${LINT_CMD:-}" \
-  TEST_CMD="${TEST_CMD:-}" \
+  INSTALL_CMD="${OV_INSTALL-}" \
+  LINT_CMD="${OV_LINT-}" \
+  TEST_CMD="${OV_TEST-}" \
     bash -c '. "$1"; verify_coverage_warning' _ "$REPO_ROOT/onboard.sh" 2>&1
 }
 
