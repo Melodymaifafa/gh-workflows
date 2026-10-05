@@ -15,8 +15,13 @@ if [ -z "$url" ]; then
   exit 1
 fi
 
-host="${url#*://}"
-host="${host#*@}"
-host="${host%%[:/]*}"
+authority="${url#*://}"
+authority="${authority%%/*}"
+authority="${authority##*@}"
+
+case "$authority" in
+  \[*\]*) host="${authority%%]*}]" ;;
+  *) host="${authority%%:*}" ;;
+esac
 
 printf '%s\n' "$host"
