@@ -259,11 +259,15 @@ case " $* " in
 esac
 EOF
   chmod +x "$fake"
-  GHWF_SWEEP_REAL_PS="$fake" "$SWEEP_BIN_DIR/ps" "$@"
+  # 「我们是谁」也喂死（GHWF_SWEEP_SELF）：真用调用者的 pid，表里那几个号码万一撞上
+  # 就换一个答案 —— 容器里 pid 从小数开始，撞得上。
+  GHWF_SWEEP_REAL_PS="$fake" GHWF_SWEEP_SELF="${1:-9}" "$SWEEP_BIN_DIR/ps" "${@:2}"
 }
 
 @test "the scoped ps drops another bats run's whole tree and nothing else" {
-  run sweep_ps_with_table -U 501 -o pid=,args=
+  # 清点是从 999（表里没有、也不是任何人的后代）那儿问出来的 = 表里每一棵 bats 树
+  # 都是「隔壁」。
+  run sweep_ps_with_table 999 -U 501 -o pid=,args=
   assert_equal "$status" 0
   # 隔壁那棵树：根（bats-exec-*）和挂在它底下的进程一起消失
   refute_contains "$output" 'bats-exec-suite'
@@ -277,8 +281,19 @@ EOF
 @test "the scoped ps leaves the process-group sweep alone" {
   # 按进程组那一下（`ps -e -o pgid=…`）只看我们自己那个组号，本来就不会数到隔壁，
   # 所以一个字都不许改：改了就是在筛一道压根没误判的清点。
-  run sweep_ps_with_table -e -o pgid=,pid=,stat=
+  run sweep_ps_with_table 999 -e -o pgid=,pid=,stat=
   assert_equal "$status" 0
   assert_contains "$output" 'bats-exec-suite'
   assert_contains "$output" 'sleep 10'
+}
+
+@test "the scoped ps keeps our own bats run, tree and all" {
+  # 反面那一半：清点是从 102（挂在 100 那棵树底下）问出来的，那棵树于是是**我们**
+  # 这次 run，一个都不许少报。少报就等于本机上这道门整个空转。
+  run sweep_ps_with_table 102 -U 501 -o pid=,args=
+  assert_equal "$status" 0
+  assert_contains "$output" 'bats-exec-suite'
+  assert_contains "$output" 'bats-exec-test'
+  assert_contains "$output" 'sleep 10'
+  assert_contains "$output" '200 sh /tmp/bats-run-zzz/test/9/escape.sh'
 }

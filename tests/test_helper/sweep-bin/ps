@@ -10,6 +10,11 @@
 # 收窄的是「**隔壁那次 run**」，不是「不是我们起的」—— 两者差别就是这道门的全部价值：
 # 验证命令的逃逸进程 setsid 换了会话、关光了描述符、被过继给 init，认不回我们，但它
 # 同样认不回隔壁那棵树，所以照报、照红。探针测的还是原来那件事。
+#
+# GHWF_SWEEP_REAL_PS / GHWF_SWEEP_SELF 只给 tests/harness.bats 那两条用：喂一张固定的
+# 进程表 + 一个固定的「我们是谁」，那两条于是在哪台机器上都是同一个答案，不靠真实
+# pid 撞不撞上表里的号码。
+
 # 真正的 ps 只认绝对路径：这个目录就在 PATH 最前面，退回去按名字找会找回自己，
 # 变成无限递归。一个都找不到就红着停下 —— 清点问不出来，而静默空转比红了更糟。
 real="${GHWF_SWEEP_REAL_PS:-}"
@@ -47,7 +52,7 @@ fi
 {
   printf '%s\n' "$snap" | sed 's/^/S|/'
   printf '%s\n' "$out" | sed 's/^/O|/'
-} | awk -v self="$PPID" '
+} | awk -v self="${GHWF_SWEEP_SELF:-$PPID}" '
     substr($0, 1, 2) == "S|" {
       line = substr($0, 3)
       n = split(line, f, " ")
