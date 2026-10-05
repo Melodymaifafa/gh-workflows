@@ -1,0 +1,80 @@
+#!/bin/sh
+# 只给**测试**用的 ps。为什么需要它、以及它为什么不放宽任何判定，见
+# tests/test_helper/common.bash 里 scope_proc_sweep_to_this_run 的那段注释。
+#
+# 一句话：验证正文那道「按运行用户清点残留」问的是「这个 uid 名下有谁」，在 runner
+# 上这等于「我们自己起的有谁」（进程表干净），在本机上不等于 —— 同一台 Mac 上另一个
+# worker 的 `bats tests/` 跟我们同一个用户，它的进程于是被当成「验证命令留下的」。
+# 这一份把答案收窄回 runner 上那个意思：隔壁那次 bats run 整棵树不报，其余一律原样报。
+#
+# 收窄的是「**隔壁那次 run**」，不是「不是我们起的」—— 两者差别就是这道门的全部价值：
+# 验证命令的逃逸进程 setsid 换了会话、关光了描述符、被过继给 init，认不回我们，但它
+# 同样认不回隔壁那棵树，所以照报、照红。探针测的还是原来那件事。
+real=${GHWF_SWEEP_REAL_PS:-/bin/ps}
+[ -x "$real" ] || real='ps'
+
+# 只有「按 uid 全机清点」那一种调用会数到隔壁（`ps -U <uid>`）。按进程组那一下
+# （`ps -e -o pgid=…`）本来就只看我们自己那个组号，原样放过。
+scoped=''
+for arg in "$@"; do
+  [ "$arg" = "-U" ] && scoped=1
+done
+[ -n "$scoped" ] || exec "$real" "$@"
+
+status=0
+out="$("$real" "$@")" || status=$?
+# 全机快照问不出来就什么都不筛：宁可把今天的噪声留着，也不要悄悄少报一个残留。
+snap="$("$real" -A -o pid=,ppid=,args= 2>/dev/null)" || snap=''
+if [ -z "$snap" ] || [ -z "$out" ]; then
+  [ -z "$out" ] || printf '%s\n' "$out"
+  exit "$status"
+fi
+
+{
+  printf '%s\n' "$snap" | sed 's/^/S|/'
+  printf '%s\n' "$out" | sed 's/^/O|/'
+} | awk -v self="$PPID" '
+    substr($0, 1, 2) == "S|" {
+      line = substr($0, 3)
+      n = split(line, f, " ")
+      p = f[1]
+      parent[p] = f[2]
+      a = ""
+      for (i = 3; i <= n; i++) a = a " " f[i]
+      cmd[p] = a
+      seen[++np] = p
+      next
+    }
+    substr($0, 1, 2) == "O|" { asked[++no] = substr($0, 3); next }
+    END {
+      # 我们自己这条祖先链：从调用 ps 的那个 shell 一路往上。链上那些 bats 进程是
+      # 我们这次 run 的，不许被当成隔壁。
+      p = self; hops = 0
+      while (p != "" && p != "0" && p != "1" && hops < 64) {
+        mine[p] = 1
+        p = parent[p]
+        hops++
+      }
+      # 隔壁那次 run 的根：bats 自己那几个 exec 进程，而且不在我们这条链上。
+      # 认 bats-exec-* 而不认别的，是因为 bats run 里所有其它进程都挂在它们底下，
+      # 而我们的探针（`sh …/escape.sh`、`perl …`、`sleep`）谁都不长这个样子。
+      for (i = 1; i <= np; i++) {
+        p = seen[i]
+        if (!(p in mine) && cmd[p] ~ /bats-exec-/) elsewhere[p] = 1
+      }
+      # 根加它的全部后代
+      for (i = 1; i <= np; i++) {
+        p = seen[i]; q = p; hops = 0
+        while (q != "" && q != "0" && q != "1" && hops < 64) {
+          if (q in elsewhere) { hide[p] = 1; break }
+          q = parent[q]
+          hops++
+        }
+      }
+      for (i = 1; i <= no; i++) {
+        split(asked[i], g, " ")
+        if (g[1] in hide) continue
+        print asked[i]
+      }
+    }'
+exit "$status"

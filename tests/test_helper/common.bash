@@ -458,6 +458,43 @@ trust_patch() {
   '
 }
 
+# scope_proc_sweep_to_this_run：验证正文那道「清点残留活进程」问的是「这个 uid 名下
+# 有谁」。runner 上进程表干净，那句话等于「我们自己起的有谁」；本机不等于 —— 池子
+# 一轮最多 3 个 worker，同一个仓库撞上两个是常态，隔壁那次 `bats tests/` 跟我们同一个
+# 用户，它的进程于是被当成「验证命令留下的」，整套测试随机红几条（MEL-304，本机实测
+# 两套并发各红 19 条，每次红的还不是同几条）。
+#
+# 所以把答案收窄回 runner 上那个意思：给验证正文一份只认本次 bats run 的 ps，隔壁
+# 那棵 bats 树整个不报，其余一律原样报。防线正文一个字不改 —— 收窄发生在「谁来回答
+# ps」这一层，判据（除了基线里那些和我们自己的后代，一个都不许有）照旧。
+#
+# 为什么不是「只认我们自己起的」：验证命令的逃逸探针 setsid 换了会话、关光了描述符、
+# 被过继给 init，按任何「我们起的」口径都认不回来 —— 那正是这道门要抓的东西。隔壁
+# 那棵树认得出来（它的根是 bats 自己那几个 exec 进程），所以筛掉的只有它。
+#
+# 反证开关：`GHWF_SWEEP_UNSCOPED=1 bats tests/` 把 ps 换回全机那一份，并发场景立刻
+# 重新变红。筛选条件只在测试里存在，workflow 从不读它。
+SWEEP_BIN_DIR="$REPO_ROOT/tests/test_helper/sweep-bin"
+
+scope_proc_sweep_to_this_run() {
+  [ "${GHWF_SWEEP_UNSCOPED:-}" != 1 ] || return 0
+  [ -n "${FIX_VERIFY_GUARD:-}" ] || {
+    echo 'scope_proc_sweep_to_this_run: FIX_VERIFY_GUARD is not set yet' >&2
+    return 1
+  }
+  local patched
+  patched="$(printf '%s\n' "$FIX_VERIFY_GUARD" | awk -v d="$SWEEP_BIN_DIR" '
+    { print }
+    !done && $0 ~ /^[[:space:]]*PATH="\$trusted_path";?$/ { print "PATH=\"" d ":$PATH\""; done = 1 }
+    END { if (!done) exit 1 }
+  ')" || {
+    echo 'scope_proc_sweep_to_this_run: the verify guard no longer filters PATH; the scoped ps was not installed' >&2
+    return 1
+  }
+  FIX_VERIFY_GUARD="$patched"
+  export FIX_VERIFY_GUARD
+}
+
 # step_env_keys <workflow-file> <step-name>：打印这一步 `env:` 块里声明的变量名，
 # 一行一个。守「这一步不许拿到某个变量」这类性质要靠它：run_block 只抽 run: 块，
 # 环境是测试自己喂的，光看块里写了什么看不出 step 真跑起来手上有哪些值。

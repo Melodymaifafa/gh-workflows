@@ -229,3 +229,56 @@ YML
   run jq -r '.[] | select(.type == "rate_limit_event") | .rate_limit_info.resetsAt' "$FIXTURES_DIR/sdk/exec-429-weekly-limit.json"
   assert_equal "$output" 1787569200
 }
+
+# ---------- 只认本次 run 的那份 ps（MEL-304） ----------
+
+# 验证正文那道清点按运行用户问「名下有谁」。本机上另一个 worker 的 `bats tests/` 跟
+# 我们同一个用户，它的进程会被当成「验证命令留下的」，整套测试随机变红。tests 里那份
+# ps（tests/test_helper/sweep-bin/ps）把答案收窄回 runner 上那个意思。
+# 这两条钉住它收窄到哪儿：隔壁那棵 bats 树整个不报，别的一个都不少报 —— 尤其是逃出
+# 进程组、被过继给 init 的那种残留，那正是这道门要抓的东西，少报一个就是假绿。
+# 进程表是喂进去的（GHWF_SWEEP_REAL_PS），所以这两条在哪台机器上都是同一个答案。
+sweep_ps_with_table() { # sweep_ps_with_table <args…>
+  local fake="$BATS_TEST_TMPDIR/table-ps"
+  cat >"$fake" <<'EOF'
+#!/bin/sh
+# 两种问法答同一张表：-A 是快照（带 ppid），别的是清点自己要的格式。
+case " $* " in
+  *" -A "*) printf '%s\n' \
+      '    1     0 /sbin/launchd' \
+      '  100     1 bash /opt/bats-core/libexec/bats-core/bats-exec-suite --x' \
+      '  101   100 bash /opt/bats-core/libexec/bats-core/bats-exec-test --x' \
+      '  102   101 sleep 10' \
+      '  200     1 sh /tmp/bats-run-zzz/test/9/escape.sh' ;;
+  *) printf '%s\n' \
+      '    1 /sbin/launchd' \
+      '  100 bash /opt/bats-core/libexec/bats-core/bats-exec-suite --x' \
+      '  101 bash /opt/bats-core/libexec/bats-core/bats-exec-test --x' \
+      '  102 sleep 10' \
+      '  200 sh /tmp/bats-run-zzz/test/9/escape.sh' ;;
+esac
+EOF
+  chmod +x "$fake"
+  GHWF_SWEEP_REAL_PS="$fake" "$SWEEP_BIN_DIR/ps" "$@"
+}
+
+@test "the scoped ps drops another bats run's whole tree and nothing else" {
+  run sweep_ps_with_table -U 501 -o pid=,args=
+  assert_equal "$status" 0
+  # 隔壁那棵树：根（bats-exec-*）和挂在它底下的进程一起消失
+  refute_contains "$output" 'bats-exec-suite'
+  refute_contains "$output" 'bats-exec-test'
+  refute_contains "$output" 'sleep 10'
+  # 逃出进程组、被过继给 init 的那个残留照旧报出来 —— 它是这道门的全部意义
+  assert_contains "$output" '200 sh /tmp/bats-run-zzz/test/9/escape.sh'
+  assert_contains "$output" '1 /sbin/launchd'
+}
+
+@test "the scoped ps leaves the process-group sweep alone" {
+  # 按进程组那一下（`ps -e -o pgid=…`）只看我们自己那个组号，本来就不会数到隔壁，
+  # 所以一个字都不许改：改了就是在筛一道压根没误判的清点。
+  run sweep_ps_with_table -e -o pgid=,pid=,stat=
+  assert_equal "$status" 0
+  assert_contains "$output" 'bats-exec-suite'
+  assert_contains "$output" 'sleep 10'
+}

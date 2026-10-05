@@ -30,6 +30,10 @@ setup() {
   # 过去），不读 $RUNNER_TEMP 里的文件。
   export FIX_VERIFY_GUARD; FIX_VERIFY_GUARD="$(step_output verify)"
   export FIX_PUSH_GUARD; FIX_PUSH_GUARD="$(step_output push)"
+  # 残留清点按运行用户问「名下有谁」，本机上那等于「这台 Mac 上这个用户有谁」——
+  # 隔壁 worker 的 bats 一起数进来。把回答这个问题的 ps 换成只认本次 run 的那一份
+  # （见 common.bash 里 scope_proc_sweep_to_this_run）。
+  scope_proc_sweep_to_this_run
   : >"$GITHUB_OUTPUT"
 }
 
