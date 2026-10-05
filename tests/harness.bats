@@ -236,7 +236,7 @@ YML
 # `bats tests/`、macOS 按需拉起来的服务、开着的桌面应用，它们会被当成「验证命令留
 # 下的」，整套测试随机变红。tests 里那份 ps（tests/test_helper/sweep-bin/ps）只答本次
 # run 自己的进程。
-# 下面四条钉住边界。最要紧的是第二条「逃出去的残留必须照答」—— 这条规则的失败方向
+# 下面几条钉住边界。最要紧的是第二条「逃出去的残留必须照答」—— 这条规则的失败方向
 # 是少报，少报一个，那几条「必须红」的测试就假绿。
 # 进程表、「我们是谁」、本次标记、uid 全是喂进去的，所以在哪台机器上都是同一个答案。
 sweep_ps_with_table() { # sweep_ps_with_table <我们是谁的 pid> <本次 run 的标记> <args…>
@@ -251,6 +251,8 @@ sweep_ps_with_table() { # sweep_ps_with_table <我们是谁的 pid> <本次 run 
 #   300  我们这次 run 的 bats，301 我们这一步的 shell（清点从这儿问出来），302 它的子进程
 #   400  我们的逃逸残留：被过继给 init，argv 里还带着本次 run 的临时目录
 #   500  macOS 按需拉起来的服务，600 机器上随便一个别的进程
+#   700  我们的另一个逃逸残留：exec 成了 /bin/sleep，argv 里没有标记、被过继给 init，
+#        长得跟 600 一样，只有探针自己报过的 pid 认得出它
 case " $* " in
   *pid=,ppid=,args=*) printf '%s\n' \
       '    1     0 /sbin/launchd' \
@@ -264,7 +266,8 @@ case " $* " in
       '  302   301 git status' \
       '  400     1 /bin/sh /tmp/bats-run-mine/escapee.sh' \
       '  500     1 /usr/libexec/networkserviceproxy' \
-      '  600     1 /Users/me/.local/bin/some-agent --model x' ;;
+      '  600     1 /Users/me/.local/bin/some-agent --model x' \
+      '  700     1 /bin/sleep 60' ;;
   *) printf '%s\n' \
       '    1 /sbin/launchd' \
       '   50 bash /usr/local/bin/run-the-suites' \
@@ -277,7 +280,8 @@ case " $* " in
       '  302 git status' \
       '  400 /bin/sh /tmp/bats-run-mine/escapee.sh' \
       '  500 /usr/libexec/networkserviceproxy' \
-      '  600 /Users/me/.local/bin/some-agent --model x' ;;
+      '  600 /Users/me/.local/bin/some-agent --model x' \
+      '  700 /bin/sleep 60' ;;
 esac
 EOF
   chmod +x "$fake"
@@ -298,6 +302,8 @@ EOF
   refute_contains "$output" 'networkserviceproxy'
   refute_contains "$output" 'some-agent'
   refute_contains "$output" 'launchd'
+  # 没报过号码的 700 跟外人分不开，照样筛掉 —— 下面那条答出它，靠的只是那一句报号
+  refute_contains "$output" '/bin/sleep 60'
 }
 
 @test "the scoped ps still answers a leftover that escaped its process group" {
@@ -307,6 +313,21 @@ EOF
   run sweep_ps_with_table 301 /tmp/bats-run-mine -U 501 -o pid=,args=
   assert_equal "$status" 0
   assert_contains "$output" '400 /bin/sh /tmp/bats-run-mine/escapee.sh'
+}
+
+@test "the scoped ps answers a leftover that exec'd its marker away, by the pid it reported" {
+  # 逃出去之后再 exec 成 /bin/sleep：argv 里什么标记都不剩、父子链也断了，前两条认法
+  # 都认不回它。探针 exec 之前把自己的 pid 报出来（exec 不换 pid），筛选按号码认。
+  # 少了这一条，「残留不带标记」那种逃逸在整套测试里就没人管了。
+  printf '700\n' >"$BATS_TEST_TMPDIR/probe.pid"
+  export GHWF_SWEEP_PROBE_PIDFILE="$BATS_TEST_TMPDIR/probe.pid"
+  run sweep_ps_with_table 301 /tmp/bats-run-mine -U 501 -o pid=,args=
+  assert_equal "$status" 0
+  assert_contains "$output" '700 /bin/sleep 60'
+  # 报了一个号码不等于把外人都放进来
+  refute_contains "$output" 'some-agent'
+  refute_contains "$output" 'networkserviceproxy'
+  refute_contains "$output" 'bats-run-theirs'
 }
 
 @test "the scoped ps answers a leftover whose command line only the sweep could read" {

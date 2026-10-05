@@ -1499,14 +1499,18 @@ EOS
   escaped_probe
   # 换掉载荷：什么都不偷，只是活着。报出来的 pid 就是它自己写下的那个。
   # 走 /bin/sleep 的绝对路径：测试环境里 PATH 上那个假 sleep 压根不睡。
-  # 这里**不** exec 成 /bin/sleep：本机跑测试时，清点按「argv 里带不带本次 run 的
-  # 临时目录」认哪些进程是我们的（见 tests/test_helper/sweep-bin/ps）。exec 之后
-  # argv 变成光秃秃一个 `/bin/sleep 12`，什么线索都不剩，清点看不见它、这一条假绿
-  # （实测过一次）。留着这层 shell，活着的那个进程 argv 里就一直带着探针脚本的路径。
+  # exec 成 /bin/sleep 是故意的：这一条要守的正是「argv 里一点线索都不剩」的那种残留
+  # —— 防线按运行用户清点，本来就不该靠命令行认它，测试也得有一条证明这一点。
+  # 本机跑测试时，清点按「argv 里带不带本次 run 的临时目录」认哪些进程是我们的（见
+  # tests/test_helper/sweep-bin/ps），exec 之后它认不出来、这一条假绿过一次。所以探针
+  # exec 之前把自己的 pid 报给那份 ps（exec 不换 pid），按号码认回来。
+  # 不再套一层 shell 还有一个原因：套着的话 reap_escaped 收掉的只是外面那层 shell，
+  # 里面的 sleep 被过继给 init、再活一分钟，跟后面那些清点进程的测试撞在一起。
+  export GHWF_SWEEP_PROBE_PIDFILE="$ESCAPE_PID"
   cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
 #!/bin/sh
 echo "$$" >"$ESCAPE_PID"
-/bin/sleep 60
+exec /bin/sleep 60
 EOS
   push_workspace "$ESCAPE_VERIFY"
 
