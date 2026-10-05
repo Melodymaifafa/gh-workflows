@@ -960,6 +960,33 @@ runs_seq() { # runs_seq <seq> [run-json ...]
   assert_contains "$(cat "$REPO_ROOT/$WF")" "已存到 .review/findings.md"
 }
 
+# 修复那一轮的默认验证命令必须跟 ci.yml 的默认值逐字一样。差一个字的代价是单向的：
+# 没有 package-lock.json 的仓库 `npm ci` 直接失败，没有 test 脚本的仓库 `npm test` 报
+# Missing script —— CI 两样都绿着放过，修复那一轮却必然红，于是「改好了但验证没过」
+# 成了常态（MEL-293）。
+@test "resolve: the node verify command is the same three commands ci.yml runs" {
+  export RUNTIME=node VERIFY_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh VERIFY_ISOLATION=auto
+  run_block "$WF" "Resolve runtime defaults"
+  verify="$(awk '/^VERIFY_CMD<<__GHA_EOF__$/ { f = 1; next } f && /^__GHA_EOF__$/ { exit } f' "$GITHUB_ENV")"
+  # ci.yml 那三条（这一句会把 $GITHUB_ENV 重写成 ci.yml 的结果，所以上面先读完）
+  resolve_commands node
+  assert_equal "$(printf '%s\n' "$verify" | sed -n 1p)" "$(resolved INSTALL_CMD)"
+  assert_equal "$(printf '%s\n' "$verify" | sed -n 2p)" "$(resolved LINT_CMD)"
+  assert_equal "$(printf '%s\n' "$verify" | sed -n 3p)" "$(resolved TEST_CMD)"
+  refute_contains "$verify" 'npm ci || npm install'
+  refute_contains "$verify" 'npm test'
+}
+
+# 上面那条比的是「跟 ci.yml 一致」；这一条盯着那两个坑本身，免得哪天 ci.yml 先退化、
+# 两边一起错还照样绿。
+@test "resolve: the node default survives a repo with no lockfile and no test script" {
+  export RUNTIME=node VERIFY_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh VERIFY_ISOLATION=auto
+  run_block "$WF" "Resolve runtime defaults"
+  verify="$(awk '/^VERIFY_CMD<<__GHA_EOF__$/ { f = 1; next } f && /^__GHA_EOF__$/ { exit } f' "$GITHUB_ENV")"
+  assert_contains "$verify" 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'
+  assert_contains "$verify" 'npm run test --if-present'
+}
+
 @test "resolve: shell runtime verifies with actionlint, shellcheck and bats" {
   export RUNTIME=shell VERIFY_OVERRIDE='' CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh VERIFY_ISOLATION=auto
   run run_block "$WF" "Resolve runtime defaults"

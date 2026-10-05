@@ -117,7 +117,9 @@ jobs:
       runtime: node
 ```
 
-`runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm + npm test`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。
+`runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm` + `npm run test --if-present`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。
+
+**修复那一轮的默认验证命令跟 `ci.yml` 的默认值逐字一样**，`tests/iterate-gate.bats` 有一条判定把两边钉在一起。差一个字的代价是单向的：没有 `package-lock.json` 的仓库 `npm ci` 直接失败，没有 `test` 脚本的仓库 `npm test` 报 Missing script —— CI 两样都绿着放过，修复那一轮却必然红（MEL-293）。`ci.yml` 用 `install_cmd` / `test_cmd` 覆盖过默认值的仓库，`claude-codex-iterate.yml` 的 `verify_cmd` 也要跟着覆盖，否则同一个坑换个地方出现。
 
 `claude-codex-iterate.yml` 另收一个 `review_fixer`：`auto`（默认，Claude 先上，只有额度耗尽 / 限流 / 认证失效 / 服务不可用才换 Codex）、`claude`（现有行为，永不换人）、`codex`（跳过 Claude）。**拼错直接红**，不会静默按 `auto` 跑掉一整轮。测试没修好、构建挂了这类业务失败**不换人**：换个模型一样挂，job 该红就红。谁上、有没有换人、为什么，三件事都写在那次 run 的 summary 里。换人成功的那一轮照样记轮数、照样召唤复审，链条不会停在这里；令牌失效这种不会自己恢复的原因，即使换人成功也推一条通知。
 

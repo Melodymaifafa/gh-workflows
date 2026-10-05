@@ -1650,7 +1650,11 @@ jobs:
               default_verify=$'uv sync --dev\nuv run ruff check .\nuv run pytest'
                 ;;
             node)
-              default_verify=$'npm ci || npm install\nnpm run lint --if-present\nnpm test'
+              # 逐字跟 ci.yml 的 node 默认值对齐（装 / lint / 测三条）。差一个字都不行：
+              # 没有 package-lock.json 的仓库 `npm ci` 直接失败，没有 test 脚本的仓库
+              # `npm test` 报 Missing script —— 两样 CI 都绿着放过，修复那一轮却必然红，
+              # 于是「改好了但验证没过」成了常态（MEL-293）。
+              default_verify=$'if [ -f package-lock.json ]; then npm ci; else npm install; fi\nnpm run lint --if-present\nnpm run test --if-present'
                 ;;
             shell)
               default_verify=$'actionlint\ngit ls-files \'*.sh\' | xargs -r shellcheck\nbats tests/'
