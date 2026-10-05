@@ -1320,7 +1320,7 @@ jobs:
               blocked=unknown
               case "$push_err" in
                 *'workflows` permission'* | *'create or update workflow'*) blocked=workflow-permission ;;
-                *'protected branch'* | *GH006*) blocked=protected-branch ;;
+                *'protected branch'* | *'Protected branch'* | *GH006*) blocked=protected-branch ;;
                 *non-fast-forward* | *'fetch first'*) blocked=non-fast-forward ;;
               esac
               echo "blocked=$blocked" >>"$GITHUB_OUTPUT"
