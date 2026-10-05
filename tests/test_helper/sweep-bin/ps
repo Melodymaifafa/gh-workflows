@@ -4,22 +4,29 @@
 #
 # 一句话：验证正文那道「按运行用户清点残留」问的是「这个 uid 名下有谁」，在 runner
 # 上这等于「本次 run 自己起的有谁」（进程表干净），在本机上不等于 —— 同一个用户名下
-# 还有隔壁 worker 的 `bats tests/`，以及 macOS 自己按需拉起来的一堆服务
+# 还有隔壁 worker 的 `bats tests/`，以及 macOS 自己按需拉起来的服务
 # （networkserviceproxy、iCloudHelper、mdworker…）。这一份把答案收窄回 runner 上那个
 # 意思：只答本次 run 自己的进程。
 #
 # 「本次 run 自己的」按三条认，缺一条这道门就在本机上失效：
-#   1. 调用 ps 的那条祖先链（bats → 这一步的 shell → …）。
-#   2. 链上任何一个进程的后代 —— 验证命令和它还连着的子孙都在这里。
-#   3. argv 里带本次 run 临时目录的（$BATS_RUN_TMPDIR）。逃逸的残留靠这一条：它
-#      setsid 换了会话、关光了描述符、被过继给 init，父子链上认不回来了，但它跑的
-#      还是本次 run 临时目录下那个探针脚本。探针故意写成「从一个带路径的文件起」
-#      就是为了这条认得出它 —— 认不出就等于清点看不见它，那几条「必须红」的测试
-#      会假绿，所以它们本身就是这条规则的自测。
+#   1. 跑这一步的那个 shell，以及它到调用 ps 之间的那几层子 shell。认法是「argv 里
+#      带本次 run 的临时目录」—— 那个 shell 跑的就是该目录下的步骤脚本。往上走到
+#      第一个不带标记的祖先就停（那是 bats 自己），**绝不**一路走到 1 号进程：走上去
+#      就会碰到「我们和隔壁 worker 共同的那个祖先」，于是隔壁整棵树都被算成我们的，
+#      筛选变成空操作（实测踩过）。
+#   2. argv 里带本次 run 临时目录的其它进程。逃逸的残留靠这一条：它 setsid 换了会话、
+#      关光了描述符、被过继给 init，父子链上认不回来了，但它跑的还是本次 run 临时
+#      目录下那个探针脚本。探针故意写成「从一个带路径的文件起」就是为了这条认得出
+#      它 —— 认不出就等于清点看不见它，那几条「必须红」的测试会假绿，所以它们本身
+#      就是这条规则的自测。
+#   3. 上面那些的后代 —— 验证命令和它还连着的子孙都在这里。
 #
-# GHWF_SWEEP_REAL_PS / GHWF_SWEEP_SELF / GHWF_SWEEP_RUN_TAG 只给 tests/harness.bats
-# 那几条用：进程表、「我们是谁」、本次标记全喂死，于是那几条在哪台机器上都是同一个
-# 答案，不靠真实 pid 撞不撞上表里的号码。
+# 另一个用户的 uid 一律原样放过：那是 runner 上那个专用账号（MEL-289），它名下本来
+# 一个进程都没有，收窄只会把「清点看得见它」那道正面自测弄假。
+#
+# GHWF_SWEEP_REAL_PS / GHWF_SWEEP_SELF / GHWF_SWEEP_RUN_TAG / GHWF_SWEEP_SELF_UID
+# 只给 tests/harness.bats 那几条用：进程表、「我们是谁」、本次标记全喂死，于是那几条
+# 在哪台机器上都是同一个答案，不靠真实 pid 撞不撞上表里的号码。
 
 # 真正的 ps 只认绝对路径：这个目录就在 PATH 最前面，退回去按名字找会找回自己，
 # 变成无限递归。一个都找不到就红着停下 —— 清点问不出来，而静默空转比红了更糟。
@@ -36,13 +43,17 @@ if [ ! -x "$real" ]; then
   exit 2
 fi
 
-# 只有「按 uid 全机清点」那一种调用会数到别人（`ps -U <uid>`）。按进程组那一下
-# （`ps -e -o pgid=…`）本来就只看我们自己那个组号，原样放过。
+# 只有「按**我们自己这个 uid** 全机清点」那一种调用会数到外人。按进程组那一下
+# （`ps -e -o pgid=…`）只看我们自己那个组号；问别的 uid 的是专用账号那条路。两种
+# 都原样放过。
 scoped=''
+want_uid=''
 for arg in "$@"; do
+  if [ -n "$scoped" ] && [ -z "$want_uid" ]; then want_uid="$arg"; fi
   [ "$arg" = "-U" ] && scoped=1
 done
-[ -n "$scoped" ] || exec "$real" "$@"
+self_uid="${GHWF_SWEEP_SELF_UID:-$(id -u)}"
+[ -n "$scoped" ] && [ "$want_uid" = "$self_uid" ] || exec "$real" "$@"
 
 status=0
 out="$("$real" "$@")" || status=$?
@@ -56,9 +67,9 @@ if [ -z "$snap" ] || [ -z "$out" ]; then
 fi
 
 # 筛完的答案先接住再交出去，不直接写 stdout：筛选本身要是挂了（awk 不在、输入噎着
-# 它），直接写就等于交出一份空的或半截的清点 —— 而「空」正是放行条件，这道门于是
-# 静默变成空操作。接住之后筛选挂了就原样交出未筛的那一份：噪声回来、并发重新变红，
-# 看得见、好诊断；静默假绿看不见。
+# 它、或者压根没找到本次 run 的标记），直接写就等于交出一份空的或半截的清点 ——
+# 而「空」正是放行条件，这道门于是静默变成空操作。接住之后筛不出来就原样交出未筛的
+# 那一份：噪声回来、并发重新变红，看得见、好诊断；静默假绿看不见。
 filtered="$({
   printf '%s\n' "$snap" | sed 's/^/S|/'
   printf '%s\n' "$out" | sed 's/^/O|/'
@@ -77,21 +88,26 @@ filtered="$({
     }
     substr($0, 1, 2) == "O|" { asked[++no] = substr($0, 3); next }
     END {
-      # 1. 调用 ps 的那条祖先链
-      p = self; hops = 0
+      if (tag == "") exit 1
+      # 1. 跑这一步的那个 shell 和它到这里之间的几层子 shell。走到第一个不带标记的
+      #    祖先就停，别往共同祖先上走。
+      p = self; hops = 0; found = 0
       while (p != "" && p != "0" && p != "1" && hops < 64) {
+        mark = (index(cmd[p], tag) > 0)
+        if (found && !mark) break
         root[p] = 1
+        if (mark) found = 1
         p = parent[p]
         hops++
       }
-      # 3. argv 里带本次 run 临时目录的（逃逸的残留靠这一条认回来）
-      if (tag != "") {
-        for (i = 1; i <= np; i++) {
-          p = seen[i]
-          if (index(cmd[p], tag) > 0) root[p] = 1
-        }
+      # 一个带标记的祖先都没有 = 这不是本次 run 的那一步在问，筛不出来。
+      if (!found) exit 1
+      # 2. 带标记的其它进程（逃逸的残留靠这一条认回来）
+      for (i = 1; i <= np; i++) {
+        p = seen[i]
+        if (index(cmd[p], tag) > 0) root[p] = 1
       }
-      # 2. 上面那些的后代
+      # 3. 上面那些的后代
       for (i = 1; i <= np; i++) {
         p = seen[i]; q = p; hops = 0
         while (q != "" && q != "0" && q != "1" && hops < 64) {
@@ -105,7 +121,7 @@ filtered="$({
         if (g[1] in ours) print asked[i]
       }
     }')" || {
-  echo 'sweep-bin/ps: the filter failed; answering with the unfiltered sweep' >&2
+  echo 'sweep-bin/ps: cannot tell this run apart; answering with the unfiltered sweep' >&2
   printf '%s\n' "$out"
   exit "$status"
 }
