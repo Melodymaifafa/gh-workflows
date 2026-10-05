@@ -458,6 +458,58 @@ trust_patch() {
   '
 }
 
+# scope_proc_sweep_to_this_run：验证正文那道「清点残留活进程」问的是「这个 uid 名下
+# 有谁」。runner 上进程表干净，那句话等于「本次 run 自己起的有谁」；本机不等于 ——
+# 同一个用户名下还有一堆外人，实测全都被记成「验证命令留下的」过（MEL-304）：
+#   ① 隔壁 worker 的 `bats tests/`（池子一轮最多 3 个 worker，同一个仓库撞上两个是
+#      常态）。两套并发，两边各红 19 条，每次红的还不是同几条。
+#   ② macOS 按需拉起来的服务（networkserviceproxy、iCloud 的助手、Spotlight 的索引
+#      进程），开着的桌面应用（Chrome 的渲染进程），以及 agent 池自己的进程。
+#      它们在验证命令跑的那几秒里才起来，于是进不了基线。
+#
+# 所以给验证正文一份只答本次 run 自己进程的 ps（tests/test_helper/sweep-bin/ps，
+# 怎么认见那个文件开头）。防线正文一个字不改 —— 收窄发生在「谁来回答 ps」这一层，
+# 判据（除了基线里那些和我们自己的后代，一个都不许有）照旧，探针照旧要被它自己的
+# 逻辑抓出来。
+#
+# 这条规则的失败方向是「少报」，所以它必须有自测，而且有：每个会活过验证命令的探针
+# 都有一条测试要求清点把它报出来（codex-takeover 里那几条 escapee / idle daemon /
+# leftover）。认不出探针 = 那几条当场红，不是悄悄绿。实测抓到过两次 —— 一次是探针
+# 最后 exec 成 /bin/sleep、argv 里线索全没了，一次是噪声重跑没把探针状态退回去。
+#
+# 认「哪些是本次 run 的」靠 argv 里带不带本次 run 的临时目录，所以每个会活过验证
+# 命令的探针都写成「从那个目录下的一个脚本起」（见 leftover_probe）。光靠 argv 不够的
+# 两种各自先把自己的 pid 报给那份 ps：故意 exec 掉这条线索的那一个（见那条 idle daemon
+# 旁边的注释），以及被过继给 1 号进程、命令行又可能一瞬读不出来的那个（噪声重跑那一条）。
+# 噪声重跑也会把探针的 pid 文件清空（见 reset_workspace）。
+#
+# 还有一条：别顺着父子链一路往上走。往上走会碰到「我们和隔壁 worker 共同的那个祖先」
+# （跑这一轮的那个 shell），于是隔壁整棵树连带算成我们的，筛选变成空操作（实测踩过）。
+# 所以只走到本次这一步的 shell 为止。
+#
+# 反证开关：`GHWF_SWEEP_UNSCOPED=1 bats tests/` 把 ps 换回全机那一份，并发场景立刻
+# 重新变红。筛选条件只在测试里存在，workflow 从不读它。
+SWEEP_BIN_DIR="$REPO_ROOT/tests/test_helper/sweep-bin"
+
+scope_proc_sweep_to_this_run() {
+  [ "${GHWF_SWEEP_UNSCOPED:-}" != 1 ] || return 0
+  [ -n "${FIX_VERIFY_GUARD:-}" ] || {
+    echo 'scope_proc_sweep_to_this_run: FIX_VERIFY_GUARD is not set yet' >&2
+    return 1
+  }
+  local patched
+  patched="$(printf '%s\n' "$FIX_VERIFY_GUARD" | awk -v d="$SWEEP_BIN_DIR" '
+    { print }
+    !done && $0 ~ /^[[:space:]]*PATH="\$trusted_path";?$/ { print "PATH=\"" d ":$PATH\""; done = 1 }
+    END { if (!done) exit 1 }
+  ')" || {
+    echo 'scope_proc_sweep_to_this_run: the verify guard no longer filters PATH; the scoped ps was not installed' >&2
+    return 1
+  }
+  FIX_VERIFY_GUARD="$patched"
+  export FIX_VERIFY_GUARD
+}
+
 # step_env_keys <workflow-file> <step-name>：打印这一步 `env:` 块里声明的变量名，
 # 一行一个。守「这一步不许拿到某个变量」这类性质要靠它：run_block 只抽 run: 块，
 # 环境是测试自己喂的，光看块里写了什么看不出 step 真跑起来手上有哪些值。

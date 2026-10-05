@@ -30,6 +30,14 @@ setup() {
   # 过去），不读 $RUNNER_TEMP 里的文件。
   export FIX_VERIFY_GUARD; FIX_VERIFY_GUARD="$(step_output verify)"
   export FIX_PUSH_GUARD; FIX_PUSH_GUARD="$(step_output push)"
+  # 残留清点按运行用户问「名下有谁」，本机上那等于「这台 Mac 上这个用户有谁」——
+  # 隔壁 worker 的 bats 一起数进来。把回答这个问题的 ps 换成只认本次 run 的那一份
+  # （见 common.bash 里 scope_proc_sweep_to_this_run）。
+  # 探针起来时都会把自己的号码写进这两个文件之一；那份 ps 按号码也认一次，所以
+  # argv 里的标记没了（exec 掉了、或者 macOS 这一瞬读不到命令行）也还认得出它是
+  # 我们的。文件这会儿还不存在，不要紧。
+  export GHWF_SWEEP_PROBE_PIDFILE="$BATS_TEST_TMPDIR/escaped.pid:$BATS_TEST_TMPDIR/leftover.pid"
+  scope_proc_sweep_to_this_run
   : >"$GITHUB_OUTPUT"
 }
 
@@ -133,6 +141,8 @@ push_workspace() { # push_workspace <verify script>
   # ROUND / REPO 是推送那一步发轮数标记 M7 用的（以前只有 Codex 那半边发，MEL-262
   # 之后两条路都在推送里发）。
   export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
+  # 噪声重跑要退回这一刻，连 .git 一起（见 reset_workspace）。
+  cp -R .git "$BATS_TEST_TMPDIR/git-pristine"
 }
 
 verify_and_push() {
@@ -160,11 +170,34 @@ is_machine_noise() {
 # 载荷，前后一比没差异，夹带的文件反倒顺利推出去。
 # git 走绝对路径：有的测试往 PATH 上种了假 git，退工作区不该去跑它。
 reset_workspace() {
+  # 先把 .git 换回 push_workspace 刚布好的那一份。验证命令动得了 .git —— 种钩子、
+  # 改 config、塞一个 MERGE_HEAD —— 而 reset --hard / clean -fdx 碰不到那儿。留在
+  # 那儿的钩子会被第二次尝试当成「验证前本来就有」，于是「它动过 .git」那一道反倒
+  # 放行，整条链绿着跑完，判定「应该红」的那些测试全部假失败（MEL-304 实测：
+  # 一次重跑之后，接下来 11 次全是这样）。
+  # 动过的那一份挪开、不删：bats 收尾会把整个临时目录清掉。
+  if [ -d "$BATS_TEST_TMPDIR/git-pristine" ]; then
+    mv .git "$(mktemp -d "$BATS_TEST_TMPDIR/git-dirty-XXXXXX")/git"
+    cp -R "$BATS_TEST_TMPDIR/git-pristine" .git
+  fi
   "$REAL_GIT" reset -q --hard origin/topic
   "$REAL_GIT" clean -qfdx
   printf 'v2 fixed by claude\n' >app.txt
   mkdir -p .review
   printf 'prefetched review\n' >.review/findings.md
+  # 探针自己也要退回去，两件事：
+  #   · 上一次那个还活着的先收掉。它 argv 里带着本次 run 的临时目录，清点认得出是
+  #     我们的，留着就会被后面别的测试数进去。
+  #   · pid 文件清空。逃逸探针靠「pid 文件还空着」判断「它还没起来」，让验证命令等
+  #     它换完会话再退出；不清掉的话第二次尝试压根不等，刚起来的探针当场被按组号
+  #     收掉，清点什么都找不到 —— 整条链绿着跑完，而这几条要的是红。
+  # 清空、不删文件：删文件要跑 rm，池子里那是会弹权限窗的命令。
+  for probe in escaped.pid leftover.pid; do
+    if [ -s "$BATS_TEST_TMPDIR/$probe" ]; then
+      kill -9 "$(cat "$BATS_TEST_TMPDIR/$probe")" 2>/dev/null || true
+    fi
+    [ ! -e "$BATS_TEST_TMPDIR/$probe" ] || : >"$BATS_TEST_TMPDIR/$probe"
+  done
 }
 
 run_verify() {
@@ -305,13 +338,20 @@ chmod +x .git/hooks/post-index-change'
 # 验证留下一个活进程，它盯着 .git/config 等凭据回来。两道各守一半：跑完先按进程组
 # 收掉它，而且凭据摘掉之后再也不还回那个文件 —— 战利品是空的 = 它什么都没等到。
 @test "claude: a process the verify command leaves behind never sees the credentials return" {
-  push_workspace "cfg=\"\$PWD/.git/config\"
+  # 载荷写成本次 run 临时目录下的一个文件再后台跑，不写成匿名子 shell：本机跑测试时
+  # 清点按 argv 里带不带这个目录认「哪些进程是我们的」（见 sweep-bin/ps），匿名子
+  # shell 的 argv 光秃秃一个 `(bash)`，清点看不见它，这一条就假绿。
+  cat >"$BATS_TEST_TMPDIR/leftover.sh" <<EOS
+#!/bin/sh
+cfg="\$1"
 loot=$BATS_TEST_TMPDIR/payload-loot.txt
-( i=0
-  while [ \"\$i\" -lt 20000 ]; do
-    if grep -q extraheader \"\$cfg\" 2>/dev/null; then cp \"\$cfg\" \"\$loot\"; exit 0; fi
-    i=\$((i + 1))
-  done ) >/dev/null 2>&1 &
+i=0
+while [ "\$i" -lt 20000 ]; do
+  if grep -q extraheader "\$cfg" 2>/dev/null; then cp "\$cfg" "\$loot"; exit 0; fi
+  i=\$((i + 1))
+done
+EOS
+  push_workspace "/bin/sh $BATS_TEST_TMPDIR/leftover.sh \"\$PWD/.git/config\" >/dev/null 2>&1 &
 echo \"\$!\" >$BATS_TEST_TMPDIR/leftover.pid
 "
 

@@ -1,0 +1,172 @@
+#!/bin/sh
+# 只给**测试**用的 ps。为什么需要它、以及它为什么不放宽任何判定，见
+# tests/test_helper/common.bash 里 scope_proc_sweep_to_this_run 的那段注释。
+#
+# 验证正文那道「按运行用户清点残留」问的是「这个 uid 名下有谁」。在 runner 上这等于
+# 「本次 run 自己起的有谁」（进程表干净）；本机上不等于 —— 同一个用户名下还有隔壁
+# worker 的 `bats tests/`、macOS 按需拉起来的服务、开着的桌面应用，连 agent 池自己的
+# 进程都算。这一份把答案收窄回 runner 上那个意思：只答本次 run 自己的进程。
+#
+# 「本次 run 自己的」按三条认：
+#   1. 跑这一步的那个 shell，以及它到调用 ps 之间的那几层子 shell。认法是「argv 里
+#      带本次 run 的临时目录」—— 那个 shell 跑的就是该目录下的步骤脚本。往上走到
+#      第一个不带标记的祖先就停，**绝不**一路走到 1 号进程：走上去会碰到「我们和
+#      隔壁 worker 共同的那个祖先」，于是隔壁整棵树都算成我们的，筛选变成空操作
+#      （实测踩过）。
+#   2. argv 里带本次 run 临时目录的其它进程。逃逸的残留靠这一条：它 setsid 换了会话、
+#      关光了描述符、被过继给 init，父子链上认不回来了，但它跑的还是本次 run 临时
+#      目录下那个探针脚本。
+#   3. 探针自己报过的 pid（GHWF_SWEEP_PROBE_PIDFILE 指的那些文件里的号码）。两种
+#      情况前两条都认不回来：残留 exec 成 /bin/sleep 这类普通程序，argv 里一点标记
+#      都不剩；以及 macOS 的 ps 这一瞬读不到它的命令行、只给一个括号里的名字。
+#      pid 不受这两件事影响，所以每个探针起来时都先把自己的号码写下来，这一条按号码
+#      认。只会多认，不会让别的少认。
+#   4. 上面那些的后代 —— 验证命令和它还连着的子孙都在这里。
+#
+# 这条规则的失败方向是「少报」，所以它必须有自测，而且有：每个会活过验证命令的探针
+# 都有一条测试要求清点把它报出来（codex-takeover 里那几条 escapee / idle daemon /
+# leftover）。认不出探针 = 那几条当场红，不是悄悄绿。实测抓到过两次 —— 一次是探针
+# 最后 exec 成 /bin/sleep、argv 里线索全没了，一次是噪声重跑没把探针状态退回去。
+# 所以探针要么「从本次 run 临时目录下的一个脚本起」，要么像 idle daemon 那条一样
+# exec 之前把自己的 pid 报给第 3 条；重跑也会把它们的状态退回去。
+#
+# 认不出本次 run 的标记（比如压根不是这一步在问）就原样交出全机那一份，绝不交一份
+# 空的：「空」正是放行条件，交空等于让这道门静默变成空操作。
+#
+# 另一个用户的 uid 一律原样放过：那是 runner 上那个专用账号（MEL-289），它名下本来
+# 一个进程都没有，收窄只会把「清点看得见它」那道正面自测弄假。
+#
+# GHWF_SWEEP_REAL_PS / GHWF_SWEEP_SELF / GHWF_SWEEP_RUN_TAG / GHWF_SWEEP_SELF_UID
+# 只给 tests/harness.bats 那几条用：进程表、「我们是谁」、本次标记、uid 全喂死，于是
+# 那几条在哪台机器上都是同一个答案，不靠真实 pid 撞不撞上表里的号码。
+# GHWF_SWEEP_PROBE_PIDFILE 是上面第 3 条的那些文件，冒号分隔，由跑探针的那两个套件
+# 在 setup 里设好、单条测试可以再往后接自己的（见 common.bash 里
+# scope_proc_sweep_to_this_run 旁边那段）。
+# 文件不存在、是空的、里面不是数字，都当没报 —— 这一条只往「多认」那边加。
+
+# 真正的 ps 只认绝对路径：这个目录就在 PATH 最前面，退回去按名字找会找回自己，
+# 变成无限递归。一个都找不到就红着停下 —— 清点问不出来，而静默空转比红了更糟。
+real="${GHWF_SWEEP_REAL_PS:-}"
+if [ -z "$real" ]; then
+  for candidate in /bin/ps /usr/bin/ps; do
+    [ -x "$candidate" ] || continue
+    real="$candidate"
+    break
+  done
+fi
+if [ ! -x "$real" ]; then
+  echo "sweep-bin/ps: no real ps found; refusing to answer the sweep" >&2
+  exit 2
+fi
+
+# 只有「按**我们自己这个 uid** 全机清点」那一种调用会数到外人。按进程组那一下
+# （`ps -e -o pgid=…`）只看我们自己那个组号；问别的 uid 的是专用账号那条路。两种
+# 都原样放过。
+scoped=''
+want_uid=''
+for arg in "$@"; do
+  if [ -n "$scoped" ] && [ -z "$want_uid" ]; then want_uid="$arg"; fi
+  [ "$arg" = "-U" ] && scoped=1
+done
+self_uid="${GHWF_SWEEP_SELF_UID:-$(id -u)}"
+[ -n "$scoped" ] && [ "$want_uid" = "$self_uid" ] || exec "$real" "$@"
+
+status=0
+out="$("$real" "$@")" || status=$?
+# 快照问不出来就什么都不筛：宁可把今天的噪声留着，也不要悄悄少报一个残留。
+# 选进程的条件跟清点自己那一句一模一样（`-U <同一个 uid>`），不用 `-A`：macOS 的
+# ps 用 `-A` 列表时读不到有些进程的完整命令行，只给一个括号里的名字（实测逃逸探针
+# 在 `-U` 下是 `/bin/sh …/escapee.sh`，在 `-A` 下是 `(bash)`）。那就等于认不出它是
+# 本次 run 的、于是清点看不见它 —— 本机并发时那几条「必须红」的测试因此假绿过。
+# -ww 不许截断命令行：Linux 的 ps 在不是终端的时候按 80 列裁，裁掉路径同样认错主人
+# （本机不截断，看不出来）。
+snap="$("$real" -U "$want_uid" -ww -o pid=,ppid=,args= 2>/dev/null)" || snap=''
+if [ -z "$snap" ] || [ -z "$out" ]; then
+  [ -z "$out" ] || printf '%s\n' "$out"
+  exit "$status"
+fi
+
+# 筛完的答案先接住再交出去，不直接写 stdout：筛选本身要是挂了，直接写就等于交出一份
+# 空的或半截的清点 —— 而「空」正是放行条件，这道门于是静默变成空操作。
+filtered="$({
+  printf '%s\n' "$snap" | sed 's/^/S|/'
+  printf '%s\n' "$out" | sed 's/^/O|/'
+} | awk -v self="${GHWF_SWEEP_SELF:-$PPID}" \
+      -v tag="${GHWF_SWEEP_RUN_TAG-${BATS_RUN_TMPDIR-}}" \
+      -v probe_pidfile="${GHWF_SWEEP_PROBE_PIDFILE:-}" '
+    substr($0, 1, 2) == "S|" {
+      line = substr($0, 3)
+      n = split(line, f, " ")
+      p = f[1]
+      parent[p] = f[2]
+      a = ""
+      for (i = 3; i <= n; i++) a = a " " f[i]
+      cmd[p] = a
+      seen[++np] = p
+      next
+    }
+    substr($0, 1, 2) == "O|" { asked[++no] = substr($0, 3); next }
+
+    function mine(p) { return (tag != "" && index(cmd[p], tag) > 0) }
+
+    END {
+      if (tag == "") exit 1
+      # 1. 跑这一步的 shell 和它到这里之间的几层子 shell
+      p = self; hops = 0; found = 0
+      while (p != "" && p != "0" && p != "1" && hops < 64) {
+        m = mine(p)
+        if (found && !m) break
+        root[p] = 1
+        if (m) found = 1
+        p = parent[p]
+        hops++
+      }
+      # 一个带标记的祖先都没有 = 不是本次 run 的那一步在问，筛不出来
+      if (!found) exit 1
+      # 2. 带标记的其它进程（逃逸的残留靠这一条认回来）
+      for (i = 1; i <= np; i++) { p = seen[i]; if (mine(p)) root[p] = 1 }
+      # 3. 探针自己报过的 pid（exec 掉标记的残留靠这一条认回来）。文件不在、读不出来
+      #    就当没报 —— 这一条只往「多认」那边加，不让别的少认。
+      if (probe_pidfile != "") {
+        nf = split(probe_pidfile, pf, ":")
+        for (k = 1; k <= nf; k++) {
+          if (pf[k] == "") continue
+          while ((getline d < pf[k]) > 0) {
+            split(d, w, " ")
+            if (w[1] ~ /^[0-9]+$/) root[w[1]] = 1
+          }
+          close(pf[k])
+        }
+      }
+      # 4. 上面那些的后代。链子走到一半断了（那一环不在快照里）就算「说不清」，
+      #    照答 —— 两次 ps 隔着一瞬，进程表本来就会对不齐，而说不清要往「多报」
+      #    那边倒，不是往「少报」那边倒。
+      for (i = 1; i <= np; i++) {
+        p = seen[i]; q = p; hops = 0
+        while (q != "" && q != "0" && q != "1" && hops < 64) {
+          if (q in root) { ours[p] = 1; break }
+          if (!(q in parent)) { ours[p] = 1; break }
+          q = parent[q]
+          hops++
+        }
+      }
+      for (i = 1; i <= no; i++) {
+        split(asked[i], g, " ")
+        # 三种都答：
+        #   · 上面认出来是本次 run 的；
+        #   · 清点问到的这一行自己就带着本次 run 的临时目录 —— 这一条不能省：macOS 的
+        #     ps 读不到某个进程的完整命令行时只给一个括号里的名字，而读得到读不到是
+        #     一瞬一瞬变的（同一个 pid，清点那一句读到了全路径，筛选那一句只读到
+        #     `(bash)`）。只认快照里那份命令行的话，逃逸探针会时不时认不出来、清点
+        #     跟着看不见它，那几条「必须红」的测试于是假绿 —— 本机并发实测过。
+        #     清点自己那一句里本来就带着命令行，直接拿它比，读不到的那一瞬就绕过去了。
+        #   · 快照里压根没有这一行（它在两次 ps 之间起来的）—— 说不清，照答。
+        if (g[1] in ours || index(asked[i], tag) > 0 || !(g[1] in parent)) print asked[i]
+      }
+    }')" || {
+  echo 'sweep-bin/ps: cannot tell this run apart; answering with the unfiltered sweep' >&2
+  printf '%s\n' "$out"
+  exit "$status"
+}
+[ -z "$filtered" ] || printf '%s\n' "$filtered"
+exit "$status"
