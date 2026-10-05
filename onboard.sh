@@ -18,6 +18,122 @@ CENTRAL="$OWNER/gh-workflows"
 SECRETS_FILE="${GH_WORKFLOWS_SECRETS:-$HOME/.config/gh-workflows/secrets.env}"
 STUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stubs"
 
+# ---------------------------------------------------------------------------
+# 渲染调用桩的那几个函数。单列出来是为了让 tests/onboard-verify-cmd.bats 直接
+# source 本文件调它们 —— 测试跑的是这里的真代码，不是复制过去的一份（复制的那份
+# 迟早和这里各改各的）。它们只读环境变量、只写给定目录，不碰网络。
+# ---------------------------------------------------------------------------
+
+# ci.yml 的 __OVERRIDES__ 块。只有显式传了覆盖值的键才写进去，
+# 没传的键留空、走中央仓库按 runtime 的默认命令。
+ci_overrides() {
+  local var value key out=''
+  for var in INSTALL_CMD LINT_CMD TEST_CMD RUNS_ON; do
+    value="${!var:-}"
+    [ -n "$value" ] || continue
+    key="$(tr '[:upper:]' '[:lower:]' <<<"$var")"
+    out+="      $key: '$value'"$'\n'
+  done
+  printf '%s' "$out"
+}
+
+# 一条验证命令。ci.yml 的 skip 在那一步里是「打一条 notice 然后退出 0」，
+# 所以修复那一轮要跟它一致就得翻成同样一条 notice：原样写 skip 会被当成命令、
+# 找不到就 127 整轮红；写成空行则中央仓库判定「没有验证命令」拒绝推送。
+verify_line() {
+  local kind="$1" cmd="$2"
+  if [ "$cmd" = skip ]; then
+    printf 'echo "::notice::%s skipped by caller"' "$kind"
+  else
+    printf '%s' "$cmd"
+  fi
+}
+
+# iterate 调用桩的 __VERIFY_CMD__ 块。三条里任意一条被覆盖过就整块写出来，
+# 没覆盖的那几条用跟 ci.yml 逐字相同的默认值填齐 —— verify_cmd 是整份替换、
+# 不是逐行合并，只写被覆盖的那一条会让另两条从修复那一轮里整个消失（MEL-303）。
+# 三条都没覆盖就什么都不打印，让中央仓库的默认值生效。
+#
+# 每条各包进一个子 shell：ci.yml 里装 / lint / 测是三个独立的 step，中央仓库却把整块
+# verify_cmd 当一个脚本跑（bash -euo pipefail -c）。不隔开的话，装依赖那条的
+# `cd frontend && npm ci` 会把后两条带进 frontend（它们自己的 `cd frontend` 当场失败
+# = CI 绿着、修复那一轮红），一条 `exit 0` 会让后面几条整个不跑（= 没验证就推）。
+# 括号各占一行而不是 `( cmd )`：覆盖值末尾带 # 注释时 ci.yml 的 eval 照跑，同一行的
+# 右括号却会被注释吃掉、整块语法错。
+iterate_verify_cmd() {
+  local runtime="$1"
+  local default_install default_lint default_test
+
+  # 这三条必须跟 .github/workflows/ci.yml 的 Resolve commands 逐字一样，
+  # tests/onboard-verify-cmd.bats 有一条判定把两边钉在一起。
+  case "$runtime" in
+    python)
+      default_install='uv sync --dev'
+      default_lint='uv run ruff check .'
+      default_test='uv run pytest'
+      ;;
+    node)
+      default_install='if [ -f package-lock.json ]; then npm ci; else npm install; fi'
+      default_lint='npm run lint --if-present'
+      default_test='npm run test --if-present'
+      ;;
+    *)
+      echo "iterate_verify_cmd: unknown runtime '$runtime'" >&2
+      return 1
+      ;;
+  esac
+
+  [ -n "${INSTALL_CMD:-}${LINT_CMD:-}${TEST_CMD:-}" ] || return 0
+
+  printf '      verify_cmd: |\n'
+  printf '        (\n          %s\n        )\n' \
+    "$(verify_line install "${INSTALL_CMD:-$default_install}")" \
+    "$(verify_line lint "${LINT_CMD:-$default_lint}")" \
+    "$(verify_line test "${TEST_CMD:-$default_test}")"
+}
+
+# 三条全 skip：CI 一条都不跑，修复那一轮的 verify_cmd 也只剩三条 notice ——
+# 等于 Claude 的修复没经过任何检查就推上 PR。这不是新开的洞（CI 本来也不验证），
+# 但它只有在接入这一刻说得出口，之后没人会再看一眼生成出来的调用桩。
+verify_coverage_warning() {
+  [ "${INSTALL_CMD:-}" = skip ] && [ "${LINT_CMD:-}" = skip ] && [ "${TEST_CMD:-}" = skip ] || return 0
+  echo "    ⚠️  装 / lint / 测三条都是 skip：CI 和修复那一轮都不会真验证任何东西，" >&2
+  echo "        Claude 的修复会直接推上 PR。三条里任意一条给上真命令就能恢复验证。" >&2
+}
+
+# 把四个调用桩渲染进 <dest>/.github/workflows/。<dest> 默认当前目录。
+render_stubs() {
+  local runtime="$1" dest="${2:-.}" f
+  mkdir -p "$dest/.github/workflows"
+  for f in ci claude-codex-iterate codex-approved-merge ff-main; do
+    sed "s|__RUNTIME__|$runtime|g" "$STUB_DIR/$f.yml" >"$dest/.github/workflows/$f.yml"
+  done
+  # 两个占位符都是多行块，用 python 替换以免 sed 处理多行麻烦
+  WORKFLOW_DIR="$dest/.github/workflows" \
+  OVERRIDES="$(ci_overrides)" \
+  VERIFY_BLOCK="$(iterate_verify_cmd "$runtime")" \
+    python3 - <<'PY'
+import os, pathlib
+
+d = pathlib.Path(os.environ["WORKFLOW_DIR"])
+for name, placeholder, key in (
+    ("ci.yml", "__OVERRIDES__\n", "OVERRIDES"),
+    ("claude-codex-iterate.yml", "__VERIFY_CMD__\n", "VERIFY_BLOCK"),
+):
+    # 命令替换把块尾的换行吃掉了，补回来；空块整行删掉。
+    block = os.environ.get(key, "")
+    if block and not block.endswith("\n"):
+        block += "\n"
+    p = d / name
+    p.write_text(p.read_text().replace(placeholder, block))
+PY
+}
+
+# 被测试 source 时只要上面那几个函数，下面的主流程（会动远端仓库）不跑。
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
 repo="${1:?usage: onboard.sh <repo> <python|node>}"
 runtime="${2:?usage: onboard.sh <repo> <python|node>}"
 slug="$OWNER/$repo"
@@ -53,34 +169,10 @@ else
 fi
 
 # 2. 调用桩。每个仓库只留这三个小文件，逻辑全在中央仓库。
-mkdir -p .github/workflows
-
-# 只有显式传了覆盖值才写进调用桩，没传就留空、走中央仓库的默认命令
-overrides=""
-for var in INSTALL_CMD LINT_CMD TEST_CMD RUNS_ON; do
-  value="${!var:-}"
-  if [ -n "$value" ]; then
-    key="$(tr '[:upper:]' '[:lower:]' <<<"$var")"
-    overrides+="      $key: '$value'"$'\n'
-  fi
-done
-overrides="${overrides%$'\n'}"
-
-for f in ci claude-codex-iterate codex-approved-merge ff-main; do
-  sed "s|__RUNTIME__|$runtime|g" "$STUB_DIR/$f.yml" >".github/workflows/$f.yml"
-done
-# __OVERRIDES__ 占位符只在 ci.yml 里；用 python 替换以免 sed 处理多行麻烦
-OVERRIDES="$overrides" python3 - <<'PY'
-import os, pathlib
-p = pathlib.Path(".github/workflows/ci.yml")
-body = p.read_text()
-block = os.environ.get("OVERRIDES", "")
-if block:
-    body = body.replace("__OVERRIDES__\n", block + "\n")
-else:
-    body = body.replace("__OVERRIDES__\n", "")
-p.write_text(body)
-PY
+#    覆盖值同时写两处：ci.yml 的 install/lint/test，和 iterate 桩的 verify_cmd。
+#    只写前者的话 CI 绿着、修复那一轮必然红（MEL-303）。
+render_stubs "$runtime"
+verify_coverage_warning
 
 # 必须先 add 再比对：调用桩是全新文件时 git diff 看不见未跟踪文件，
 # 会误报「无需提交」。

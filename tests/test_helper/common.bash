@@ -71,6 +71,62 @@ resolved() {
   sed -n "s/^$1=//p" "$BATS_TEST_TMPDIR/github_env"
 }
 
+# ---------------------------------------------------------------------------
+# onboard.sh 的调用桩渲染。source 它只会拿到那几个函数：主流程（动远端仓库那段）
+# 被 BASH_SOURCE 判定挡住了，所以这里跑的是 onboard.sh 里的真代码。
+#
+# 测试要覆盖哪条就设 OV_INSTALL / OV_LINT / OV_TEST / OV_RUNS_ON，**不要**直接设
+# onboard.sh 读的那四个名字：`ci.yml` 的 Resolve commands 会把 INSTALL_CMD /
+# LINT_CMD / TEST_CMD 写进 $GITHUB_ENV，于是这个套件在 CI 里跑时环境里本来就有值。
+# 继承它们的话，「没传覆盖值」那几条判定在本机绿、在 CI 红（PR #48 第一版踩过）。
+# 下面每次都把那四个名字完整赋一遍，子进程看到的值只由 OV_* 决定。
+# ---------------------------------------------------------------------------
+
+# 渲染四个调用桩到 $BATS_TEST_TMPDIR/out/.github/workflows/。
+onboard_render() { # onboard_render <python|node>
+  INSTALL_CMD="${OV_INSTALL-}" \
+  LINT_CMD="${OV_LINT-}" \
+  TEST_CMD="${OV_TEST-}" \
+  RUNS_ON="${OV_RUNS_ON-}" \
+    bash -c '. "$1"; render_stubs "$2" "$3"' \
+      _ "$REPO_ROOT/onboard.sh" "$1" "$BATS_TEST_TMPDIR/out"
+}
+
+# 只跑「三条全 skip 就警告」那一段，stderr 并进 stdout 好断言。
+onboard_coverage_warning() {
+  INSTALL_CMD="${OV_INSTALL-}" \
+  LINT_CMD="${OV_LINT-}" \
+  TEST_CMD="${OV_TEST-}" \
+    bash -c '. "$1"; verify_coverage_warning' _ "$REPO_ROOT/onboard.sh" 2>&1
+}
+
+# 读回渲染出来的某个调用桩的全文。
+rendered_stub() { # rendered_stub <ci.yml|claude-codex-iterate.yml|...>
+  cat "$BATS_TEST_TMPDIR/out/.github/workflows/$1"
+}
+
+# 渲染出来的 iterate 桩里 verify_cmd 块的第 n 条命令（n 从 1 起，去掉缩进）。
+# 注释行（# verify_cmd:）不算：只认行首就是 verify_cmd 的那一行。每条命令各自包在
+# 一对独占一行的括号里（子 shell），括号行跳过，只认括号里面多缩进一级的那一行。
+rendered_verify_line() { # rendered_verify_line <n>
+  awk '
+    /^      verify_cmd: \|$/ { f = 1; next }
+    f && /^        [()]$/ { next }
+    f && /^          / { sub(/^          /, ""); print; next }
+    f { exit }
+  ' "$BATS_TEST_TMPDIR/out/.github/workflows/claude-codex-iterate.yml" | sed -n "${1}p"
+}
+
+# 渲染出来的 verify_cmd 整块（去掉块缩进），就是中央仓库交给 bash -euo pipefail -c
+# 的那个脚本。
+rendered_verify_block() {
+  awk '
+    /^      verify_cmd: \|$/ { f = 1; next }
+    f && /^        / { sub(/^        /, ""); print; next }
+    f { exit }
+  ' "$BATS_TEST_TMPDIR/out/.github/workflows/claude-codex-iterate.yml"
+}
+
 # 断言写成函数，不要在测试里直接写 `[[ ... ]]`：
 # bats 会漏掉中途失败的 `[[ ]]`，只看最后一条命令的退出码，测试于是假绿。
 # 函数返回非零它抓得住，顺带还能打出「期望什么 / 实际什么」。
