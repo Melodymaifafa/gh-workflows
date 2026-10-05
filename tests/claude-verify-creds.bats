@@ -1100,10 +1100,16 @@ reject_push_with() { # reject_push_with <远端 stderr 的那一行>
 
 @test "claude: a protected branch and a stale branch each get their own class" {
   push_workspace 'true'
-  reject_push_with 'GH006: Protected branch update failed for refs/heads/topic'
-  run_chain_trusted_push
-  assert_equal "$status" 1
-  assert_equal "$(step_output blocked)" protected-branch
+  # 两种长相都要认：带 GH006 的，和只有一句大写 Protected branch 的
+  for refusal in 'GH006: Protected branch update failed for refs/heads/topic' \
+                 'Protected branch update failed for refs/heads/topic'; do
+    : >"$GITHUB_OUTPUT"
+    reset_workspace
+    reject_push_with "$refusal"
+    run_chain_trusted_push
+    assert_equal "$status" 1
+    assert_equal "$(step_output blocked)" protected-branch
+  done
 
   : >"$GITHUB_OUTPUT"
   reset_workspace
