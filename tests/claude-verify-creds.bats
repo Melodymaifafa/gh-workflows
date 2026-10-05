@@ -137,6 +137,8 @@ push_workspace() { # push_workspace <verify script>
   # ROUND / REPO 是推送那一步发轮数标记 M7 用的（以前只有 Codex 那半边发，MEL-262
   # 之后两条路都在推送里发）。
   export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
+  # 噪声重跑要退回这一刻，连 .git 一起（见 reset_workspace）。
+  cp -R .git "$BATS_TEST_TMPDIR/git-pristine"
 }
 
 verify_and_push() {
@@ -164,6 +166,16 @@ is_machine_noise() {
 # 载荷，前后一比没差异，夹带的文件反倒顺利推出去。
 # git 走绝对路径：有的测试往 PATH 上种了假 git，退工作区不该去跑它。
 reset_workspace() {
+  # 先把 .git 换回 push_workspace 刚布好的那一份。验证命令动得了 .git —— 种钩子、
+  # 改 config、塞一个 MERGE_HEAD —— 而 reset --hard / clean -fdx 碰不到那儿。留在
+  # 那儿的钩子会被第二次尝试当成「验证前本来就有」，于是「它动过 .git」那一道反倒
+  # 放行，整条链绿着跑完，判定「应该红」的那些测试全部假失败（MEL-304 实测：
+  # 一次重跑之后，接下来 11 次全是这样）。
+  # 动过的那一份挪开、不删：bats 收尾会把整个临时目录清掉。
+  if [ -d "$BATS_TEST_TMPDIR/git-pristine" ]; then
+    mv .git "$(mktemp -d "$BATS_TEST_TMPDIR/git-dirty-XXXXXX")/git"
+    cp -R "$BATS_TEST_TMPDIR/git-pristine" .git
+  fi
   "$REAL_GIT" reset -q --hard origin/topic
   "$REAL_GIT" clean -qfdx
   printf 'v2 fixed by claude\n' >app.txt

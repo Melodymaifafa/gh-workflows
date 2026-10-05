@@ -654,6 +654,8 @@ push_workspace() { # push_workspace <verify script>
   # 要放行的测试自己在调用前 export 一份。
   export VERIFY_WRITABLE_PATHS="${VERIFY_WRITABLE_PATHS:-}"
   export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
+  # 噪声重跑要退回这一刻，连 .git 一起（见 reset_workspace）。
+  cp -R .git "$BATS_TEST_TMPDIR/git-pristine"
 }
 
 # 验证跑完接着提交推送，两步连起来跑。
@@ -690,6 +692,16 @@ is_machine_noise() {
 # 把战利品直接送给它；而带凭据那一步本来就不再往那个文件里写，少这一份不改变任何
 # 一条判定。
 reset_workspace() {
+  # 先把 .git 换回 push_workspace 刚布好的那一份。验证命令动得了 .git —— 种钩子、
+  # 改 config、塞一个 MERGE_HEAD —— 而 reset --hard / clean -fdx 碰不到那儿。留在
+  # 那儿的钩子会被第二次尝试当成「验证前本来就有」，于是「它动过 .git」那一道反倒
+  # 放行，整条链绿着跑完，判定「应该红」的那些测试全部假失败（MEL-304 实测：
+  # 一次重跑之后，接下来 11 次全是这样）。
+  # 动过的那一份挪开、不删：bats 收尾会把整个临时目录清掉。
+  if [ -d "$BATS_TEST_TMPDIR/git-pristine" ]; then
+    mv .git "$(mktemp -d "$BATS_TEST_TMPDIR/git-dirty-XXXXXX")/git"
+    cp -R "$BATS_TEST_TMPDIR/git-pristine" .git
+  fi
   "$REAL_GIT" reset -q --hard origin/topic
   "$REAL_GIT" clean -qfdx
   printf 'v2 fixed by codex\n' >app.txt
@@ -1778,6 +1790,10 @@ fi
 printf run >>"$NOISE_MARK.runs"
 printf 'backdoor\n' >planted.txt
 git add planted.txt
+# .git 那一半：种一个钩子。重跑前要是不把 .git 换回去，第二次的「验证前」就已经
+# 带着它，指纹前后一比没差异，「它动过 .git」这一道反倒放行。
+printf '#!/bin/sh\n' >.git/hooks/post-index-change
+chmod +x .git/hooks/post-index-change
 EOS
   push_workspace "sh $BATS_TEST_TMPDIR/noisy.sh"
 
@@ -1787,7 +1803,9 @@ EOS
   runs="$(wc -c <"$NOISE_MARK.runs" | tr -d ' ')"
   [ "$runs" -ge 6 ] || { echo "the chain ran only $((runs / 3)) time(s); the retry never happened" >&2; return 1; }
   assert_equal "$status" 1
-  assert_contains "$output" 'outside verify_writable_paths'
+  # 两半都要在重跑之后照旧抓到：工作区那半（夹带的文件）和 .git 那半（种的钩子）。
+  # 重跑前不把 .git 换回去的话，红的原因会变成前者、后者静默失效。
+  assert_contains "$output" 'the verify command modified .git'
   assert_equal "$(git ls-tree -r --name-only origin/topic)" "$(printf 'app.txt\ndeps.lock')"
 }
 

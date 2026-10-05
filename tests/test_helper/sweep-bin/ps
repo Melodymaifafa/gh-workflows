@@ -49,7 +49,11 @@ if [ -z "$snap" ] || [ -z "$out" ]; then
   exit "$status"
 fi
 
-{
+# 筛完的答案先接住再交出去，不直接写 stdout：筛选本身要是挂了（awk 不在、输入噎着
+# 它），直接写就等于交出一份空的或半截的清点 —— 而「空」正是放行条件，这道门于是
+# 静默变成空操作。接住之后筛选挂了就原样交出未筛的那一份：噪声回来、并发重新变红，
+# 看得见、好诊断；静默假绿看不见。
+filtered="$({
   printf '%s\n' "$snap" | sed 's/^/S|/'
   printf '%s\n' "$out" | sed 's/^/O|/'
 } | awk -v self="${GHWF_SWEEP_SELF:-$PPID}" '
@@ -95,5 +99,10 @@ fi
         if (g[1] in hide) continue
         print asked[i]
       }
-    }'
+    }')" || {
+  echo 'sweep-bin/ps: the filter failed; answering with the unfiltered sweep' >&2
+  printf '%s\n' "$out"
+  exit "$status"
+}
+[ -z "$filtered" ] || printf '%s\n' "$filtered"
 exit "$status"
