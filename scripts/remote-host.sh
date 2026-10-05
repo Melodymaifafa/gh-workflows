@@ -10,7 +10,7 @@ set -euo pipefail
 
 url="${1-}"
 
-if [ -z $url ]; then
+if [ -z "$url" ]; then
   echo "::error::remote-host.sh needs a remote URL"
   exit 1
 fi
@@ -19,4 +19,4 @@ host="${url#*://}"
 host="${host#*@}"
 host="${host%%[:/]*}"
 
-printf '%s\n' $host
+printf '%s\n' "$host"
