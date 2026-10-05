@@ -10,8 +10,20 @@
 # 收窄的是「**隔壁那次 run**」，不是「不是我们起的」—— 两者差别就是这道门的全部价值：
 # 验证命令的逃逸进程 setsid 换了会话、关光了描述符、被过继给 init，认不回我们，但它
 # 同样认不回隔壁那棵树，所以照报、照红。探针测的还是原来那件事。
-real=${GHWF_SWEEP_REAL_PS:-/bin/ps}
-[ -x "$real" ] || real='ps'
+# 真正的 ps 只认绝对路径：这个目录就在 PATH 最前面，退回去按名字找会找回自己，
+# 变成无限递归。一个都找不到就红着停下 —— 清点问不出来，而静默空转比红了更糟。
+real="${GHWF_SWEEP_REAL_PS:-}"
+if [ -z "$real" ]; then
+  for candidate in /bin/ps /usr/bin/ps; do
+    [ -x "$candidate" ] || continue
+    real="$candidate"
+    break
+  done
+fi
+if [ ! -x "$real" ]; then
+  echo "sweep-bin/ps: no real ps found; refusing to answer the sweep" >&2
+  exit 2
+fi
 
 # 只有「按 uid 全机清点」那一种调用会数到隔壁（`ps -U <uid>`）。按进程组那一下
 # （`ps -e -o pgid=…`）本来就只看我们自己那个组号，原样放过。
@@ -24,7 +36,9 @@ done
 status=0
 out="$("$real" "$@")" || status=$?
 # 全机快照问不出来就什么都不筛：宁可把今天的噪声留着，也不要悄悄少报一个残留。
-snap="$("$real" -A -o pid=,ppid=,args= 2>/dev/null)" || snap=''
+# -ww 不许截断命令行：Linux 的 ps 在不是终端的时候按 80 列裁，裁掉 bats-exec-* 那
+# 几个字就等于认不出隔壁那棵树的根，筛选于是变成空操作（本机不截断，看不出来）。
+snap="$("$real" -A -ww -o pid=,ppid=,args= 2>/dev/null)" || snap=''
 if [ -z "$snap" ] || [ -z "$out" ]; then
   [ -z "$out" ] || printf '%s\n' "$out"
   exit "$status"
