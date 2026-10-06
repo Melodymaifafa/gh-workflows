@@ -71,10 +71,10 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 **巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused`、CI 红）等人处理。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
 
-- **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是没设 `SWEEP_READ_TOKEN`）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
+- **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **节奏**：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次，所以上面的 30 / 60 分钟只是下限。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。
 - **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`。
-- **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；另加一个只给巡检用的 `SWEEP_READ_TOKEN`，见下方「密钥」。
+- **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
 - 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。
 
 故意不管的：草稿、从 fork 开的 PR、标题带 `[no-codex-merge]` / `[no-claude]` 的 PR。叫审 3 次没结果的 head 之后只每天叫一次、共 7 天，然后不再叫；有冲突、已停车的 head 只告警一次。用内联副本、没接共享调用桩的仓库（如 Weibo--automation-android）：每个 PR 的每个 head 空闲 60 分钟后告警一次 `unwatched`，不叫审；私有仓库要等巡检读得到调用桩才生效。
@@ -153,11 +153,11 @@ jobs:
 | `CODEX_TRIGGER_TOKEN` | 无法召唤 Codex 复审；Claude 撞额度时请不动 Codex 出补丁；Claude 代审结论发不出（告警 `pat-missing`）；巡检不能动手 |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
 
-`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** + **Contents、Workflows read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。Contents、Workflows 写权限只为本仓库把它复用成 `SELF_WORKFLOWS_TOKEN`（见下一段）。代价：每个仓库都存着它，任何一个泄露，别人就能改所有仓库的代码和流水线 —— 2026-10-06 认了这个代价，换「不用再管第二把令牌」。
+`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** + **Contents、Workflows read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。Contents、Workflows 写权限是为本仓库把它复用成 `SELF_WORKFLOWS_TOKEN`（见下一段）；巡检读各仓库调用桩也顺带用它的 Contents 权限。代价：每个仓库都存着它，任何一个泄露，别人就能改所有仓库的代码和流水线 —— 2026-10-06 认了这个代价，换「不用再管第二把令牌」。
 
 `SELF_WORKFLOWS_TOKEN` 只设在本仓库，值就是 `CODEX_TRIGGER_TOKEN` 那一把，不另建（2026-10-06）：`set -a && source ~/.config/gh-workflows/secrets.env && set +a && printf %s "$CODEX_TRIGGER_TOKEN" | gh secret set SELF_WORKFLOWS_TOKEN --repo Melodymaifafa/gh-workflows`。`onboard.sh` 不刷它 —— 代码只在本仓库读这个名字。GitHub 不许没有 Workflows 权限的令牌推、合 `.github/workflows/` 下的改动，而本仓库的 PR 几乎都改这些文件（2026-09-26 到 10-01，17 / 18 / 19 号 PR 为此停了 5 次里的 4 次）。只交给两处：iterate 推修复那一条 `git push`、codex-approved-merge 那一条 `gh pr merge`；验证命令、跑被审 PR 代码的步骤、Claude / Codex 那几步都拿不到，同一步里的 `gh pr comment` 也照旧用 `github.token`。没设它行为不变 —— 照旧走 `github.token`，推不动 / 合不动就按现有告警走（MEL-295）。
 
-`SWEEP_READ_TOKEN` 只存在本仓库（`gh secret set SWEEP_READ_TOKEN --repo Melodymaifafa/gh-workflows`，不走 `onboard.sh`）：另建一个 fine-grained PAT，**All repositories** + Metadata read + Contents read，巡检只用它读各仓库调用桩的 `base_branch`。没设它，私有仓库的调用桩读不到，巡检退回只扫默认分支是 develop 的仓库，并在 run 里警告。
+`SWEEP_READ_TOKEN` 不用了（2026-10-06）：`CODEX_TRIGGER_TOKEN` 有了 Contents 权限，巡检直接拿它读各仓库调用桩的 `base_branch`，代码也不再读这个名字 —— 留着一把过期的单独令牌，反而会顶掉能用的那把、让私有仓库的调用桩读不到。以前设过的删掉即可：`gh secret delete SWEEP_READ_TOKEN --repo Melodymaifafa/gh-workflows`，那把 PAT 也可以在 GitHub 上作废。
 
 ## 本仓库自己也接了（2026-07-30）
 
