@@ -1,0 +1,69 @@
+# 每周探一次「现在最新的 Opus 是哪个」，跟本仓库钉死的 claude_model 默认值比，
+# 不一样推一条 Pushover，一样什么都不发（规则和去重见 scripts/probe-latest-opus.sh）。
+# 只提醒，不自动改默认值 —— 改默认 = 改一行 + 合 PR + 移 v1 标签，那一步在人手里。
+# 只在 gh-workflows 里跑（它读的就是本仓库的那两个默认值；公开仓库，分钟免费）。
+name: Opus model probe
+
+on:
+  # 每周一 01:17 UTC（北京时间 09:17）。不卡整点：整点全球排队，GitHub 会往后拖更久。
+  schedule:
+    - cron: '17 1 * * 1'
+  # 手动：仓库 → Actions → Opus model probe → Run workflow。
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 这条已经推过也再推一次（平时不用勾，用来确认通知通不通）。
+        type: boolean
+        default: false
+
+# contents 只用来 checkout 脚本；actions: write 给自己的定时任务保活，顺带够读凭据列表。
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: opus-model-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # 公开仓库 60 天没提交，定时 workflow 会被自动停用；每轮都显式启用一次。
+      - name: Keep the schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/$REPO/actions/workflows/opus-model-probe.yml/enable" --silent ||
+            echo "::warning::保活调用失败"
+
+      - name: Probe the newest Opus
+        id: probe
+        env:
+          # 查「这个模型推过没有」的凭据（以前某一轮留下的 artifact），自带令牌够。
+          GH_TOKEN: ${{ github.token }}
+          # 读 /v1/models 用的是现成的 Claude 令牌，只读列表，不烧推理额度。
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          FORCE_NOTIFY: ${{ inputs.force == true }}
+        run: ./scripts/probe-latest-opus.sh
+
+      # 凭据以模型 id 命名，上一步推成功了才交出名字，所以没推成功这一步就不跑。
+      # 留不上就让这一轮红着：凭据是去重的全部依据，悄悄没留上会变成每周重复推同一条。
+      # 它过期（仓库的 artifact 保留期，默认 90 天）之后同一条会再推一次 —— 故意的，
+      # 宁可重复提醒一次，也不要因为凭据没了就把新模型咽掉。
+      - name: Remember we pushed this one
+        if: steps.probe.outputs.notified_artifact != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.probe.outputs.notified_artifact }}
+          path: ${{ steps.probe.outputs.notified_marker }}
+          if-no-files-found: error
