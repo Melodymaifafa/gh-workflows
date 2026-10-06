@@ -16,7 +16,7 @@ setup() {
   export OWNER=Melodymaifafa SWEEP_MODE=live ONLY_REPOS=private-caller GH_TOKEN=owner-pat
   NOW_EPOCH="$(jq -n '"2026-09-18T12:00:00Z" | fromdateiso8601')"
   export NOW_EPOCH
-  unset PUSHOVER_TOKEN PUSHOVER_USER SWEEP_READ_TOKEN
+  unset PUSHOVER_TOKEN PUSHOVER_USER
   fake_route "user/repos?affiliation=owner&per_page=100" sweep/user-repos.json
   stub "$R" "$(stub_yaml develop)"
   comments
@@ -754,14 +754,14 @@ EOF
   assert_equal "$output" main
 }
 
-@test "SWEEP_READ_TOKEN, when set, reads the caller stub; writes still use GH_TOKEN" {
-  export SWEEP_READ_TOKEN=read-pat
+@test "the caller stub is read with GH_TOKEN; a leftover SWEEP_READ_TOKEN is ignored" {
+  export SWEEP_READ_TOKEN=stale-pat
   one_pr clean 900
   sweep
   assert_equal "$status" 0
-  assert_contains "$(fake_calls "contents/$WF/codex-approved-merge.yml")" "[token=read-pat]"
+  assert_contains "$(fake_calls "contents/$WF/codex-approved-merge.yml")" "[token=owner-pat]"
+  refute_contains "$(fake_calls "contents/$WF/codex-approved-merge.yml")" "stale-pat"
   assert_contains "$(fake_calls "gh api POST")" "[token=owner-pat]"
-  refute_contains "$(fake_calls "gh api POST")" "read-pat"
 }
 
 @test "a main-default repo onboarded with base main: its main PR is swept, its develop PR is unwatched" {
@@ -813,7 +813,7 @@ EOF
   refute_called "reason=unwatched"
   assert_equal "$(grep -c '::warning::' <<<"$output")" 1
   assert_contains "$output" "::warning::2 个仓库读不到合并调用桩"
-  assert_contains "$output" "Contents: Read-only"
+  assert_contains "$output" "CODEX_TRIGGER_TOKEN 缺 Contents 权限"
   assert_contains "$output" "$LABEL"
   refute_contains "$output" "private-caller"
 }

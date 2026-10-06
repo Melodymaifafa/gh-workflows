@@ -71,6 +71,62 @@ resolved() {
   sed -n "s/^$1=//p" "$BATS_TEST_TMPDIR/github_env"
 }
 
+# ---------------------------------------------------------------------------
+# onboard.sh 的调用桩渲染。source 它只会拿到那几个函数：主流程（动远端仓库那段）
+# 被 BASH_SOURCE 判定挡住了，所以这里跑的是 onboard.sh 里的真代码。
+#
+# 测试要覆盖哪条就设 OV_INSTALL / OV_LINT / OV_TEST / OV_RUNS_ON，**不要**直接设
+# onboard.sh 读的那四个名字：`ci.yml` 的 Resolve commands 会把 INSTALL_CMD /
+# LINT_CMD / TEST_CMD 写进 $GITHUB_ENV，于是这个套件在 CI 里跑时环境里本来就有值。
+# 继承它们的话，「没传覆盖值」那几条判定在本机绿、在 CI 红（PR #48 第一版踩过）。
+# 下面每次都把那四个名字完整赋一遍，子进程看到的值只由 OV_* 决定。
+# ---------------------------------------------------------------------------
+
+# 渲染四个调用桩到 $BATS_TEST_TMPDIR/out/.github/workflows/。
+onboard_render() { # onboard_render <python|node>
+  INSTALL_CMD="${OV_INSTALL-}" \
+  LINT_CMD="${OV_LINT-}" \
+  TEST_CMD="${OV_TEST-}" \
+  RUNS_ON="${OV_RUNS_ON-}" \
+    bash -c '. "$1"; render_stubs "$2" "$3"' \
+      _ "$REPO_ROOT/onboard.sh" "$1" "$BATS_TEST_TMPDIR/out"
+}
+
+# 只跑「三条全 skip 就警告」那一段，stderr 并进 stdout 好断言。
+onboard_coverage_warning() {
+  INSTALL_CMD="${OV_INSTALL-}" \
+  LINT_CMD="${OV_LINT-}" \
+  TEST_CMD="${OV_TEST-}" \
+    bash -c '. "$1"; verify_coverage_warning' _ "$REPO_ROOT/onboard.sh" 2>&1
+}
+
+# 读回渲染出来的某个调用桩的全文。
+rendered_stub() { # rendered_stub <ci.yml|claude-codex-iterate.yml|...>
+  cat "$BATS_TEST_TMPDIR/out/.github/workflows/$1"
+}
+
+# 渲染出来的 iterate 桩里 verify_cmd 块的第 n 条命令（n 从 1 起，去掉缩进）。
+# 注释行（# verify_cmd:）不算：只认行首就是 verify_cmd 的那一行。每条命令各自包在
+# 一对独占一行的括号里（子 shell），括号行跳过，只认括号里面多缩进一级的那一行。
+rendered_verify_line() { # rendered_verify_line <n>
+  awk '
+    /^      verify_cmd: \|$/ { f = 1; next }
+    f && /^        [()]$/ { next }
+    f && /^          / { sub(/^          /, ""); print; next }
+    f { exit }
+  ' "$BATS_TEST_TMPDIR/out/.github/workflows/claude-codex-iterate.yml" | sed -n "${1}p"
+}
+
+# 渲染出来的 verify_cmd 整块（去掉块缩进），就是中央仓库交给 bash -euo pipefail -c
+# 的那个脚本。
+rendered_verify_block() {
+  awk '
+    /^      verify_cmd: \|$/ { f = 1; next }
+    f && /^        / { sub(/^        /, ""); print; next }
+    f { exit }
+  ' "$BATS_TEST_TMPDIR/out/.github/workflows/claude-codex-iterate.yml"
+}
+
 # 断言写成函数，不要在测试里直接写 `[[ ... ]]`：
 # bats 会漏掉中途失败的 `[[ ]]`，只看最后一条命令的退出码，测试于是假绿。
 # 函数返回非零它抓得住，顺带还能打出「期望什么 / 实际什么」。
@@ -181,6 +237,18 @@ fake_cli_fail() {
   mkdir -p "$(dirname "$base")"
   echo "$2" >"$base.exit"
   [ -z "${3:-}" ] || _fake_write "$3" "$base.out"
+}
+
+# fake_linear <操作名> <json-or-file> [seq]：假 Linear GraphQL 的响应，如
+# fake_linear LinearTeam '{"data":{"teams":{"nodes":[{"id":"team-1"}]}}}'
+fake_linear() {
+  _fake_write "$2" "$FAKE_GH_DIR/linear/$1${3:+.$3}.json"
+}
+
+# fake_linear_fail <操作名> <exit-code> [seq]
+fake_linear_fail() {
+  mkdir -p "$FAKE_GH_DIR/linear"
+  echo "$2" >"$FAKE_GH_DIR/linear/$1${3:+.$3}.exit"
 }
 
 # fake_calls [fixed-string]：打印日志里含该子串的行（不给参数就打印全部）。
@@ -400,6 +468,58 @@ trust_patch() {
     { print }
     !patched && $0 ~ /^[[:space:]]*PATH="\$trusted_path";?$/ { print "PATH=\"" d ":$PATH\""; patched = 1 }
   '
+}
+
+# scope_proc_sweep_to_this_run：验证正文那道「清点残留活进程」问的是「这个 uid 名下
+# 有谁」。runner 上进程表干净，那句话等于「本次 run 自己起的有谁」；本机不等于 ——
+# 同一个用户名下还有一堆外人，实测全都被记成「验证命令留下的」过（MEL-304）：
+#   ① 隔壁 worker 的 `bats tests/`（池子一轮最多 3 个 worker，同一个仓库撞上两个是
+#      常态）。两套并发，两边各红 19 条，每次红的还不是同几条。
+#   ② macOS 按需拉起来的服务（networkserviceproxy、iCloud 的助手、Spotlight 的索引
+#      进程），开着的桌面应用（Chrome 的渲染进程），以及 agent 池自己的进程。
+#      它们在验证命令跑的那几秒里才起来，于是进不了基线。
+#
+# 所以给验证正文一份只答本次 run 自己进程的 ps（tests/test_helper/sweep-bin/ps，
+# 怎么认见那个文件开头）。防线正文一个字不改 —— 收窄发生在「谁来回答 ps」这一层，
+# 判据（除了基线里那些和我们自己的后代，一个都不许有）照旧，探针照旧要被它自己的
+# 逻辑抓出来。
+#
+# 这条规则的失败方向是「少报」，所以它必须有自测，而且有：每个会活过验证命令的探针
+# 都有一条测试要求清点把它报出来（codex-takeover 里那几条 escapee / idle daemon /
+# leftover）。认不出探针 = 那几条当场红，不是悄悄绿。实测抓到过两次 —— 一次是探针
+# 最后 exec 成 /bin/sleep、argv 里线索全没了，一次是噪声重跑没把探针状态退回去。
+#
+# 认「哪些是本次 run 的」靠 argv 里带不带本次 run 的临时目录，所以每个会活过验证
+# 命令的探针都写成「从那个目录下的一个脚本起」（见 leftover_probe）。光靠 argv 不够的
+# 两种各自先把自己的 pid 报给那份 ps：故意 exec 掉这条线索的那一个（见那条 idle daemon
+# 旁边的注释），以及被过继给 1 号进程、命令行又可能一瞬读不出来的那个（噪声重跑那一条）。
+# 噪声重跑也会把探针的 pid 文件清空（见 reset_workspace）。
+#
+# 还有一条：别顺着父子链一路往上走。往上走会碰到「我们和隔壁 worker 共同的那个祖先」
+# （跑这一轮的那个 shell），于是隔壁整棵树连带算成我们的，筛选变成空操作（实测踩过）。
+# 所以只走到本次这一步的 shell 为止。
+#
+# 反证开关：`GHWF_SWEEP_UNSCOPED=1 bats tests/` 把 ps 换回全机那一份，并发场景立刻
+# 重新变红。筛选条件只在测试里存在，workflow 从不读它。
+SWEEP_BIN_DIR="$REPO_ROOT/tests/test_helper/sweep-bin"
+
+scope_proc_sweep_to_this_run() {
+  [ "${GHWF_SWEEP_UNSCOPED:-}" != 1 ] || return 0
+  [ -n "${FIX_VERIFY_GUARD:-}" ] || {
+    echo 'scope_proc_sweep_to_this_run: FIX_VERIFY_GUARD is not set yet' >&2
+    return 1
+  }
+  local patched
+  patched="$(printf '%s\n' "$FIX_VERIFY_GUARD" | awk -v d="$SWEEP_BIN_DIR" '
+    { print }
+    !done && $0 ~ /^[[:space:]]*PATH="\$trusted_path";?$/ { print "PATH=\"" d ":$PATH\""; done = 1 }
+    END { if (!done) exit 1 }
+  ')" || {
+    echo 'scope_proc_sweep_to_this_run: the verify guard no longer filters PATH; the scoped ps was not installed' >&2
+    return 1
+  }
+  FIX_VERIFY_GUARD="$patched"
+  export FIX_VERIFY_GUARD
 }
 
 # step_env_keys <workflow-file> <step-name>：打印这一步 `env:` 块里声明的变量名，

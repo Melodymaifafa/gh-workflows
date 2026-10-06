@@ -25,7 +25,9 @@
 #   PUSHOVER_TOKEN / PUSHOVER_USER  告警推送（都有才推）
 #
 #   LABEL_KEY        私有仓库日志标签的 HMAC 密钥（默认用 GH_TOKEN）
-#   SWEEP_READ_TOKEN 只读调用桩用的令牌（Contents: Read-only），没设就用 GH_TOKEN
+#
+# 读调用桩也用 GH_TOKEN（CODEX_TRIGGER_TOKEN，带 Contents 权限）；以前那把单独的
+# SWEEP_READ_TOKEN 不再读 —— 留着一把过期的反而会顶掉能用的那把。
 #
 # 日志和 $GITHUB_STEP_SUMMARY 是公开的：私有仓库只写 repo-<HMAC 前 8 位>，不写名字、PR 号和 SHA，
 # gh 的报错也吞掉。Pushover 是私人通道，照写真名。
@@ -129,7 +131,7 @@ repo_label() {
 integration_base() {
   local f out line b re='^[A-Za-z0-9_][A-Za-z0-9._/-]{0,99}$'
   for f in codex-approved-merge.yml self-codex-approved-merge.yml; do
-    if ! out="$(GH_TOKEN="${SWEEP_READ_TOKEN:-${GH_TOKEN:-}}" gh api -H 'Accept: application/vnd.github.raw+json' "repos/$1/contents/.github/workflows/$f")"; then
+    if ! out="$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$1/contents/.github/workflows/$f")"; then
       [ "$(jq -r '.status // (if .message == "Not Found" then 404 else empty end)' <<<"$out" 2>/dev/null)" = 404 ] && continue
       return 4
     fi
@@ -361,6 +363,6 @@ for entry in $repos; do
   done
 done
 if [ "$unreadable" -gt 0 ]; then
-  echo "::warning::$unreadable 个仓库读不到合并调用桩，按旧规则只扫默认分支是 develop 的（多半是没设 SWEEP_READ_TOKEN，或它缺 Contents: Read-only）：${unreadable_labels# }"
+  echo "::warning::$unreadable 个仓库读不到合并调用桩，按旧规则只扫默认分支是 develop 的（多半是 CODEX_TRIGGER_TOKEN 缺 Contents 权限）：${unreadable_labels# }"
 fi
 exit "$failed"

@@ -36,6 +36,15 @@ setup() {
   # 过去），不读 $RUNNER_TEMP 里的文件。
   export FIX_VERIFY_GUARD; FIX_VERIFY_GUARD="$(step_output verify)"
   export FIX_PUSH_GUARD; FIX_PUSH_GUARD="$(step_output push)"
+  # 残留清点按运行用户问「名下有谁」，本机上那等于「这台 Mac 上这个用户有谁」——
+  # 隔壁 worker 的 bats 一起数进来。把回答这个问题的 ps 换成只认本次 run 的那一份
+  # （见 common.bash 里 scope_proc_sweep_to_this_run）。
+  # 探针起来时都会把自己的号码写下来；那份 ps 按号码也认一次，所以 argv 里的标记没了
+  # （exec 掉了、或者 macOS 这一瞬读不到命令行）也还认得出它是我们的。文件这会儿还不
+  # 存在，不要紧。单条测试可以往这串后面再接一个自己的号码文件 —— 噪声重跑那一条就是
+  # 这么做的，它那个进程不能进这两个文件（is_machine_noise 读的就是它们）。
+  export GHWF_SWEEP_PROBE_PIDFILE="$BATS_TEST_TMPDIR/escaped.pid:$BATS_TEST_TMPDIR/leftover.pid"
+  scope_proc_sweep_to_this_run
   : >"$GITHUB_OUTPUT"
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
 }
@@ -650,6 +659,8 @@ push_workspace() { # push_workspace <verify script>
   # 要放行的测试自己在调用前 export 一份。
   export VERIFY_WRITABLE_PATHS="${VERIFY_WRITABLE_PATHS:-}"
   export HEAD_REF=topic PR_NUMBER=7 ROUND=2 REPO=o/r GH_TOKEN=write-token
+  # 噪声重跑要退回这一刻，连 .git 一起（见 reset_workspace）。
+  cp -R .git "$BATS_TEST_TMPDIR/git-pristine"
 }
 
 # 验证跑完接着提交推送，两步连起来跑。
@@ -686,11 +697,34 @@ is_machine_noise() {
 # 把战利品直接送给它；而带凭据那一步本来就不再往那个文件里写，少这一份不改变任何
 # 一条判定。
 reset_workspace() {
+  # 先把 .git 换回 push_workspace 刚布好的那一份。验证命令动得了 .git —— 种钩子、
+  # 改 config、塞一个 MERGE_HEAD —— 而 reset --hard / clean -fdx 碰不到那儿。留在
+  # 那儿的钩子会被第二次尝试当成「验证前本来就有」，于是「它动过 .git」那一道反倒
+  # 放行，整条链绿着跑完，判定「应该红」的那些测试全部假失败（MEL-304 实测：
+  # 一次重跑之后，接下来 11 次全是这样）。
+  # 动过的那一份挪开、不删：bats 收尾会把整个临时目录清掉。
+  if [ -d "$BATS_TEST_TMPDIR/git-pristine" ]; then
+    mv .git "$(mktemp -d "$BATS_TEST_TMPDIR/git-dirty-XXXXXX")/git"
+    cp -R "$BATS_TEST_TMPDIR/git-pristine" .git
+  fi
   "$REAL_GIT" reset -q --hard origin/topic
   "$REAL_GIT" clean -qfdx
   printf 'v2 fixed by codex\n' >app.txt
   mkdir -p .review
   printf 'prefetched review\n' >.review/findings-99-1.md
+  # 探针自己也要退回去，两件事：
+  #   · 上一次那个还活着的先收掉。它 argv 里带着本次 run 的临时目录，清点认得出是
+  #     我们的，留着就会被后面别的测试数进去。
+  #   · pid 文件清空。逃逸探针靠「pid 文件还空着」判断「它还没起来」，让验证命令等
+  #     它换完会话再退出；不清掉的话第二次尝试压根不等，刚起来的探针当场被按组号
+  #     收掉，清点什么都找不到 —— 整条链绿着跑完，而这几条要的是红。
+  # 清空、不删文件：删文件要跑 rm，池子里那是会弹权限窗的命令。
+  for probe in escaped.pid leftover.pid; do
+    if [ -s "$BATS_TEST_TMPDIR/$probe" ]; then
+      kill -9 "$(cat "$BATS_TEST_TMPDIR/$probe")" 2>/dev/null || true
+    fi
+    [ ! -e "$BATS_TEST_TMPDIR/$probe" ] || : >"$BATS_TEST_TMPDIR/$probe"
+  done
 }
 
 # 代替 `run verify_and_push` / `run run_step … Verify`：bats 的 run 写的是全局
@@ -1256,17 +1290,25 @@ done'
 # 就能把钥匙捞走。守的是：验证跑完连整个进程组一起收掉，收干净之前不许把凭据塞
 # 回去。探针盯着 .git/config，一看到凭据回来就抄走 —— 战利品不存在 = 它在凭据回
 # 来之前就被收掉了。循环有上限，万一收不掉也不会把测试挂死。
+# 载荷写成本次 run 临时目录下的一个文件再后台跑，不写成匿名子 shell：本机跑测试时，
+# 清点按「argv 里带不带本次 run 的临时目录」认哪些进程是我们的（见
+# tests/test_helper/sweep-bin/ps）。匿名子 shell 的 argv 是光秃秃一个 `(bash)`，
+# 清点于是看不见它 —— 而「它必须被收掉」正是这两条要证明的事。
 leftover_probe() { # leftover_probe [收到 TERM 不退的写法]
-  printf 'cfg="$PWD/.git/config"
-loot=%s/payload-loot.txt
-( %s
-  i=0
-  while [ "$i" -lt 20000 ]; do
-    if grep -q extraheader "$cfg" 2>/dev/null; then cp "$cfg" "$loot"; exit 0; fi
-    i=$((i + 1))
-  done ) >/dev/null 2>&1 &
+  cat >"$BATS_TEST_TMPDIR/leftover.sh" <<EOS
+#!/bin/sh
+${1:-}
+cfg="\$1"
+loot=$BATS_TEST_TMPDIR/payload-loot.txt
+i=0
+while [ "\$i" -lt 20000 ]; do
+  if grep -q extraheader "\$cfg" 2>/dev/null; then cp "\$cfg" "\$loot"; exit 0; fi
+  i=\$((i + 1))
+done
+EOS
+  printf '/bin/sh %s/leftover.sh "$PWD/.git/config" >/dev/null 2>&1 &
 echo "$!" >%s/leftover.pid
-' "$BATS_TEST_TMPDIR" "${1:-}" "$BATS_TEST_TMPDIR"
+' "$BATS_TEST_TMPDIR" "$BATS_TEST_TMPDIR"
 }
 
 leftover_state() {
@@ -1325,8 +1367,12 @@ escaped_probe() { # escaped_probe [抄到凭据之后再干什么]
   cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
 #!/bin/sh
 echo "$$" >"$ESCAPE_PID"
+# 活得比那道门的容忍窗口长得多（它在 5 秒里只要撞见一个干净的瞬间就放行）。本机
+# 两套测试并发时，从探针起来到清点跑完能拖到十几秒 —— 原来写 200 次（约 10 秒）
+# 的话，探针会在窗口里自己死掉，于是清点真的看见了一个干净的瞬间、整条链绿着跑完，
+# 而这几条要的是红。测试跑完由 reap_escaped 收它，重跑前由 reset_workspace 收。
 i=0
-while [ "$i" -lt 200 ]; do
+while [ "$i" -lt 1200 ]; do
   if grep -q extraheader "$ESCAPE_CFG" 2>/dev/null; then
     cp "$ESCAPE_CFG" "$ESCAPE_LOOT"
     [ -z "$ESCAPE_AFTER" ] || sh -c "$ESCAPE_AFTER"
@@ -1456,12 +1502,19 @@ EOS
 # 「那一刻这个用户名下一个残留都没有」。
 @test "takeover: an idle daemon left behind is caught even though it steals nothing" {
   escaped_probe
-  # 换掉载荷：什么都不偷，只是活着。exec 掉之后 pid 不变，收尾那一下收的正是它。
+  # 换掉载荷：什么都不偷，只是活着。报出来的 pid 就是它自己写下的那个。
   # 走 /bin/sleep 的绝对路径：测试环境里 PATH 上那个假 sleep 压根不睡。
+  # exec 成 /bin/sleep 是故意的：这一条要守的正是「argv 里一点线索都不剩」的那种残留
+  # —— 防线按运行用户清点，本来就不该靠命令行认它，测试也得有一条证明这一点。
+  # 本机跑测试时，清点按「argv 里带不带本次 run 的临时目录」认哪些进程是我们的（见
+  # tests/test_helper/sweep-bin/ps），exec 之后它认不出来、这一条假绿过一次。所以探针
+  # exec 之前把自己的 pid 报给那份 ps（exec 不换 pid），按号码认回来。
+  # 不再套一层 shell 还有一个原因：套着的话 reap_escaped 收掉的只是外面那层 shell，
+  # 里面的 sleep 被过继给 init、再活一分钟，跟后面那些清点进程的测试撞在一起。
   cat >"$BATS_TEST_TMPDIR/escapee.sh" <<'EOS'
 #!/bin/sh
 echo "$$" >"$ESCAPE_PID"
-exec /bin/sleep 12
+exec /bin/sleep 60
 EOS
   push_workspace "$ESCAPE_VERIFY"
 
@@ -1754,8 +1807,23 @@ settle_touched_units() {
 @test "harness: a noise retry restarts from a clean workspace, so the smuggled file is still caught" {
   export NOISE_MARK="$BATS_TEST_TMPDIR/noise.mark"
   export NOISY_DAEMON="$BATS_TEST_TMPDIR/noisy-daemon.sh"
+  # 这个守护进程照 escaped_probe 那一套来：起来第一件事报自己的号码，验证命令等它报完
+  # 再退出。两件事各挡住一个实测过的漏法（MEL-304 第 2 轮，原来这两样都没有，约 5%
+  # 的概率清点报不出它、重跑压根不发生、这一条当场红在前置门上）：
+  #   · 报号码。它被过继给 1 号进程，父子链上认不回来，于是只剩「argv 里带本次 run 的
+  #     临时目录」一条认法；macOS 的 ps 读不到某个进程的命令行时只给一个括号里的名字，
+  #     清点那一句和筛选那一句同时读不到，它就被筛掉。而那道门在 5 秒里撞见一个干净的
+  #     瞬间就放行 —— 也就是有 50 次机会漏，「大概率认得出」不够用，按号码认才是确定的。
+  #   · 等它报完再走。perl 还没 setsid 完验证命令就退出的话，按组号那一下把它正当收掉，
+  #     压根没有残留可报。原来写死 /bin/sleep 1，并发负载下不保证够。
+  # 号码写进第三个文件，不是 is_machine_noise 读的那两个（escaped.pid / leftover.pid）：
+  # 那份 ps 要认得出它是我们的，而 is_machine_noise 必须继续把它当成「没种过的机器
+  # 噪声」—— 写进那两个里，重跑就不触发了，这一条照样红。
+  export NOISE_PID="$BATS_TEST_TMPDIR/noise.pid"
+  export GHWF_SWEEP_PROBE_PIDFILE="$GHWF_SWEEP_PROBE_PIDFILE:$NOISE_PID"
   cat >"$NOISY_DAEMON" <<'EOS'
 #!/bin/sh
+echo "$$" >"$NOISE_PID"
 i=0
 while [ "$i" -lt 600 ] && [ ! -e "$NOISE_MARK.stop" ]; do
   /bin/sleep 0.1
@@ -1769,11 +1837,22 @@ if [ -e "$NOISE_MARK" ]; then
 else
   : >"$NOISE_MARK"
   perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec("/bin/sh", $ENV{NOISY_DAEMON});' >/dev/null 2>&1 &
-  /bin/sleep 1
+  # 等它换完会话、exec 完、把号码写下来再让验证命令退出（同 escape.sh）。定长 sleep
+  # 在并发负载下不保证够，而慢一步就等于这一轮压根没有噪声进程。
+  # 走 /bin/sleep 的绝对路径：PATH 上那个假 sleep 压根不睡。
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -s "$NOISE_PID" ]; do
+    /bin/sleep 0.05
+    i=$((i + 1))
+  done
 fi
 printf run >>"$NOISE_MARK.runs"
 printf 'backdoor\n' >planted.txt
 git add planted.txt
+# .git 那一半：种一个钩子。重跑前要是不把 .git 换回去，第二次的「验证前」就已经
+# 带着它，指纹前后一比没差异，「它动过 .git」这一道反倒放行。
+printf '#!/bin/sh\n' >.git/hooks/post-index-change
+chmod +x .git/hooks/post-index-change
 EOS
   push_workspace "sh $BATS_TEST_TMPDIR/noisy.sh"
 
@@ -1781,9 +1860,18 @@ EOS
 
   # 真的重跑过：载荷每跑一次记三个字节
   runs="$(wc -c <"$NOISE_MARK.runs" | tr -d ' ')"
-  [ "$runs" -ge 6 ] || { echo "the chain ran only $((runs / 3)) time(s); the retry never happened" >&2; return 1; }
+  [ "$runs" -ge 6 ] || {
+    echo "the chain ran only $((runs / 3)) time(s); the retry never happened" >&2
+    noise_pid="$(cat "$NOISE_PID" 2>/dev/null || true)"
+    echo "# noise daemon: pid=${noise_pid:-none}" \
+         "alive=$(kill -0 "${noise_pid:-0}" 2>/dev/null && echo yes || echo no)" \
+         "ps=[$(ps -p "${noise_pid:-0}" -o args= 2>/dev/null || true)]" >&2
+    return 1
+  }
   assert_equal "$status" 1
-  assert_contains "$output" 'outside verify_writable_paths'
+  # 两半都要在重跑之后照旧抓到：工作区那半（夹带的文件）和 .git 那半（种的钩子）。
+  # 重跑前不把 .git 换回去的话，红的原因会变成前者、后者静默失效。
+  assert_contains "$output" 'the verify command modified .git'
   assert_equal "$(git ls-tree -r --name-only origin/topic)" "$(printf 'app.txt\ndeps.lock')"
 }
 
@@ -1854,6 +1942,19 @@ decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [a
   assert_equal "$status" 1
   assert_contains "$output" 'pr-guard helpers did not arrive'
   refute_called "gh pr comment"
+}
+
+# claude-code-action 把自己整步跳过了（PR 分支上的调用桩落后于默认分支，判据见
+# iterate-gate.bats 的 stale_caller_workflow）。换谁上都一样被跳过，所以这里不问分类器、
+# 不换人：说清要去点 Update branch，然后红着停下。以前它落到一条笼统的「没跑成」上。
+@test "takeover: a stale caller workflow is fatal, says Update branch, and hands nothing over" {
+  decide claude true stale-workflow
+  assert_equal "$status" 1
+  assert_equal "$(step_output run_codex)" false
+  body="$(fake_last_body "gh pr comment")"
+  assert_contains "$body" 'Update branch'
+  assert_contains "$body" "reason=stale-workflow until=- -->"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" 'claude-code-action skipped itself'
 }
 
 # 两步的 run 块里都不许再出现那个文件名：谁把 source 加回来，这一条当场红。

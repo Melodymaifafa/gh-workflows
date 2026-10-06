@@ -26,6 +26,21 @@ jobs:
       # claude_model: claude-opus-5-5
       # claude_effort: xhigh
       #
+      # 修复那一轮推之前要跑的验证命令（一行一条）。不写就用中央仓库按 runtime 的
+      # 默认值，那份默认值跟 ci.yml 的默认值逐字一样。
+      # **ci.yml 里用 install_cmd / lint_cmd / test_cmd 覆盖过默认值的仓库，这里必须
+      # 跟着覆盖成同样那三条**，否则 CI 绿着、修复那一轮必然红（MEL-293 / MEL-303）：
+      # 验证命令跑的是仓库自己装不上的那套默认命令。onboard.sh 在 INSTALL_CMD /
+      # LINT_CMD / TEST_CMD 任意一个有值时会把这一段自动写出来，手改 ci.yml 的覆盖值
+      # 时要记得一起改这里。整份替换，不是逐行合并：写了就得把三条都写齐。
+      # 整块是当一个脚本跑的，不像 ci.yml 那样每条一个 step：哪条带 cd 或 exit，
+      # 就把它单独用一对独占一行的 ( ) 括起来，免得带到后面几条（onboard.sh 写出来的就是这样）。
+      # verify_cmd: |
+      #   uv sync --dev
+      #   uv run ruff check .
+      #   uv run pytest
+__VERIFY_CMD__
+      #
       # 允许验证命令重写哪些被跟踪的文件（一行一个，精确路径）。默认一个都不许：
       # 验证命令来自被审的那个 PR，它改过的被跟踪文件会跟着修复一起提交推送。
       # 验证会重新生成 lock 文件的仓库（python 的 uv sync --dev 重写 uv.lock、

@@ -49,7 +49,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `pr-guard: fix-round head=H round=N` | GITHUB_TOKEN | 第 N 轮修复已推送（轮数不靠召唤是否成功） |
 | `pr-guard: alert head=H reason=R until=T` | 各环节 | 已告警 R，同一 head 同一原因只推一次 |
 
-告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
+告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `verify-failed` `push-failed` `stale-workflow` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
 
 ### 修满轮数之后（2026-10-04）
 
@@ -65,14 +65,22 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根目录是受信任的 base，主人的 PAT 只在最后发结论那一步。
 
+### 判「不用改」之后（2026-10-06，MEL-307）
+
+修复那一轮 Claude 看完意见判「都不用改」时，不再停车等人点 Merge，而是交给同一个 judge 逐条复核：没有真 bug 就发放行标记、CI 全绿后合并；有确认的 bug 就发 M9 接着修。放行不推手机（这是常态）。照旧停车告警 `no-fix` 的三种：没配主人的 PAT；这一轮修的正是 judge 确认的 bug（两个 Claude 意见相反，再判只会来回转）；judge 没判成或审查方标了 P0 而 Claude 不认。`judged_already` 把 `no-fix` 停车也算一个判决，同一个 head 不重判。
+
+**以后再做的记到 Linear**：judge 给每条 P2 多填一个 `later`。`later=true`（优化、新功能、超出本 PR 范围但值得做）在放行或 M9 时记成一张 Linear 票：Backlog、不指派、带 Improvement 标签，正文写 judge 的理由、来源 PR 和原意见链接 —— 不进 Agent Queue，流水线不给自己派活。找项目先认挂着这个仓库 GitHub 链接的项目（名字常对不上，如 `learn-api-integrations` → Duolinguo learning app），再认同名项目（跳过已取消的），都没有就建一个同名项目并挂上链接。每次最多 5 张；同一个 PR 同标题的票不重记。没配 `LINEAR_API_KEY`、Linear 出错或查不到团队的 Backlog 状态（免得票落进 Triage）只写进评论（M9 时写进那条 review，注明本 PR 不用改），照样放行。停车时不记票，人先看。
+
+改好了却没推上去时，PR 上也一定有一句话（2026-10-05）：验证命令没过 → `verify-failed`；提交了但 push 被拒 → `push-failed`，告警里直接说是哪一种拒（令牌不许改 workflow 文件 / 分支保护 / 分支落后），两条都带 run 链接。`claude-code-action` 因为「PR 分支上的调用桩跟默认分支不一样」把自己整步跳过时 → `stale-workflow`，告警直接写「点 Update branch」。这三种以前在 PR 上一个字都没有，只能等巡检重试两次之后收到一条不说原因的 `retry-exhausted`。
+
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
 
 **巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused`、CI 红）等人处理。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
 
-- **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是没设 `SWEEP_READ_TOKEN`）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
+- **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **节奏**：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次，所以上面的 30 / 60 分钟只是下限。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。
 - **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`。
-- **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；另加一个只给巡检用的 `SWEEP_READ_TOKEN`，见下方「密钥」。
+- **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
 - 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。
 
 故意不管的：草稿、从 fork 开的 PR、标题带 `[no-codex-merge]` / `[no-claude]` 的 PR。叫审 3 次没结果的 head 之后只每天叫一次、共 7 天，然后不再叫；有冲突、已停车的 head 只告警一次。用内联副本、没接共享调用桩的仓库（如 Weibo--automation-android）：每个 PR 的每个 head 空闲 60 分钟后告警一次 `unwatched`，不叫审；私有仓库要等巡检读得到调用桩才生效。
@@ -117,7 +125,11 @@ jobs:
       runtime: node
 ```
 
-`runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm + npm test`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。
+`runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm` + `npm run test --if-present`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。
+
+**修复那一轮的默认验证命令跟 `ci.yml` 的默认值逐字一样**，`tests/iterate-gate.bats` 有一条判定把两边钉在一起。差一个字的代价是单向的：没有 `package-lock.json` 的仓库 `npm ci` 直接失败，没有 `test` 脚本的仓库 `npm test` 报 Missing script —— CI 两样都绿着放过，修复那一轮却必然红（MEL-293）。`ci.yml` 用 `install_cmd` / `test_cmd` 覆盖过默认值的仓库，`claude-codex-iterate.yml` 的 `verify_cmd` 也要跟着覆盖，否则同一个坑换个地方出现。
+
+**`onboard.sh` 会自动把这两处一起写出来（MEL-303）**：`INSTALL_CMD` / `LINT_CMD` / `TEST_CMD` 任意一个有值时，它在 iterate 调用桩里写一个三条命令的 `verify_cmd`，没覆盖的那几条用跟 `ci.yml` 逐字相同的默认值填齐 —— `verify_cmd` 是整份替换、不是逐行合并，只写被覆盖的那一条会让另两条从修复那一轮里整个消失。三条各包在一对独占一行的 `( )` 里（子 shell）：`ci.yml` 里装 / lint / 测各是一个 step，中央仓库却把整块 `verify_cmd` 当一个脚本跑，不隔开的话装依赖那条的 `cd frontend` 会带进后两条（它们自己的 `cd frontend` 当场失败），一条 `exit 0` 会让后面几条整个不跑。括号不跟命令写在同一行，是因为覆盖值末尾的 `#` 注释 `ci.yml` 照跑，同一行的右括号却会被它吃掉。`skip` 翻成 `echo "::notice::<步骤> skipped by caller"`，跟 `ci.yml` 里 `skip` 的行为（打一条 notice 然后退出 0）对齐：原样写 `skip` 会被当成命令、找不到就整轮红，写成空行则中央仓库判定「没有验证命令」拒绝推送。三条全 `skip` 的仓库接入时会收到一条警告 —— 那种仓库的修复不经任何检查就推上 PR（CI 本来也一条都不跑，所以不是新开的洞，但只有接入那一刻说得出口）。手改 `ci.yml` 的覆盖值时记得一起改 `verify_cmd`，`tests/onboard-verify-cmd.bats` 把 `onboard.sh` 填的默认值和 `ci.yml` 的钉在一起。
 
 `claude-codex-iterate.yml` 另收一个 `review_fixer`：`auto`（默认，Claude 先上，只有额度耗尽 / 限流 / 认证失效 / 服务不可用才换 Codex）、`claude`（现有行为，永不换人）、`codex`（跳过 Claude）。**拼错直接红**，不会静默按 `auto` 跑掉一整轮。测试没修好、构建挂了这类业务失败**不换人**：换个模型一样挂，job 该红就红。谁上、有没有换人、为什么，三件事都写在那次 run 的 summary 里。换人成功的那一轮照样记轮数、照样召唤复审，链条不会停在这里；令牌失效这种不会自己恢复的原因，即使换人成功也推一条通知。
 
@@ -139,17 +151,20 @@ jobs:
 
 ## 密钥
 
-四个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
+五个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
 
 | 密钥 | 缺了会怎样 |
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude 修复和 Claude 代审都不跑（`claude setup-token` 生成，`sk-ant-oat01-` 开头）。和本人的订阅共用每周额度 |
 | `CODEX_TRIGGER_TOKEN` | 无法召唤 Codex 复审；Claude 撞额度时请不动 Codex 出补丁；Claude 代审结论发不出（告警 `pat-missing`）；巡检不能动手 |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
+| `LINEAR_API_KEY` | judge 判为「以后再做」的意见不记 Linear 票，只写在 PR 评论里；照样合并（Linear 个人 API key，`lin_api_` 开头） |
 
-`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。
+`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** + **Contents、Workflows read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。Contents、Workflows 写权限是为本仓库把它复用成 `SELF_WORKFLOWS_TOKEN`（见下一段）；巡检读各仓库调用桩也顺带用它的 Contents 权限。代价：每个仓库都存着它，任何一个泄露，别人就能改所有仓库的代码和流水线 —— 2026-10-06 认了这个代价，换「不用再管第二把令牌」。
 
-`SWEEP_READ_TOKEN` 只存在本仓库（`gh secret set SWEEP_READ_TOKEN --repo Melodymaifafa/gh-workflows`，不走 `onboard.sh`）：另建一个 fine-grained PAT，**All repositories** + Metadata read + Contents read，巡检只用它读各仓库调用桩的 `base_branch`。不把 Contents 读权限加给 `CODEX_TRIGGER_TOKEN`，因为那个令牌会复制到每个仓库，任何一个仓库泄露就能读到所有私有仓库的代码。没设它，私有仓库的调用桩读不到，巡检退回只扫默认分支是 develop 的仓库，并在 run 里警告。
+`SELF_WORKFLOWS_TOKEN` 只设在本仓库，值就是 `CODEX_TRIGGER_TOKEN` 那一把，不另建（2026-10-06）：`set -a && source ~/.config/gh-workflows/secrets.env && set +a && printf %s "$CODEX_TRIGGER_TOKEN" | gh secret set SELF_WORKFLOWS_TOKEN --repo Melodymaifafa/gh-workflows`。`onboard.sh` 不刷它 —— 代码只在本仓库读这个名字。GitHub 不许没有 Workflows 权限的令牌推、合 `.github/workflows/` 下的改动，而本仓库的 PR 几乎都改这些文件（2026-09-26 到 10-01，17 / 18 / 19 号 PR 为此停了 5 次里的 4 次）。只交给两处：iterate 推修复那一条 `git push`、codex-approved-merge 那一条 `gh pr merge`；验证命令、跑被审 PR 代码的步骤、Claude / Codex 那几步都拿不到，同一步里的 `gh pr comment` 也照旧用 `github.token`。没设它行为不变 —— 照旧走 `github.token`，推不动 / 合不动就按现有告警走（MEL-295）。
+
+`SWEEP_READ_TOKEN` 不用了（2026-10-06）：`CODEX_TRIGGER_TOKEN` 有了 Contents 权限，巡检直接拿它读各仓库调用桩的 `base_branch`，代码也不再读这个名字 —— 留着一把过期的单独令牌，反而会顶掉能用的那把、让私有仓库的调用桩读不到。以前设过的删掉即可：`gh secret delete SWEEP_READ_TOKEN --repo Melodymaifafa/gh-workflows`，那把 PAT 也可以在 GitHub 上作废。
 
 ## 本仓库自己也接了（2026-07-30）
 
@@ -215,6 +230,8 @@ git tag -f v1 && git push -f origin v1
 - **Codex 额度用完时它照样回一条评论**：旧版超时告警把它当成「Codex 有反应」，于是既不告警也不合并，PR 就这么卡住（2026-09-17，3 个 PR）。现在认出这句话就当场换 Claude。
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
 - **密钥只写不读，个人账号也没有账号级密钥**：存进仓库后连 API 都取不回值（`gh api repos/X/actions/secrets/NAME` 只返回名字和日期），共享密钥是 organization 才有的功能。所以 `secrets.env` 是唯一母本 —— 在网页上手填过的值必须补回母本，否则接新仓库时无处可取（2026-07-30 为此翻了半天 `~/.claude/history.jsonl`）。
-- **Regenerate PAT 会立刻作废旧值**：换完要把所有仓库的 secret 一起刷新。漏掉的那个 CI 照样绿，只有 Codex 复审那步静默停住。
+- **Regenerate PAT 会立刻作废旧值**：换完要把所有仓库的 secret 一起刷新；换的是 `CODEX_TRIGGER_TOKEN` 的话，本仓库的 `SELF_WORKFLOWS_TOKEN` 也要按上面那条命令重设（`onboard.sh` 不管它，漏了本仓库的 PR 又推不动、合不动流水线文件）。漏掉的那个 CI 照样绿，只有 Codex 复审那步静默停住。
 - **bats 里别直接写 `[[ ... ]]`**：中途失败的 `[[ ]]` bats 抓不住，只认最后一条命令的退出码，测试于是假绿（一条明知会挂的断言照样报 ok）。用 `tests/test_helper/common.bash` 里的 `assert_equal` / `assert_contains`，函数返回非零它抓得住。
 - **接完要把仓库默认分支改成 `develop`**：`onboard.sh` 起手要求默认分支是 `main`（它靠 main 建 develop），但完成后会自动改成 `develop`。如果这步失败，必须手动补；否则 `gh pr create` 不带 `--base` 会打向默认分支。linear-agent-team 忘了改，agent 开的 3 个 PR 全合进 main，develop 停在初始 commit（2026-07-30）。
+- **Claude 那一步只认默认分支上的调用桩**：`anthropics/claude-code-action` 自己会校验「触发这次 run 的那份工作流文件，内容跟仓库默认分支上的是否一字不差」，不一样就整步跳过，日志只有一句 `Skipping action due to workflow validation`。于是**演练时把调用桩临时钉到别的 ref（分支、tag、sha）这招对 Claude 那条路是走不通的**：action 不跑、没有任何结构化输出，`Check the fix outcome` 按「业务失败」收口，整轮红（MEL-200 实测，run 37255446498）。Claude 那条路只能拿默认分支上原样的调用桩演练 —— `v1` 等于 `develop` 尖端时它本来就是在跑新代码。Codex 接管那条不受影响：它压根不调这个 action，钉 sha + 传 `review_fixer: codex` 照跑（MEL-200 实测，run 37256040590）。
+- **被审 PR 进门时 CI 就得是绿的，否则这一轮多半到不了推送**：fixer 只管复审意见，而验证那一步跑的是本仓库全套验证命令。所以 PR 身上只要有**复审没提到的** lint 问题，补丁打得再干净，验证照样红、什么都不推（MEL-200 实测：演练 PR 自带一个 shellcheck 的 SC2086，Codex 的意见是另一回事，于是 `verification: failed, nothing was pushed`，run 37255492609；补上引号重跑，同一条路立刻走完五步）。验证看的是补丁打完以后的代码，所以真正拦住推送的是**补丁打完还剩下的** lint 问题，两个 fixer 都一样。差别在于剩下的概率：Claude 那条的 prompt 明确不让它跑 lint / 测试，它看不到这类问题，除非按复审意见改的恰好是同一行、顺带把问题改没了，否则这种 PR 在那条路上推不出去；Codex 接管那条的请求只叫它「修复审意见、回一份 diff」，没禁它在云端自己跑 lint，所以它顺手把别的问题也修掉、验证碰巧转绿的可能更大一些 —— 两条都别指望这个。这不是 bug：自动修复接手的前提是「除了复审指出的那些，别的都已经是绿的」；排查时见到哪条偶尔绕过去了，也不代表这个前提可以不管。

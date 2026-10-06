@@ -106,6 +106,14 @@ jobs:
     steps:
       - name: Wait for Codex and merge a clean exact head
         id: watch
+        env:
+          # 本仓库专用的写权限令牌（带 Workflows 权限）。GitHub 不许没有 Workflows 权限
+          # 的令牌合 `.github/workflows/` 下的改动，而本仓库的 PR 几乎都改这些文件
+          # （2026-10-01 的 19 号 PR 就是这样被拒的）。密钥只设在 Melodymaifafa/gh-workflows
+          # 一个仓库，别的仓库取到空串 → 照旧走 github.token，行为跟今天一字不差。
+          # 只交给下面那一条 gh pr merge：等 Codex、读 PR、发告警评论的那些调用照旧用
+          # github.token（判定在 merge_credential_source）。
+          SELF_WORKFLOWS_TOKEN: ${{ secrets.SELF_WORKFLOWS_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -703,9 +711,28 @@ jobs:
             exit 0
           fi
 
+          # 合并这一条用哪一份令牌 —— 只打印名字，值由下面按名字取，绝不打印。
+          # 两个条件同时成立才用本仓库专用的那把：跑在 Melodymaifafa/gh-workflows（别的
+          # 仓库万一也设了同名密钥，一样不许用），且密钥非空。
+          merge_credential_source() {
+            if [ "${REPO:-}" = Melodymaifafa/gh-workflows ] &&
+              [ -n "${SELF_WORKFLOWS_TOKEN:-}" ]
+            then
+              echo self-workflows
+            else
+              echo github-token
+            fi
+          }
+          merge_credential="$(merge_credential_source)"
+          case "$merge_credential" in
+            self-workflows) merge_token="$SELF_WORKFLOWS_TOKEN" ;;
+            *)              merge_token="$GH_TOKEN" ;;
+          esac
+          echo "the merge request uses the $merge_credential credential"
+
           # GitHub 拒绝合并时不能只让 run 变红：没人会去看，巡检还会一遍遍重新叫审。
           if merge_out="$(
-            gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch \
+            GH_TOKEN="$merge_token" gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch \
               --match-head-commit "$expected_head" 2>&1
           )"; then
             printf '%s\n' "$merge_out"
