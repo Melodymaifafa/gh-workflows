@@ -1219,9 +1219,9 @@ jobs:
           # 这一条 push 用哪一份写权限凭据 —— 只打印名字，值由下面按名字取，绝不打印。
           # GitHub 不许没有 Workflows 权限的令牌推 `.github/workflows/` 下的改动，而本仓库
           # 的 PR 几乎都改这些文件：2026-09-26 到 10-01，17 / 18 / 19 号 PR 为此停了 4 次。
-          # 所以本仓库单独配一把带 Workflows 权限的 PAT（`SELF_WORKFLOWS_TOKEN`，只设在这
-          # 一个仓库、不走 onboard.sh / secrets.env，否则会刷到所有仓库去）。两个条件同时
-          # 成立才用它：
+          # 所以本仓库多设一个密钥 `SELF_WORKFLOWS_TOKEN`，值就是加了 Contents / Workflows
+          # 写权限的 CODEX_TRIGGER_TOKEN（2026-10-06 定，不另建；名字只设在这一个仓库，
+          # onboard.sh 不刷它）。两个条件同时成立才用它：
           #   1. 跑在 Melodymaifafa/gh-workflows —— 别的仓库万一也设了同名密钥，一样不许用；
           #   2. 密钥非空 —— 没设就照旧走 github.token，行为跟今天一字不差，不报错。
           # 它能改所有仓库共用的流水线，所以只交给这一条 push：同一步里的 gh pr comment
