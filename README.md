@@ -108,6 +108,8 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip ./onboard.sh <repo> node
 ```
 
+`package.json` 的 `engines` 要求比 `ci.yml` 的默认 node 20 新时用 `NODE_VERSION=24 ./onboard.sh <repo> node` 钉住，否则第一次接入就装不上依赖。只有 `ci.yml` 收这个值：中央 `claude-codex-iterate.yml` 的 `setup-node` 写死 node 20 且没开成 input，所以钉了别的版本时修复那一轮仍是 20，接入时会为此打一条警告 —— 跟 `verify_cmd` 跟不上覆盖值时同一种单向代价（CI 绿着、修复那一轮红）。
+
 **本仓库已是 public（2026-07-30），公开和私有仓库都能接。** 之前是 private 时，公开仓库调用它会失败得毫无线索：run 存在但 0 秒结束、一个 job 都没有、只报 "workflow file issue" —— 跨可见性调用不被允许，而报错完全不提这回事。顺带好处：公开仓库的 Actions 分钟数免费无上限，私有仓库每月 2000 分钟。
 
 Codex connector 是账号级授权，新仓库无需单独授权（2026-07-29 在 learn-api-integrations 实测：新开的 PR 2 分钟内就被自动 review 并 👍）。

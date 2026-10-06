@@ -11,6 +11,10 @@
 # 仓库没有依赖清单 / lint 配置 / 测试时，用环境变量把对应步骤设成 skip，
 # 避免第一次接入就满屏红叉：
 #   INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip ./onboard.sh <repo> node
+#
+# package.json 的 engines 要求比 ci.yml 的默认 node 20 新时，用 NODE_VERSION 钉住，
+# 否则第一次接入就装不上依赖：
+#   NODE_VERSION=24 ./onboard.sh <repo> node
 set -euo pipefail
 
 OWNER=Melodymaifafa
@@ -28,7 +32,7 @@ STUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stubs"
 # 没传的键留空、走中央仓库按 runtime 的默认命令。
 ci_overrides() {
   local var value key out=''
-  for var in INSTALL_CMD LINT_CMD TEST_CMD RUNS_ON; do
+  for var in INSTALL_CMD LINT_CMD TEST_CMD RUNS_ON NODE_VERSION; do
     value="${!var:-}"
     [ -n "$value" ] || continue
     key="$(tr '[:upper:]' '[:lower:]' <<<"$var")"
@@ -99,6 +103,17 @@ verify_coverage_warning() {
   [ "${INSTALL_CMD:-}" = skip ] && [ "${LINT_CMD:-}" = skip ] && [ "${TEST_CMD:-}" = skip ] || return 0
   echo "    ⚠️  装 / lint / 测三条都是 skip：CI 和修复那一轮都不会真验证任何东西，" >&2
   echo "        Claude 的修复会直接推上 PR。三条里任意一条给上真命令就能恢复验证。" >&2
+}
+
+# NODE_VERSION 只到得了 ci.yml。中央 claude-codex-iterate.yml 的 setup-node 把
+# node-version 写死成 '20' 且没开成 input，所以修复那一轮永远是 node 20 ——
+# 跟 verify_cmd 跟不上 ci.yml 覆盖值时一样的单向代价（MEL-293 / MEL-303）：
+# CI 绿着，修复那一轮装不上依赖必然红。这一刻不说，之后没人会再看一眼生成的桩。
+node_version_warning() {
+  local pinned="${NODE_VERSION:-}"
+  [ -n "$pinned" ] && [ "$pinned" != 20 ] || return 0
+  echo "    ⚠️  CI 钉在 node $pinned，但修复那一轮固定跑 node 20（中央 iterate 没有" >&2
+  echo "        node_version input）。Codex 提出意见后那一轮可能装不上依赖而红。" >&2
 }
 
 # 把四个调用桩渲染进 <dest>/.github/workflows/。<dest> 默认当前目录。
@@ -175,6 +190,7 @@ fi
 #    只写前者的话 CI 绿着、修复那一轮必然红（MEL-303）。
 render_stubs "$runtime"
 verify_coverage_warning
+node_version_warning
 
 # 必须先 add 再比对：调用桩是全新文件时 git diff 看不见未跟踪文件，
 # 会误报「无需提交」。
