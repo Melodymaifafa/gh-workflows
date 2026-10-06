@@ -70,6 +70,75 @@ load test_helper/common
   assert_contains "$(rendered_stub ci.yml)" "runs_on: 'macos-latest'"
 }
 
+# ---------- node 版本（engines 要求比 ci.yml 的默认 20 新的仓库） ----------
+
+# package.json 写 `engines: {"node": ">=24"}` 的仓库在 node 20 上装依赖就失败，
+# 而这件事只有接入那条命令说得出来 —— 覆盖值只有 install/lint/test 的话，
+# 唯一的出路是接完再手改一遍生成出来的 ci.yml，没人会记得。
+@test "node_version alone is not a verify command and writes no verify_cmd" {
+  OV_NODE_VERSION=24 onboard_render node
+  refute_contains "$(rendered_stub claude-codex-iterate.yml)" $'\n      verify_cmd:'
+  assert_contains "$(rendered_stub ci.yml)" "node_version: '24'"
+}
+
+@test "no node_version override: the ci stub says nothing and keeps ci.yml's default" {
+  onboard_render node
+  refute_contains "$(rendered_stub ci.yml)" 'node_version:'
+}
+
+@test "the CI job's own NODE_VERSION in the environment does not leak into the rendering" {
+  export NODE_VERSION='leaked-version'
+  onboard_render node
+  refute_contains "$(rendered_stub ci.yml)" leaked
+}
+
+# 钉住键名本身，而不只是「写出来了」。ci_overrides 是把变量名小写当键用的，
+# 中央 ci.yml 哪天改了 input 名字，接入照样写得出来、workflow 当场拒收整个调用。
+@test "pinned: every key ci_overrides can emit is an input ci.yml declares" {
+  OV_INSTALL='make deps' OV_LINT='make lint' OV_TEST='make test' \
+  OV_RUNS_ON='macos-latest' OV_NODE_VERSION=24 \
+    onboard_render node
+  run python3 -c '
+import sys, pathlib, re
+try:
+    import yaml
+except ImportError:
+    sys.exit(99)
+stub, central = (pathlib.Path(p).read_text() for p in sys.argv[1:3])
+declared = set(yaml.safe_load(central)[True]["workflow_call"]["inputs"])
+emitted = set(re.findall(r"^      ([a-z_]+): ", stub, re.M)) - {"runtime"}
+assert emitted, "ci_overrides emitted nothing; the test is not checking anything"
+missing = emitted - declared
+assert not missing, f"ci.yml does not declare {sorted(missing)}"
+print("ok", len(emitted))
+' "$BATS_TEST_TMPDIR/out/.github/workflows/ci.yml" "$CI_WORKFLOW"
+  [ "$status" -eq 99 ] && skip 'pyyaml not installed'
+  assert_equal "$status" 0
+  assert_contains "$output" ok
+}
+
+# 中央 iterate 的 setup-node 写死 node 20 且没有 node_version input，所以 CI 钉了
+# 别的版本时两边必然不一样。接入这一刻说出来，否则只会在 Codex 第一次提意见时
+# 变成一句看不懂的红。
+@test "pinning CI to another node version warns that the fix round stays on 20" {
+  OV_NODE_VERSION=24
+  assert_contains "$(onboard_node_version_warning)" '修复那一轮固定跑 node 20'
+}
+
+@test "no node_version, or node_version 20, matches the fix round and is not warned" {
+  assert_equal "$(onboard_node_version_warning)" ''
+  OV_NODE_VERSION=20
+  assert_equal "$(onboard_node_version_warning)" ''
+}
+
+# 上面那条警告的前提：中央 iterate 真的还是写死 20、真的还没有 node_version input。
+# 哪天补上了，这条会红，提醒把警告一起删掉 —— 而不是留一句假话在接入输出里。
+@test "pinned: the central iterate still hardcodes node 20 with no input to override it" {
+  inputs="$(awk '/^on:/,/^jobs:/' "$ITERATE_WORKFLOW")"
+  refute_contains "$inputs" 'node_version:'
+  assert_contains "$(grep -A3 'setup-node' "$ITERATE_WORKFLOW")" "node-version: '20'"
+}
+
 # ---------- 填进去的默认值必须跟 ci.yml 逐字一样 ----------
 
 # 第三份拷贝（ci.yml、中央 iterate、onboard.sh）就得有第三条判定钉住它。
