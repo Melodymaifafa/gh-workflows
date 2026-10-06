@@ -232,7 +232,7 @@ sweep_pr() {
   if [ "$watched" = 0 ]; then
     [ "$idle" -ge 3600 ] || { echo "  没人管，还不够空闲"; return 0; }
     if [ "$base" = - ]; then
-      alert_once unwatched - "🤖 巡检：这个仓库没接共享的审查自动化，这个 PR 不会有人自动审或合。请接上共享调用桩，或手动处理。"
+      alert_once unwatched - "🤖 巡检：这个仓库没接共享的审查自动化，这个 PR 不会有人自动审或合。在 gh-workflows 里跑 ./onboard.sh $repo <python|node> 接上，或手动处理。"
     else
       alert_once unwatched - "🤖 巡检：自动审查和合并只管打向 $base 的 PR，这个 PR 不会有人管。请把 base 改成 $base，或关掉。"
     fi
@@ -309,7 +309,7 @@ repos="$(gh api --paginate --slurp "user/repos?affiliation=owner&per_page=100" |
     | "\(.full_name):\(.private == true):\(.default_branch)"')"
 
 summary "### PR 巡检（$MODE）"
-failed=0 unreadable=0 unreadable_labels=""
+failed=0 unreadable=0 unreadable_labels="" unonboarded=0 unonboarded_labels=""
 for entry in $repos; do
   # 仓库名和分支名都不含 : 和空白。
   repo="${entry%%:*}" rest="${entry#*:}"
@@ -333,7 +333,10 @@ for entry in $repos; do
     :
   else
     case $? in
-      3) base=- ;;
+      # 没接共享自动化，但有开着的 PR：这些 PR 一个都不会被审或合，而每个 head 只
+      # 告警一次，告完就再无声音（MEL-308：三个仓库这样卡了两周，5 个 PR 全停）。
+      # 所以每轮都在 run 摘要里点名一次，让日常体检看得见，不用翻 PR 评论。
+      3) base=- unonboarded=$((unonboarded + 1)) unonboarded_labels="$unonboarded_labels $label" ;;
       *)
         # 读不到调用桩（多半是令牌没有 Contents 读权限）：退回旧规则，
         # 只管默认分支是 develop 的仓库里合进 develop 的 PR，别的一概不碰（也不告 unwatched）。
@@ -364,5 +367,10 @@ for entry in $repos; do
 done
 if [ "$unreadable" -gt 0 ]; then
   echo "::warning::$unreadable 个仓库读不到合并调用桩，按旧规则只扫默认分支是 develop 的（多半是 CODEX_TRIGGER_TOKEN 缺 Contents 权限）：${unreadable_labels# }"
+fi
+# 每轮都报，不跟着 head 去重：仓库漏接是仓库级的，换个 head 也不会自己好。
+if [ "$unonboarded" -gt 0 ]; then
+  echo "::warning::$unonboarded 个仓库有开着的 PR 但没接共享自动化，这些 PR 不会被审也不会被合，跑 ./onboard.sh <仓库> <python|node> 接上：${unonboarded_labels# }"
+  summary "- 没接共享自动化却有开着的 PR（$unonboarded 个仓库，跑 \`./onboard.sh <仓库> <python|node>\`）：${unonboarded_labels# }"
 fi
 exit "$failed"
