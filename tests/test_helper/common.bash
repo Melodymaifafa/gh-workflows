@@ -239,6 +239,18 @@ fake_cli_fail() {
   [ -z "${3:-}" ] || _fake_write "$3" "$base.out"
 }
 
+# fake_linear <操作名> <json-or-file> [seq]：假 Linear GraphQL 的响应，如
+# fake_linear LinearTeam '{"data":{"teams":{"nodes":[{"id":"team-1"}]}}}'
+fake_linear() {
+  _fake_write "$2" "$FAKE_GH_DIR/linear/$1${3:+.$3}.json"
+}
+
+# fake_linear_fail <操作名> <exit-code> [seq]
+fake_linear_fail() {
+  mkdir -p "$FAKE_GH_DIR/linear"
+  echo "$2" >"$FAKE_GH_DIR/linear/$1${3:+.$3}.exit"
+}
+
 # fake_calls [fixed-string]：打印日志里含该子串的行（不给参数就打印全部）。
 fake_calls() {
   if [ "$#" -eq 0 ]; then cat "$FAKE_LOG"; else grep -F -- "$1" "$FAKE_LOG"; fi

@@ -65,6 +65,12 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根目录是受信任的 base，主人的 PAT 只在最后发结论那一步。
 
+### 判「不用改」之后（2026-10-06，MEL-307）
+
+修复那一轮 Claude 看完意见判「都不用改」时，不再停车等人点 Merge，而是交给同一个 judge 逐条复核：没有真 bug 就发放行标记、CI 全绿后合并；有确认的 bug 就发 M9 接着修。放行不推手机（这是常态）。照旧停车告警 `no-fix` 的三种：没配主人的 PAT；这一轮修的正是 judge 确认的 bug（两个 Claude 意见相反，再判只会来回转）；judge 没判成或审查方标了 P0 而 Claude 不认。`judged_already` 把 `no-fix` 停车也算一个判决，同一个 head 不重判。
+
+**以后再做的记到 Linear**：judge 给每条 P2 多填一个 `later`。`later=true`（优化、新功能、超出本 PR 范围但值得做）在放行或 M9 时记成一张 Linear 票：Backlog、不指派、带 Improvement 标签，正文写 judge 的理由、来源 PR 和原意见链接 —— 不进 Agent Queue，流水线不给自己派活。找项目先认挂着这个仓库 GitHub 链接的项目（名字常对不上，如 `learn-api-integrations` → Duolinguo learning app），再认同名项目（跳过已取消的），都没有就建一个同名项目并挂上链接。每次最多 5 张；同一个 PR 同标题的票不重记。没配 `LINEAR_API_KEY`、Linear 出错或查不到团队的 Backlog 状态（免得票落进 Triage）只写进评论（M9 时写进那条 review，注明本 PR 不用改），照样放行。停车时不记票，人先看。
+
 改好了却没推上去时，PR 上也一定有一句话（2026-10-05）：验证命令没过 → `verify-failed`；提交了但 push 被拒 → `push-failed`，告警里直接说是哪一种拒（令牌不许改 workflow 文件 / 分支保护 / 分支落后），两条都带 run 链接。`claude-code-action` 因为「PR 分支上的调用桩跟默认分支不一样」把自己整步跳过时 → `stale-workflow`，告警直接写「点 Update branch」。这三种以前在 PR 上一个字都没有，只能等巡检重试两次之后收到一条不说原因的 `retry-exhausted`。
 
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
@@ -145,13 +151,14 @@ jobs:
 
 ## 密钥
 
-四个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
+五个，都在各仓库的 Settings → Secrets 里，由 `onboard.sh` 从 `~/.config/gh-workflows/secrets.env` 刷进去。**`secrets.env.example` 是那个文件的模板** —— 键名、各自干什么、去哪生成都在里面；真值只留在 `~/.config` 下（本仓库是 public，值放进仓库就等于公开）。
 
 | 密钥 | 缺了会怎样 |
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude 修复和 Claude 代审都不跑（`claude setup-token` 生成，`sk-ant-oat01-` 开头）。和本人的订阅共用每周额度 |
 | `CODEX_TRIGGER_TOKEN` | 无法召唤 Codex 复审；Claude 撞额度时请不动 Codex 出补丁；Claude 代审结论发不出（告警 `pat-missing`）；巡检不能动手 |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
+| `LINEAR_API_KEY` | judge 判为「以后再做」的意见不记 Linear 票，只写在 PR 评论里；照样合并（Linear 个人 API key，`lin_api_` 开头） |
 
 `CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** + **Contents、Workflows read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。Contents、Workflows 写权限是为本仓库把它复用成 `SELF_WORKFLOWS_TOKEN`（见下一段）；巡检读各仓库调用桩也顺带用它的 Contents 权限。代价：每个仓库都存着它，任何一个泄露，别人就能改所有仓库的代码和流水线 —— 2026-10-06 认了这个代价，换「不用再管第二把令牌」。
 
