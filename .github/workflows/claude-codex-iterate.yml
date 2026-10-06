@@ -3587,11 +3587,13 @@ jobs:
                   # 不带 stateId 建票、开了 Triage 的团队会落进 Triage（Codex 2026-10-06 的 P2）。
                   # 类型是 backlog 的有好几个时，先挑名字叫 Backlog 的，再挑排最前的。
                   # 查不到（这一查出错、团队没有 backlog 类状态）就整批不记，理由同上（Codex 2026-10-06 的 P2）。
+                  # 状态从团队自己的 states 查，不按团队过滤全工作区的 workflowStates：子团队可以沿用
+                  # 上级团队的状态，那些状态挂在上级名下，按子团队过滤就查不到（Codex 2026-10-06 的 P2）。
                   # Improvement 标签只认全工作区的、本团队的、本团队上级团队的（子团队能用上级的标签）：
                   # 别的团队自己的同名标签挂上去，建票会整个失败（Codex 2026-10-06 的 P2）。
-                  meta="$(linear 'query LinearIssueMeta($team: ID!) { workflowStates(filter: {team: {id: {eq: $team}}, type: {eq: "backlog"}}) { nodes { id name position } } issueLabels(first: 250, filter: {name: {eq: "Improvement"}}) { nodes { id team { id } } } }' \
+                  meta="$(linear 'query LinearIssueMeta($team: String!) { team(id: $team) { states(filter: {type: {eq: "backlog"}}) { nodes { id name position } } } issueLabels(first: 250, filter: {name: {eq: "Improvement"}}) { nodes { id team { id } } } }' \
                     "$(jq -cn --arg team "$team" '{team: $team}')")" || meta='{}'
-                  state="$(jq -r '[.workflowStates.nodes[]?]
+                  state="$(jq -r '[.team.states.nodes[]?]
                     | sort_by([((.name // "") | ascii_downcase) != "backlog", (.position // 0)])
                     | .[0].id // empty' <<<"$meta")"
                   # 上级团队顺着往上认最多 5 层；这一查出错不要紧，只认本团队，顶多票上不带标签。
