@@ -483,6 +483,32 @@ issue_input() { fake_last_body 'curl linear:LinearIssueCreate' | jq -c '.variabl
   assert_contains "$(cat "$FAKE_DIR/state/linear_headers")" 'Authorization: lin_api_test_key'
 }
 
+@test "linear: the Backlog state is found by its type, so a renamed one still keeps the issue out of Triage" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-name r)")"
+  fake_linear LinearIssueMeta '{"data":{"workflowStates":{"nodes":[
+    {"id":"state-later","name":"Later","position":2},
+    {"id":"state-icebox","name":"Icebox","position":1}]},"issueLabels":{"nodes":[]}}}'
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$(fake_last_body 'curl linear:LinearIssueMeta' | jq -r .query)" 'type: {eq: "backlog"}'
+  assert_equal "$(issue_input | jq -r .stateId)" state-icebox
+  assert_equal "$(issue_input | jq -r 'has("labelIds")')" false
+}
+
+@test "linear: among several backlog-type states the one named Backlog wins" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-name r)")"
+  fake_linear LinearIssueMeta '{"data":{"workflowStates":{"nodes":[
+    {"id":"state-icebox","name":"Icebox","position":0},
+    {"id":"state-backlog","name":"Backlog","position":5}]},"issueLabels":{"nodes":[]}}}'
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_equal "$(issue_input | jq -r .stateId)" state-backlog
+}
+
 @test "linear: no linked project falls back to the same name, never to a canceled one" {
   linear_env
   fake_linear LinearProjects "$(projects_json \

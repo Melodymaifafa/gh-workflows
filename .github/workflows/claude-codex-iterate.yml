@@ -3566,9 +3566,14 @@ jobs:
                 if [ -z "$project" ]; then
                   note='找不到也建不了 Linear 项目，没记上（看 Actions 日志）'
                 else
-                  meta="$(linear 'query LinearIssueMeta($team: ID!) { workflowStates(filter: {team: {id: {eq: $team}}, name: {eq: "Backlog"}}) { nodes { id } } issueLabels(filter: {name: {eq: "Improvement"}}) { nodes { id } } }' \
+                  # Backlog 按状态类型找，不按名字：团队把它改了名（如「Later」）按名字就找不到，
+                  # 不带 stateId 建票、开了 Triage 的团队会落进 Triage（Codex 2026-10-06 的 P2）。
+                  # 类型是 backlog 的有好几个时，先挑名字叫 Backlog 的，再挑排最前的。
+                  meta="$(linear 'query LinearIssueMeta($team: ID!) { workflowStates(filter: {team: {id: {eq: $team}}, type: {eq: "backlog"}}) { nodes { id name position } } issueLabels(filter: {name: {eq: "Improvement"}}) { nodes { id } } }' \
                     "$(jq -cn --arg team "$team" '{team: $team}')")" || meta='{}'
-                  state="$(jq -r '.workflowStates.nodes[0].id // empty' <<<"$meta")"
+                  state="$(jq -r '[.workflowStates.nodes[]?]
+                    | sort_by([((.name // "") | ascii_downcase) != "backlog", (.position // 0)])
+                    | .[0].id // empty' <<<"$meta")"
                   label="$(jq -r '.issueLabels.nodes[0].id // empty' <<<"$meta")"
                   src="$REPO#$PR_NUMBER"
                   # 查重认整段「来源：o/r#7（」，前后都卡住：光找 o/r#7 会把 o/r#70 同标题的票也认成
