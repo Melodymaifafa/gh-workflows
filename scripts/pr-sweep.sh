@@ -232,7 +232,7 @@ sweep_pr() {
   if [ "$watched" = 0 ]; then
     [ "$idle" -ge 3600 ] || { echo "  没人管，还不够空闲"; return 0; }
     if [ "$base" = - ]; then
-      alert_once unwatched - "🤖 巡检：这个仓库没接共享的审查自动化，这个 PR 不会有人自动审或合。在 gh-workflows 里跑 ./onboard.sh $repo <python|node> 接上，或手动处理。"
+      alert_once unwatched - "🤖 巡检：这个仓库没接共享的审查自动化，这个 PR 不会有人自动审或合。在 gh-workflows 里跑 ./onboard.sh ${repo#*/} <python|node> 接上，或手动处理。"
     else
       alert_once unwatched - "🤖 巡检：自动审查和合并只管打向 $base 的 PR，这个 PR 不会有人管。请把 base 改成 $base，或关掉。"
     fi

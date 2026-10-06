@@ -865,7 +865,8 @@ EOF
   assert_contains "$output" "$LABEL"
   refute_contains "$output" "private-caller"
   assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "没接共享自动化却有开着的 PR（1 个仓库"
-  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "./onboard.sh $R <python|node>"
+  # onboard.sh 自己拼 owner，只给名字。
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "./onboard.sh ${R#*/} <python|node>"
 
   # 第二轮：这个 head 已经有告警标记，一个字都不再写进 PR —— 但仓库级的点名照旧，
   # 不跟着 head 去重（MEL-308：漏接的仓库告完一次就彻底没声音，卡了两周）。
