@@ -153,11 +153,11 @@ jobs:
 | `CODEX_TRIGGER_TOKEN` | 无法召唤 Codex 复审；Claude 撞额度时请不动 Codex 出补丁；Claude 代审结论发不出（告警 `pat-missing`）；巡检不能动手 |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
 
-`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。
+`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** + **Contents、Workflows read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。Contents、Workflows 写权限只为本仓库把它复用成 `SELF_WORKFLOWS_TOKEN`（见下一段）。代价：每个仓库都存着它，任何一个泄露，别人就能改所有仓库的代码和流水线 —— 2026-10-06 认了这个代价，换「不用再管第二把令牌」。
 
-`SELF_WORKFLOWS_TOKEN` 只存在本仓库（`gh secret set SELF_WORKFLOWS_TOKEN --repo Melodymaifafa/gh-workflows`，不走 `onboard.sh` / `secrets.env` —— 进了那两处就会刷到每个仓库，而它能改大家共用的流水线）：再建一个 fine-grained PAT，**Only select repositories** 只勾 `gh-workflows` 一个，权限 Metadata read + Contents、Workflows、Pull requests 各 Read and write。GitHub 不许没有 Workflows 权限的令牌推、合 `.github/workflows/` 下的改动，而本仓库的 PR 几乎都改这些文件（2026-09-26 到 10-01，17 / 18 / 19 号 PR 为此停了 5 次里的 4 次）。只交给两处：iterate 推修复那一条 `git push`、codex-approved-merge 那一条 `gh pr merge`；验证命令、跑被审 PR 代码的步骤、Claude / Codex 那几步都拿不到，同一步里的 `gh pr comment` 也照旧用 `github.token`。没设它行为不变 —— 照旧走 `github.token`，推不动 / 合不动就按现有告警走（MEL-295）。
+`SELF_WORKFLOWS_TOKEN` 只设在本仓库，值就是 `CODEX_TRIGGER_TOKEN` 那一把，不另建（2026-10-06）：`set -a && source ~/.config/gh-workflows/secrets.env && set +a && printf %s "$CODEX_TRIGGER_TOKEN" | gh secret set SELF_WORKFLOWS_TOKEN --repo Melodymaifafa/gh-workflows`。`onboard.sh` 不刷它 —— 代码只在本仓库读这个名字。GitHub 不许没有 Workflows 权限的令牌推、合 `.github/workflows/` 下的改动，而本仓库的 PR 几乎都改这些文件（2026-09-26 到 10-01，17 / 18 / 19 号 PR 为此停了 5 次里的 4 次）。只交给两处：iterate 推修复那一条 `git push`、codex-approved-merge 那一条 `gh pr merge`；验证命令、跑被审 PR 代码的步骤、Claude / Codex 那几步都拿不到，同一步里的 `gh pr comment` 也照旧用 `github.token`。没设它行为不变 —— 照旧走 `github.token`，推不动 / 合不动就按现有告警走（MEL-295）。
 
-`SWEEP_READ_TOKEN` 只存在本仓库（`gh secret set SWEEP_READ_TOKEN --repo Melodymaifafa/gh-workflows`，不走 `onboard.sh`）：另建一个 fine-grained PAT，**All repositories** + Metadata read + Contents read，巡检只用它读各仓库调用桩的 `base_branch`。不把 Contents 读权限加给 `CODEX_TRIGGER_TOKEN`，因为那个令牌会复制到每个仓库，任何一个仓库泄露就能读到所有私有仓库的代码。没设它，私有仓库的调用桩读不到，巡检退回只扫默认分支是 develop 的仓库，并在 run 里警告。
+`SWEEP_READ_TOKEN` 只存在本仓库（`gh secret set SWEEP_READ_TOKEN --repo Melodymaifafa/gh-workflows`，不走 `onboard.sh`）：另建一个 fine-grained PAT，**All repositories** + Metadata read + Contents read，巡检只用它读各仓库调用桩的 `base_branch`。没设它，私有仓库的调用桩读不到，巡检退回只扫默认分支是 develop 的仓库，并在 run 里警告。
 
 ## 本仓库自己也接了（2026-07-30）
 
@@ -215,7 +215,7 @@ git tag -f v1 && git push -f origin v1
 - **Codex 额度用完时它照样回一条评论**：旧版超时告警把它当成「Codex 有反应」，于是既不告警也不合并，PR 就这么卡住（2026-09-17，3 个 PR）。现在认出这句话就当场换 Claude。
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
 - **密钥只写不读，个人账号也没有账号级密钥**：存进仓库后连 API 都取不回值（`gh api repos/X/actions/secrets/NAME` 只返回名字和日期），共享密钥是 organization 才有的功能。所以 `secrets.env` 是唯一母本 —— 在网页上手填过的值必须补回母本，否则接新仓库时无处可取（2026-07-30 为此翻了半天 `~/.claude/history.jsonl`）。
-- **Regenerate PAT 会立刻作废旧值**：换完要把所有仓库的 secret 一起刷新。漏掉的那个 CI 照样绿，只有 Codex 复审那步静默停住。
+- **Regenerate PAT 会立刻作废旧值**：换完要把所有仓库的 secret 一起刷新；换的是 `CODEX_TRIGGER_TOKEN` 的话，本仓库的 `SELF_WORKFLOWS_TOKEN` 也要按上面那条命令重设（`onboard.sh` 不管它，漏了本仓库的 PR 又推不动、合不动流水线文件）。漏掉的那个 CI 照样绿，只有 Codex 复审那步静默停住。
 - **bats 里别直接写 `[[ ... ]]`**：中途失败的 `[[ ]]` bats 抓不住，只认最后一条命令的退出码，测试于是假绿（一条明知会挂的断言照样报 ok）。用 `tests/test_helper/common.bash` 里的 `assert_equal` / `assert_contains`，函数返回非零它抓得住。
 - **接完要把仓库默认分支改成 `develop`**：`onboard.sh` 起手要求默认分支是 `main`（它靠 main 建 develop），但完成后会自动改成 `develop`。如果这步失败，必须手动补；否则 `gh pr create` 不带 `--base` 会打向默认分支。linear-agent-team 忘了改，agent 开的 3 个 PR 全合进 main，develop 停在初始 commit（2026-07-30）。
 - **Claude 那一步只认默认分支上的调用桩**：`anthropics/claude-code-action` 自己会校验「触发这次 run 的那份工作流文件，内容跟仓库默认分支上的是否一字不差」，不一样就整步跳过，日志只有一句 `Skipping action due to workflow validation`。于是**演练时把调用桩临时钉到别的 ref（分支、tag、sha）这招对 Claude 那条路是走不通的**：action 不跑、没有任何结构化输出，`Check the fix outcome` 按「业务失败」收口，整轮红（MEL-200 实测，run 37255446498）。Claude 那条路只能拿默认分支上原样的调用桩演练 —— `v1` 等于 `develop` 尖端时它本来就是在跑新代码。Codex 接管那条不受影响：它压根不调这个 action，钉 sha + 传 `review_fixer: codex` 照跑（MEL-200 实测，run 37256040590）。
