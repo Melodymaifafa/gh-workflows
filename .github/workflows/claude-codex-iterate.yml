@@ -3527,7 +3527,7 @@ jobs:
           }
           file_followups() {
             local all items n note repo_name repo_url team projects project meta state label
-            local f fid title reason src found created ident url desc link
+            local f fid title reason src marker found created ident url desc link
             all="$(jq -c "$sanitize"' [.findings[] | select(.later == true and .severity == "P2")
               | {id, title: (.title | clean(120) | line1), reason: (.reason | clean(400))}]' <<<"$STRUCTURED_OUTPUT")"
             n="$(jq length <<<"$all")"
@@ -3571,17 +3571,20 @@ jobs:
                   state="$(jq -r '.workflowStates.nodes[0].id // empty' <<<"$meta")"
                   label="$(jq -r '.issueLabels.nodes[0].id // empty' <<<"$meta")"
                   src="$REPO#$PR_NUMBER"
+                  # 查重认整段「来源：o/r#7（」，前后都卡住：光找 o/r#7 会把 o/r#70 同标题的票也认成
+                  # 自己的（Codex 2026-10-06 的 P2）。描述里的来源行也用它拼，两边不会对不上。
+                  marker="来源：$src（"
                   while IFS= read -r f; do
                     fid="$(jq -r .id <<<"$f")"
                     title="$(jq -r .title <<<"$f")"
                     reason="$(jq -r .reason <<<"$f")"
                     found="$(linear 'query LinearIssueFind($p: ID!, $t: String!, $src: String!) { issues(first: 1, filter: {project: {id: {eq: $p}}, title: {eqIgnoreCase: $t}, description: {contains: $src}}) { nodes { identifier url } } }' \
-                      "$(jq -cn --arg p "$project" --arg t "$title" --arg src "$src" '{p: $p, t: $t, src: $src}')" |
+                      "$(jq -cn --arg p "$project" --arg t "$title" --arg src "$marker" '{p: $p, t: $t, src: $src}')" |
                       jq -c '.issues.nodes[0] // empty')" || found=''
                     created="$found"
                     if [ -z "$created" ]; then
-                      printf -v desc '%s\n\n---\n来源：%s（Claude 复核时判为「以后再做」，这个 PR 没改）\nPR：%s/pull/%s\n审查意见：%s' \
-                        "$reason" "$src" "$repo_url" "$PR_NUMBER" \
+                      printf -v desc '%s\n\n---\n%sClaude 复核时判为「以后再做」，这个 PR 没改）\nPR：%s/pull/%s\n审查意见：%s' \
+                        "$reason" "$marker" "$repo_url" "$PR_NUMBER" \
                         "$(jq -r --arg f "$fid" '.[$f] // "（没取到链接）"' <<<"${FINDING_URLS:-"{}"}" 2>/dev/null || echo '（没取到链接）')"
                       created="$(linear 'mutation LinearIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { identifier url } } }' \
                         "$(jq -cn --arg team "$team" --arg p "$project" --arg t "$title" --arg d "$desc" --arg s "$state" --arg l "$label" '
@@ -3648,11 +3651,13 @@ jobs:
           # 第二阶段：Claude 确认了真 bug、还没修到 max_confirmed_fix_rounds，就不停车，用主人的 PAT
           # 发一条 review（M9）只列确认的那几条，iterate 收到后接着修，修完照旧请 Codex 复审、再判。
           # 只有审查方标了 P0 而 Claude 一条都不认的，不替人拿主意，照旧停车。
+          # 「以后再做」的没记上 Linear 的（没配 key、接口出错、超过 5 条）也列在这条 review 里、
+          # 注明本 PR 不用改：下一轮只看得到这条 review，不列就丢了（Codex 2026-10-06 的 P2）。
           if [ -n "$blockers" ] && [ "$ROUND" -le "$MAX_CONFIRMED_FIX_ROUNDS" ]; then
             file_followups || echo '::warning::filing the follow-ups in Linear failed; the verdict is posted anyway'
             body="$(
               jq -r --arg head "$HEAD_SHA" --arg n "$done_rounds" --arg r "$ROUND" --arg cap "$MAX_CONFIRMED_FIX_ROUNDS" --arg why "$park_reason" \
-                --argjson filed "$filed" "$sanitize"'
+                --argjson filed "$filed" --argjson unfiled "$unfiled" "$sanitize$later_note"'
                 (if $why == "no-fix" then
                   "### 🤖 Claude 复核：修复这一轮判了不用改，但复核确认还有 bug，接着修\n\n"
                 else
@@ -3663,6 +3668,11 @@ jobs:
                 + (if ($filed | length) > 0 then
                     "\n\n另有 \($filed | length) 条以后再做的建议已记到 Linear，本 PR 不用改：" + ([$filed[] | .identifier] | join("、"))
                   else "" end)
+                + ([.findings[] | select(.later == true and .severity == "P2" and ($filed[.id] | not))] as $left
+                  | if ($left | length) > 0 then
+                      "\n\n另有 \($left | length) 条以后再做的建议没记上 Linear，本 PR 也不用改，先留在这里免得丢：\n"
+                        + ([$left[] | item + later_note] | join("\n"))
+                    else "" end)
                 + "\n\n<!-- claude-review-findings: " + $head + " -->"
                 + "\n<!-- claude-judge-fix: head=" + $head + " -->"
               ' <<<"$STRUCTURED_OUTPUT"

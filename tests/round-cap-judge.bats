@@ -470,7 +470,7 @@ issue_input() { fake_last_body 'curl linear:LinearIssueCreate' | jq -c '.variabl
   assert_equal "$(jq -r 'has("assigneeId")' <<<"$input")" false
   desc="$(jq -r .description <<<"$input")"
   assert_contains "$desc" '列表大了会慢'
-  assert_contains "$desc" '来源：o/r#7'
+  assert_contains "$desc" '来源：o/r#7（Claude 复核时判为「以后再做」'
   assert_contains "$desc" 'PR：https://github.com/o/r/pull/7'
   assert_contains "$desc" '审查意见：https://github.com/o/r/pull/7#discussion_r101'
   body="$(m8_post)"
@@ -567,7 +567,8 @@ issue_input() { fake_last_body 'curl linear:LinearIssueCreate' | jq -c '.variabl
   assert_equal "$status" 0
   refute_called 'curl linear:LinearIssueCreate'
   find="$(fake_last_body 'curl linear:LinearIssueFind' | jq -c .variables)"
-  assert_equal "$(jq -r .src <<<"$find")" 'o/r#7'
+  # 来源前后都卡住，o/r#7 不会认上 o/r#70 的票
+  assert_equal "$(jq -r .src <<<"$find")" '来源：o/r#7（'
   assert_equal "$(jq -r .t <<<"$find")" '补测试'
   assert_contains "$(m8_post)" '→ 以后做，已记到 Linear：[MEL-350](https://linear.app/m/issue/MEL-350/y)'
 }
@@ -582,6 +583,21 @@ issue_input() { fake_last_body 'curl linear:LinearIssueCreate' | jq -c '.variabl
   body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
   assert_contains "$body" '另有 1 条以后再做的建议已记到 Linear，本 PR 不用改：MEL-401'
   refute_contains "$body" '补测试'
+  refute_contains "$body" '没记上 Linear'
+  assert_equal "${body##*$'\n'}" "<!-- claude-judge-fix: head=$H -->"
+}
+
+@test "linear: a confirmed-bug round keeps the later items it could not file in the review" {
+  unset LINEAR_API_KEY
+  use_verdict "$(verdict stop 's' "$(item P1 '空列表会崩')" "$(later_item '补测试')" "$(item P2 '措辞')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_called 'linear:'
+  body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
+  assert_contains "$body" '另有 1 条以后再做的建议没记上 Linear，本 PR 也不用改，先留在这里免得丢：'
+  assert_contains "$body" '- **P2** F2 补测试：核实过，值得单独做 → 以后做（没配 LINEAR_API_KEY，没记到 Linear）'
+  refute_contains "$body" '措辞'
+  refute_contains "$body" '已记到 Linear，本 PR 不用改'
   assert_equal "${body##*$'\n'}" "<!-- claude-judge-fix: head=$H -->"
 }
 
