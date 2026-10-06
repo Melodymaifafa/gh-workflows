@@ -69,7 +69,7 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 修复那一轮 Claude 看完意见判「都不用改」时，不再停车等人点 Merge，而是交给同一个 judge 逐条复核：没有真 bug 就发放行标记、CI 全绿后合并；有确认的 bug 就发 M9 接着修。放行不推手机（这是常态）。照旧停车告警 `no-fix` 的三种：没配主人的 PAT；这一轮修的正是 judge 确认的 bug（两个 Claude 意见相反，再判只会来回转）；judge 没判成或审查方标了 P0 而 Claude 不认。`judged_already` 把 `no-fix` 停车也算一个判决，同一个 head 不重判。
 
-**以后再做的记到 Linear**：judge 给每条 P2 多填一个 `later`。`later=true`（优化、新功能、超出本 PR 范围但值得做）在放行或 M9 时记成一张 Linear 票：Backlog、不指派、带 Improvement 标签，正文写 judge 的理由、来源 PR 和原意见链接 —— 不进 Agent Queue，流水线不给自己派活。找项目先认挂着这个仓库 GitHub 链接的项目（名字常对不上，如 `learn-api-integrations` → Duolinguo learning app），再认同名项目（跳过已取消的），都没有就建一个同名项目并挂上链接。每次最多 5 张；同一个 PR 同标题的票不重记。没配 `LINEAR_API_KEY` 或 Linear 出错只写进评论（M9 时写进那条 review，注明本 PR 不用改），照样放行。停车时不记票，人先看。
+**以后再做的记到 Linear**：judge 给每条 P2 多填一个 `later`。`later=true`（优化、新功能、超出本 PR 范围但值得做）在放行或 M9 时记成一张 Linear 票：Backlog、不指派、带 Improvement 标签，正文写 judge 的理由、来源 PR 和原意见链接 —— 不进 Agent Queue，流水线不给自己派活。找项目先认挂着这个仓库 GitHub 链接的项目（名字常对不上，如 `learn-api-integrations` → Duolinguo learning app），再认同名项目（跳过已取消的），都没有就建一个同名项目并挂上链接。每次最多 5 张；同一个 PR 同标题的票不重记。没配 `LINEAR_API_KEY`、Linear 出错或查不到团队的 Backlog 状态（免得票落进 Triage）只写进评论（M9 时写进那条 review，注明本 PR 不用改），照样放行。停车时不记票，人先看。
 
 改好了却没推上去时，PR 上也一定有一句话（2026-10-05）：验证命令没过 → `verify-failed`；提交了但 push 被拒 → `push-failed`，告警里直接说是哪一种拒（令牌不许改 workflow 文件 / 分支保护 / 分支落后），两条都带 run 链接。`claude-code-action` 因为「PR 分支上的调用桩跟默认分支不一样」把自己整步跳过时 → `stale-workflow`，告警直接写「点 Update branch」。这三种以前在 PR 上一个字都没有，只能等巡检重试两次之后收到一条不说原因的 `retry-exhausted`。
 

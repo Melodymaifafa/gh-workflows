@@ -3526,7 +3526,7 @@ jobs:
             jq -c .data <<<"$resp"
           }
           file_followups() {
-            local all items n note repo_name repo_url team projects page cursor project meta state label
+            local all items n note repo_name repo_url team projects page cursor project meta state label_teams label
             local f fid title reason src marker found created ident url desc link
             all="$(jq -c "$sanitize"' [.findings[] | select(.later == true and .severity == "P2")
               | {id, title: (.title | clean(120) | line1), reason: (.reason | clean(400))}]' <<<"$STRUCTURED_OUTPUT")"
@@ -3586,46 +3586,55 @@ jobs:
                   # Backlog 按状态类型找，不按名字：团队把它改了名（如「Later」）按名字就找不到，
                   # 不带 stateId 建票、开了 Triage 的团队会落进 Triage（Codex 2026-10-06 的 P2）。
                   # 类型是 backlog 的有好几个时，先挑名字叫 Backlog 的，再挑排最前的。
-                  # Improvement 标签只认全工作区的或本团队的：别的团队自己的同名标签挂上去，
-                  # 建票会整个失败（Codex 2026-10-06 的 P2）。
+                  # 查不到（这一查出错、团队没有 backlog 类状态）就整批不记，理由同上（Codex 2026-10-06 的 P2）。
+                  # Improvement 标签只认全工作区的、本团队的、本团队上级团队的（子团队能用上级的标签）：
+                  # 别的团队自己的同名标签挂上去，建票会整个失败（Codex 2026-10-06 的 P2）。
                   meta="$(linear 'query LinearIssueMeta($team: ID!) { workflowStates(filter: {team: {id: {eq: $team}}, type: {eq: "backlog"}}) { nodes { id name position } } issueLabels(first: 250, filter: {name: {eq: "Improvement"}}) { nodes { id team { id } } } }' \
                     "$(jq -cn --arg team "$team" '{team: $team}')")" || meta='{}'
                   state="$(jq -r '[.workflowStates.nodes[]?]
                     | sort_by([((.name // "") | ascii_downcase) != "backlog", (.position // 0)])
                     | .[0].id // empty' <<<"$meta")"
-                  label="$(jq -r --arg team "$team" '[.issueLabels.nodes[]? | select(.team == null or .team.id == $team)]
+                  # 上级团队顺着往上认最多 5 层；这一查出错不要紧，只认本团队，顶多票上不带标签。
+                  label_teams="$(linear 'query LinearTeamParents($id: String!) { team(id: $id) { parent { id parent { id parent { id parent { id parent { id } } } } } } }' \
+                    "$(jq -cn --arg id "$team" '{id: $id}')" |
+                    jq -c --arg team "$team" '[$team] + [.team.parent // empty | recurse(.parent; . != null) | .id | strings]')" ||
+                    label_teams="$(jq -cn --arg team "$team" '[$team]')"
+                  label="$(jq -r --argjson teams "$label_teams" '[.issueLabels.nodes[]? | select(.team == null or (.team.id | IN($teams[])))]
                     | .[0].id // empty' <<<"$meta")"
-                  src="$REPO#$PR_NUMBER"
-                  # 查重认整段「来源：o/r#7（」，前后都卡住：光找 o/r#7 会把 o/r#70 同标题的票也认成
-                  # 自己的（Codex 2026-10-06 的 P2）。描述里的来源行也用它拼，两边不会对不上。
-                  marker="来源：$src（"
-                  while IFS= read -r f; do
-                    fid="$(jq -r .id <<<"$f")"
-                    title="$(jq -r .title <<<"$f")"
-                    reason="$(jq -r .reason <<<"$f")"
-                    found="$(linear 'query LinearIssueFind($p: ID!, $t: String!, $src: String!) { issues(first: 1, filter: {project: {id: {eq: $p}}, title: {eqIgnoreCase: $t}, description: {contains: $src}}) { nodes { identifier url } } }' \
-                      "$(jq -cn --arg p "$project" --arg t "$title" --arg src "$marker" '{p: $p, t: $t, src: $src}')" |
-                      jq -c '.issues.nodes[0] // empty')" || found=''
-                    created="$found"
-                    if [ -z "$created" ]; then
-                      printf -v desc '%s\n\n---\n%sClaude 复核时判为「以后再做」，这个 PR 没改）\nPR：%s/pull/%s\n审查意见：%s' \
-                        "$reason" "$marker" "$repo_url" "$PR_NUMBER" \
-                        "$(jq -r --arg f "$fid" '.[$f] // "（没取到链接）"' <<<"${FINDING_URLS:-"{}"}" 2>/dev/null || echo '（没取到链接）')"
-                      created="$(linear 'mutation LinearIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { identifier url } } }' \
-                        "$(jq -cn --arg team "$team" --arg p "$project" --arg t "$title" --arg d "$desc" --arg s "$state" --arg l "$label" '
-                          {input: ({teamId: $team, projectId: $p, title: $t, description: $d}
-                            + (if $s != "" then {stateId: $s} else {} end)
-                            + (if $l != "" then {labelIds: [$l]} else {} end))}')" |
-                        jq -c '.issueCreate.issue // empty')" || created=''
-                    fi
-                    ident="$(jq -r '.identifier // ""' <<<"${created:-"{}"}")"
-                    url="$(jq -r '.url // ""' <<<"${created:-"{}"}")"
-                    if [[ "$ident" =~ ^[A-Z][A-Z0-9]*-[0-9]+$ ]] && [[ "$url" =~ ^https://linear\.app/[^[:space:]\)]+$ ]]; then
-                      filed="$(jq -c --arg f "$fid" --arg i "$ident" --arg u "$url" '. + {($f): {identifier: $i, url: $u}}' <<<"$filed")"
-                    else
-                      unfiled="$(jq -c --arg f "$fid" '. + {($f): "Linear 接口出错，没记上（看 Actions 日志）"}' <<<"$unfiled")"
-                    fi
-                  done < <(jq -c '.[]' <<<"$items")
+                  if [ -z "$state" ]; then
+                    note='查不到团队的 Backlog 状态，没记上（看 Actions 日志）'
+                  else
+                    src="$REPO#$PR_NUMBER"
+                    # 查重认整段「来源：o/r#7（」，前后都卡住：光找 o/r#7 会把 o/r#70 同标题的票也认成
+                    # 自己的（Codex 2026-10-06 的 P2）。描述里的来源行也用它拼，两边不会对不上。
+                    marker="来源：$src（"
+                    while IFS= read -r f; do
+                      fid="$(jq -r .id <<<"$f")"
+                      title="$(jq -r .title <<<"$f")"
+                      reason="$(jq -r .reason <<<"$f")"
+                      found="$(linear 'query LinearIssueFind($p: ID!, $t: String!, $src: String!) { issues(first: 1, filter: {project: {id: {eq: $p}}, title: {eqIgnoreCase: $t}, description: {contains: $src}}) { nodes { identifier url } } }' \
+                        "$(jq -cn --arg p "$project" --arg t "$title" --arg src "$marker" '{p: $p, t: $t, src: $src}')" |
+                        jq -c '.issues.nodes[0] // empty')" || found=''
+                      created="$found"
+                      if [ -z "$created" ]; then
+                        printf -v desc '%s\n\n---\n%sClaude 复核时判为「以后再做」，这个 PR 没改）\nPR：%s/pull/%s\n审查意见：%s' \
+                          "$reason" "$marker" "$repo_url" "$PR_NUMBER" \
+                          "$(jq -r --arg f "$fid" '.[$f] // "（没取到链接）"' <<<"${FINDING_URLS:-"{}"}" 2>/dev/null || echo '（没取到链接）')"
+                        created="$(linear 'mutation LinearIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { identifier url } } }' \
+                          "$(jq -cn --arg team "$team" --arg p "$project" --arg t "$title" --arg d "$desc" --arg s "$state" --arg l "$label" '
+                            {input: ({teamId: $team, projectId: $p, title: $t, description: $d, stateId: $s}
+                              + (if $l != "" then {labelIds: [$l]} else {} end))}')" |
+                          jq -c '.issueCreate.issue // empty')" || created=''
+                      fi
+                      ident="$(jq -r '.identifier // ""' <<<"${created:-"{}"}")"
+                      url="$(jq -r '.url // ""' <<<"${created:-"{}"}")"
+                      if [[ "$ident" =~ ^[A-Z][A-Z0-9]*-[0-9]+$ ]] && [[ "$url" =~ ^https://linear\.app/[^[:space:]\)]+$ ]]; then
+                        filed="$(jq -c --arg f "$fid" --arg i "$ident" --arg u "$url" '. + {($f): {identifier: $i, url: $u}}' <<<"$filed")"
+                      else
+                        unfiled="$(jq -c --arg f "$fid" '. + {($f): "Linear 接口出错，没记上（看 Actions 日志）"}' <<<"$unfiled")"
+                      fi
+                    done < <(jq -c '.[]' <<<"$items")
+                  fi
                 fi
               fi
             fi
