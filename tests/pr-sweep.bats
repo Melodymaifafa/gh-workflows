@@ -852,6 +852,42 @@ EOF
   done
 }
 
+@test "a repo without shared automation is named every run, even once its head is already alerted" {
+  no_stub "$R"
+  reviews "$(codex_findings 4863267293 "$H" 900)"
+  one_pr clean 900
+
+  # 第一轮：告警照旧写一次，同时点名这个仓库并给出接入命令。
+  sweep
+  assert_equal "$status" 0
+  assert_contains "$output" "::warning::1 个仓库有开着的 PR 但没接共享自动化"
+  assert_contains "$output" "./onboard.sh <仓库> <python|node>"
+  assert_contains "$output" "$LABEL"
+  refute_contains "$output" "private-caller"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "没接共享自动化却有开着的 PR（1 个仓库"
+  # onboard.sh 自己拼 owner，只给名字。
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "./onboard.sh ${R#*/} <python|node>"
+
+  # 第二轮：这个 head 已经有告警标记，一个字都不再写进 PR —— 但仓库级的点名照旧，
+  # 不跟着 head 去重（MEL-308：漏接的仓库告完一次就彻底没声音，卡了两周）。
+  : >"$FAKE_LOG"; : >"$GITHUB_STEP_SUMMARY"
+  comments "$(alert_comment 5 unwatched - 120)"
+  sweep
+  assert_equal "$status" 0
+  refute_writes
+  assert_contains "$output" "::warning::1 个仓库有开着的 PR 但没接共享自动化"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "没接共享自动化却有开着的 PR（1 个仓库"
+  refute_contains "$output" "private-caller"
+}
+
+@test "a repo with the shared stub is never named as unonboarded" {
+  one_pr clean 900
+  sweep
+  assert_equal "$status" 0
+  refute_contains "$output" "没接共享自动化却有开着的 PR"
+  refute_contains "$(cat "$GITHUB_STEP_SUMMARY")" "没接共享自动化却有开着的 PR"
+}
+
 @test "a PR off the integration branch: one unwatched alert per head, a new head alerts again" {
   one_pr clean 900 main
   sweep
