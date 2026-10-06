@@ -370,6 +370,253 @@ PARK='Park the capped head'
   assert_contains "$judge" $'    outputs:\n      posted: ${{ steps.post.outputs.posted }}\n'
 }
 
+# ---------- 修复员判「不用改」叫来的 judge（MEL-307） ----------
+
+@test "no-fix: all P2 merges with its own wording and pushes nothing to the phone" {
+  export JUDGE_REASON=no-fix ROUND=1
+  use_verdict "$(verdict merge '都不拦' "$(item P2 '措辞')" "$(item P2 '变量名')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  body="$(m8_post)"
+  assert_contains "$body" '🤖 Claude 看完审查意见觉得都不用改，又逐条复核了一遍：2 条都不拦合并；CI 全绿后自动合并。'
+  refute_contains "$body" '自动修了'
+  assert_equal "${body##*$'\n'}" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
+  refute_called 'api.pushover.net'
+  assert_equal "$(posted)" true
+}
+
+@test "no-fix: a judge that could not decide parks the head as no-fix, not round-cap" {
+  export JUDGE_REASON=no-fix ROUND=1 OUTCOME=failure
+  use_verdict "$(verdict merge '都不拦' "$(item P2 '措辞')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$(fake_last_body "gh pr comment")" 'Claude 看完审查意见觉得都不用改，复核那一步没判成，PR 已停下。点 Merge 或关掉'
+  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: alert head=$H reason=no-fix until=- -->"
+  refute_called 'claude-judge-clean'
+}
+
+@test "no-fix: a bug the judge confirms goes back for a fix round under the no-fix heading" {
+  export JUDGE_REASON=no-fix ROUND=1
+  use_verdict "$(verdict stop '有真 bug' "$(item P1 '空列表会崩')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
+  assert_contains "$body" '### 🤖 Claude 复核：修复这一轮判了不用改，但复核确认还有 bug，接着修'
+  assert_contains "$body" '- **P1** F1 空列表会崩'
+  assert_equal "${body##*$'\n'}" "<!-- claude-judge-fix: head=$H -->"
+}
+
+@test "no-fix: a reviewer P0 nobody confirms parks as no-fix with the reason" {
+  export JUDGE_REASON=no-fix ROUND=1 CODEX_P0=true
+  use_verdict "$(verdict merge '其实没事' "$(item P2 '其实没事')")"
+  run run_block "$WF" "$POST"
+  assert_contains "$(fake_last_body "gh pr comment")" 'Claude 看完审查意见觉得都不用改，复核后还要你看一眼。审查方把其中一条标成了 P0'
+  assert_contains "$(fake_last_body "gh pr comment")" "reason=no-fix until=- -->"
+}
+
+@test "park: a no-fix judge that left no verdict parks as no-fix" {
+  export GH_TOKEN=actions-token JUDGE_REASON=no-fix ROUND=1
+  run run_block "$WF" "$PARK"
+  assert_equal "$status" 0
+  assert_contains "$(fake_last_body "gh pr comment")" 'Claude 看完审查意见觉得都不用改，复核的结论这次没能发出来'
+  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: alert head=$H reason=no-fix until=- -->"
+}
+
+# ---------- 「以后再做」记到 Linear（MEL-307） ----------
+
+# later_item <title> [reason]：一条 P2、值得以后做的意见
+later_item() {
+  jq -cn --arg t "$1" --arg r "${2:-核实过，值得单独做}" '{severity: "P2", later: true, title: $t, reason: $r}'
+}
+
+# linear_env：配好 key、团队、状态和标签；项目列表由各测试自己给。
+linear_env() {
+  export LINEAR_API_KEY=lin_api_test_key LINEAR_TEAM=MEL SERVER_URL=https://github.com
+  export FINDING_URLS='{"F1":"https://github.com/o/r/pull/7#discussion_r101"}'
+  fake_linear LinearTeam '{"data":{"teams":{"nodes":[{"id":"team-1"}]}}}'
+  fake_linear LinearIssueMeta '{"data":{"workflowStates":{"nodes":[{"id":"state-backlog"}]},"issueLabels":{"nodes":[{"id":"label-improvement"}]}}}'
+  fake_linear LinearIssueFind '{"data":{"issues":{"nodes":[]}}}'
+  fake_linear LinearIssueCreate '{"data":{"issueCreate":{"success":true,"issue":{"identifier":"MEL-401","url":"https://linear.app/m/issue/MEL-401/x"}}}}'
+}
+
+projects_json() { # projects_json <node-json> ...
+  jq -cn --argjson n "$(json_array "$@")" '{data: {projects: {nodes: $n}}}'
+}
+
+# project_node <id> <name> [github url] [canceledAt]
+project_node() {
+  jq -cn --arg id "$1" --arg name "$2" --arg url "${3:-}" --arg c "${4:-}" \
+    '{id: $id, name: $name, canceledAt: (if $c == "" then null else $c end),
+      externalLinks: {nodes: (if $url == "" then [] else [{url: $url}] end)}}'
+}
+
+issue_input() { fake_last_body 'curl linear:LinearIssueCreate' | jq -c '.variables.input'; }
+
+@test "linear: a later item becomes a Backlog issue in the project linked to this repo, ahead of a same-name one" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json \
+    "$(project_node p-same r)" \
+    "$(project_node p-linked 'Some other name' 'https://github.com/O/R.git')")"
+  use_verdict "$(verdict merge '一条以后做、一条不做' "$(later_item '给导出加分页' '列表大了会慢')" "$(item P2 '措辞')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_called 'curl linear:LinearIssueCreate' 1
+  input="$(issue_input)"
+  assert_equal "$(jq -r .projectId <<<"$input")" p-linked
+  assert_equal "$(jq -r .teamId <<<"$input")" team-1
+  assert_equal "$(jq -r .stateId <<<"$input")" state-backlog
+  assert_equal "$(jq -c .labelIds <<<"$input")" '["label-improvement"]'
+  assert_equal "$(jq -r .title <<<"$input")" '给导出加分页'
+  assert_equal "$(jq -r 'has("assigneeId")' <<<"$input")" false
+  desc="$(jq -r .description <<<"$input")"
+  assert_contains "$desc" '列表大了会慢'
+  assert_contains "$desc" '来源：o/r#7'
+  assert_contains "$desc" 'PR：https://github.com/o/r/pull/7'
+  assert_contains "$desc" '审查意见：https://github.com/o/r/pull/7#discussion_r101'
+  body="$(m8_post)"
+  assert_contains "$body" '- **P2** F1 给导出加分页：列表大了会慢 → 以后做，已记到 Linear：[MEL-401](https://linear.app/m/issue/MEL-401/x)'
+  assert_contains "$body" '- **P2** F2 措辞：核实过'
+  refute_contains "$body" 'F2 措辞：核实过 →'
+  assert_equal "${body##*$'\n'}" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
+  # key 只走请求头文件，不上 curl 的命令行
+  refute_called 'lin_api_test_key'
+  assert_contains "$(cat "$FAKE_DIR/state/linear_headers")" 'Authorization: lin_api_test_key'
+}
+
+@test "linear: no linked project falls back to the same name, never to a canceled one" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json \
+    "$(project_node p-dup 'r（重复）' 'https://github.com/o/r' 2026-10-06T07:29:08Z)" \
+    "$(project_node p-name R)")"
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_equal "$(issue_input | jq -r .projectId)" p-name
+  refute_called 'curl linear:LinearProjectCreate'
+}
+
+@test "linear: no matching project creates one named after the repo and links it" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-x other)")"
+  fake_linear LinearProjectCreate '{"data":{"projectCreate":{"success":true,"project":{"id":"p-new"}}}}'
+  fake_linear LinearProjectLink '{"data":{"entityExternalLinkCreate":{"success":true}}}'
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  create="$(fake_last_body 'curl linear:LinearProjectCreate' | jq -c .variables.input)"
+  assert_equal "$(jq -r .name <<<"$create")" r
+  assert_equal "$(jq -c .teamIds <<<"$create")" '["team-1"]'
+  assert_contains "$(jq -r .content <<<"$create")" '本地目录: `~/projects/r`'
+  link="$(fake_last_body 'curl linear:LinearProjectLink' | jq -c .variables.input)"
+  assert_equal "$(jq -r .url <<<"$link")" https://github.com/o/r
+  assert_equal "$(jq -r .projectId <<<"$link")" p-new
+  assert_equal "$(issue_input | jq -r .projectId)" p-new
+}
+
+@test "linear: without LINEAR_API_KEY nothing is filed and the PR still merges" {
+  unset LINEAR_API_KEY
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')" "$(item P2 '措辞')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_called 'linear:'
+  assert_contains "$(m8_post)" '- **P2** F1 补测试：核实过，值得单独做 → 以后做（没配 LINEAR_API_KEY，没记到 Linear）'
+  assert_contains "$(m8_post)" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
+  assert_equal "$(posted)" true
+}
+
+@test "linear: an outage never holds up the verdict" {
+  linear_env
+  fake_linear_fail LinearTeam 22
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_called 'curl linear:LinearIssueCreate'
+  assert_contains "$(m8_post)" '→ 以后做（Linear 接口出错，没记上（看 Actions 日志））'
+  assert_contains "$(m8_post)" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
+}
+
+@test "linear: an issue create that returns no issue is reported, the rest still merge" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-name r)")"
+  fake_linear LinearIssueCreate '{"errors":[{"message":"boom"}]}'
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$(m8_post)" '→ 以后做（Linear 接口出错，没记上（看 Actions 日志））'
+}
+
+@test "linear: at most five issues per verdict; the rest are listed as not filed" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-name r)")"
+  use_verdict "$(verdict merge 's' \
+    "$(later_item 'a1')" "$(later_item 'a2')" "$(later_item 'a3')" "$(later_item 'a4')" \
+    "$(later_item 'a5')" "$(later_item 'a6')" "$(later_item 'a7')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_called 'curl linear:LinearIssueCreate' 5
+  assert_contains "$(m8_post)" 'F6 a6：核实过，值得单独做 → 以后做（这次超过 5 条，没记）'
+  assert_contains "$(m8_post)" 'F7 a7：核实过，值得单独做 → 以后做（这次超过 5 条，没记）'
+}
+
+@test "linear: the same PR and title already filed is linked again, not duplicated" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-name r)")"
+  fake_linear LinearIssueFind '{"data":{"issues":{"nodes":[{"identifier":"MEL-350","url":"https://linear.app/m/issue/MEL-350/y"}]}}}'
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_called 'curl linear:LinearIssueCreate'
+  find="$(fake_last_body 'curl linear:LinearIssueFind' | jq -c .variables)"
+  assert_equal "$(jq -r .src <<<"$find")" 'o/r#7'
+  assert_equal "$(jq -r .t <<<"$find")" '补测试'
+  assert_contains "$(m8_post)" '→ 以后做，已记到 Linear：[MEL-350](https://linear.app/m/issue/MEL-350/y)'
+}
+
+@test "linear: a confirmed-bug round files the later items and tells the fixer to leave them" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-name r)")"
+  use_verdict "$(verdict stop 's' "$(item P1 '空列表会崩')" "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_called 'curl linear:LinearIssueCreate' 1
+  body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
+  assert_contains "$body" '另有 1 条以后再做的建议已记到 Linear，本 PR 不用改：MEL-401'
+  refute_contains "$body" '补测试'
+  assert_equal "${body##*$'\n'}" "<!-- claude-judge-fix: head=$H -->"
+}
+
+@test "linear: a stop files nothing — the owner looks at it first" {
+  linear_env
+  export CODEX_P0=true
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_called 'linear:'
+}
+
+@test "linear: Claude's later text cannot mention anyone or leak a token into Linear" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-name r)")"
+  use_verdict "$(verdict merge 's' "$(later_item '@melody 看 ghp_abcdefghij' '<!-- x --> sk-ant-abc123')")"
+  run run_block "$WF" "$POST"
+  assert_called 'curl linear:LinearIssueCreate' 1
+  input="$(issue_input)"
+  assert_contains "$(jq -r .title <<<"$input")" 'melody 看 [已隐藏]'
+  refute_contains "$input" 'ghp_abcdefghij'
+  refute_contains "$input" 'sk-ant-abc123'
+  refute_contains "$input" '<!--'
+  refute_contains "$(jq -r .title <<<"$input")" '@melody'
+}
+
+@test "later=true on a real bug is not a valid verdict" {
+  bad="$(jq -cn '{severity: "P1", later: true, title: "t", reason: "r"}')"
+  use_verdict "$(verdict stop 's' "$bad")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_round_cap_alert 'Claude 这次没能判断剩下的意见。'
+  refute_called 'linear:'
+}
+
 # ---------- 准备材料 ----------
 
 # prepare_repo：up/ 里 develop 上一个提交、feat 上再一个；pr/ clone 下来停在 feat 的头上。
@@ -420,6 +667,20 @@ prepare_repo() {
   assert_contains "$(cat .review/pr.diff)" '+change'
 }
 
+# 记 Linear 票时要能点回原话（MEL-307）：每个 F 号对应那条行内评论或 review 的网页链接。
+@test "prepare: each finding's web link is handed on for the Linear issue" {
+  prepare_repo
+  review_901="$(gh_review 901 "$CODEX" NONE "$HEAD_SHA" 'summary' | jq -c '. + {html_url: "https://github.com/o/r/pull/7#pullrequestreview-901"}')"
+  review_902="$(gh_review 902 melody OWNER "$HEAD_SHA" "x <!-- claude-review-findings: $HEAD_SHA -->" | jq -c '. + {html_url: "https://github.com/o/r/pull/7#pullrequestreview-902"}')"
+  fake_route "$REVIEWS_ROUTE" "$(json_array "$review_901" "$review_902")"
+  fake_route 'repos/o/r/pulls/7/reviews/901/comments?per_page=100' \
+    '[{"path":"a.txt","line":2,"body":"one","html_url":"https://github.com/o/r/pull/7#discussion_r11"},{"path":"a.txt","line":3,"body":"two","html_url":"https://github.com/o/r/pull/7#discussion_r12"}]'
+  fake_route 'repos/o/r/pulls/7/reviews/902/comments?per_page=100' '[]'
+  run run_block "$WF" "$PREPARE"
+  assert_equal "$status" 0
+  assert_equal "$(step_output urls | jq -c .)" '{"F1":"https://github.com/o/r/pull/7#discussion_r11","F2":"https://github.com/o/r/pull/7#discussion_r12","F3":"https://github.com/o/r/pull/7#pullrequestreview-902"}'
+}
+
 @test "prepare: a P0 badge anywhere in the judged reviews is flagged" {
   prepare_repo
   fake_route "$REVIEWS_ROUTE" "$(json_array "$(gh_review 901 "$CODEX" NONE "$HEAD_SHA" 'summary')")"
@@ -448,9 +709,10 @@ prepare_repo() {
 
 # ---------- job 形状（配置写错就没有安全边界） ----------
 
-@test "the iterate job hands judge, head, round and the pr-guard helpers to the judge job" {
+@test "the iterate job hands judge, why, head, round and the pr-guard helpers to the judge job" {
   job="$(awk '/^  iterate:/{on=1} /^    steps:/{exit} on' "$REPO_ROOT/$WF")"
-  assert_contains "$job" $'    outputs:\n      judge: ${{ steps.gate.outputs.judge }}\n      head: ${{ steps.gate.outputs.head }}\n      round: ${{ steps.gate.outputs.round }}\n      pr_guard: ${{ steps.helpers.outputs.script }}\n'
+  # judge 有两个来源：修满轮数（Gate）和修复员判「不用改」（outcome，MEL-307）。
+  assert_contains "$job" $'      judge: ${{ steps.gate.outputs.judge || steps.outcome.outputs.judge }}\n      judge_reason: ${{ steps.gate.outputs.judge_reason || steps.outcome.outputs.judge_reason }}\n      head: ${{ steps.gate.outputs.head }}\n      round: ${{ steps.gate.outputs.round }}\n      pr_guard: ${{ steps.helpers.outputs.script }}\n'
 }
 
 @test "round-cap-judge job is locked down like the fallback reviewer" {
@@ -498,6 +760,7 @@ prepare_repo() {
     and .properties.findings.minItems == 1
     and .properties.findings.items.properties.severity.enum == ["P0", "P1", "P2"]
     and .properties.findings.items.properties.id.pattern == "^F[0-9]+$"
-    and (.properties.findings.items.required | sort) == ["id", "reason", "severity", "title"]
+    and .properties.findings.items.properties.later.type == "boolean"
+    and (.properties.findings.items.required | sort) == ["id", "later", "reason", "severity", "title"]
   ' <<<"$schema"
 }

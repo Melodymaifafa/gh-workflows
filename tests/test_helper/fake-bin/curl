@@ -1,19 +1,51 @@
 #!/usr/bin/env bash
 # 假 curl：记一行日志就成功，不联网。Pushover 的 message 字段存成 body。
 # $FAKE_GH_DIR/curl.exit 存在时按里面的退出码失败（模拟 Pushover 挂掉）。
+#
+# Linear GraphQL（api.linear.app/graphql）：请求体从 --data-binary @- 的 stdin 读，按操作名
+# （query LinearTeam … 里的 LinearTeam）记一行 `curl linear:<操作名> <参数>`，请求 JSON 存成 body。
+# 响应取 $FAKE_GH_DIR/linear/<操作名>[.<n>].json（序列规则同假 gh），没有就回 {"data":{}}；
+# 有 .exit 就按它失败。-H @<文件> 读到的请求头存进 $FAKE_DIR/state/linear_headers，
+# 测试拿它确认 key 走的是请求头文件、没上命令行。
 # shellcheck source=tests/test_helper/fake-bin/_lib.sh
 . "$(dirname "$0")/_lib.sh"
 fake_require_env curl
 
-url="" body="" has_body=0 prev=""
+url="" body="" has_body=0 prev="" stdin_body=0 header_files=()
 for a in "$@"; do
   case "$prev" in
     --form-string|-F|--form|-d|--data|--data-urlencode|--data-raw)
       case "$a" in message=*) body="${a#message=}"; has_body=1 ;; esac ;;
+    --data-binary)
+      [ "$a" = @- ] && stdin_body=1 ;;
+    -H|--header)
+      case "$a" in @*) header_files+=("${a#@}") ;; esac ;;
   esac
   case "$a" in http://*|https://*) url="$a" ;; esac
   prev="$a"
 done
+
+case "$url" in
+  *api.linear.app/graphql*)
+    req=""
+    [ "$stdin_body" = 1 ] && req="$(cat)"
+    mkdir -p "$FAKE_DIR/state"
+    for h in ${header_files[@]+"${header_files[@]}"}; do
+      cat "$h" >>"$FAKE_DIR/state/linear_headers" 2>/dev/null || true
+    done
+    op="$(printf '%s' "$req" | jq -r '(.query // "" | capture("^\\s*(query|mutation)\\s+(?<op>[A-Za-z0-9_]+)").op)? // "anonymous"' 2>/dev/null)"
+    [ -n "$op" ] || op=anonymous
+    fake_log "curl linear:$op $*" "$req"
+    n="$(fake_next_count "linear_$op")"
+    slot="$(fake_slot "$FAKE_GH_DIR/linear" "$op" "$n")"
+    if [ -n "$slot" ] && [ -e "$slot.exit" ]; then
+      code="$(tr -d '[:space:]' <"$slot.exit")"
+      [ "$code" = 0 ] || { echo "curl: (22) fake failure for $url" >&2; exit "$code"; }
+    fi
+    if [ -n "$slot" ] && [ -e "$slot.json" ]; then cat "$slot.json"; else echo '{"data":{}}'; fi
+    exit 0
+    ;;
+esac
 
 if [ "$has_body" = 1 ]; then fake_log "curl $*" "$body"; else fake_log "curl $*"; fi
 

@@ -462,6 +462,8 @@ outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
   # shellcheck disable=SC2016  # 字面量写进被种的脚本
   printf '%s\n' 'printf "GH_TOKEN=%s\n" "${GH_TOKEN:-}" >>"$PLANTED_LOG"' >"$RUNNER_TEMP/pr-guard.sh"
   outcome_env success '{"pushed":false,"fixed":0,"skipped":1}'
+  # 走停车那条路：发出来的告警正文能证明用的是可信的那份 alert_once
+  export HAS_PAT=false
   live_head "$H"
   outcome
   assert_equal "$status" 0
@@ -647,8 +649,9 @@ stale_env() { # stale_env <默认分支上那份文件的内容>
   assert_contains "$(fake_last_body "gh pr comment")" "Claude 自动修复额度用完了"
 }
 
-@test "outcome: pushed=false -> one no-fix alert, PR parked" {
+@test "outcome: pushed=false without the owner's PAT -> one no-fix alert, PR parked" {
   outcome_env success '{"pushed":false,"fixed":0,"skipped":3}'
+  export HAS_PAT=false
   live_head "$H"
   outcome
   assert_equal "$status" 0
@@ -658,8 +661,47 @@ stale_env() { # stale_env <默认分支上那份文件的内容>
 <!-- pr-guard: alert head=$H reason=no-fix until=- -->"
 }
 
+# MEL-307：判「都不用改」不停车，交给 round-cap-judge 逐条复核；没有真 bug 就放行合并。
+@test "outcome: pushed=false hands the head to the judge instead of parking it" {
+  outcome_env success '{"pushed":false,"fixed":0,"skipped":3}'
+  export REVIEWER=Codex
+  live_head "$H"
+  outcome
+  assert_equal "$status" 0
+  assert_equal "$(step_output summon)" false
+  assert_equal "$(step_output judge)" true
+  assert_equal "$(step_output judge_reason)" no-fix
+  refute_called "gh pr comment"
+  refute_called "curl "
+}
+
+# 这一轮修的正是 judge 确认的 bug（M9），修复员却又判不用改：两个 Claude 意见相反，再叫 judge
+# 只会来回转。停车等人。
+@test "outcome: a no-change verdict on the judge's own confirmed bugs parks instead of re-judging" {
+  outcome_env success '{"pushed":false,"fixed":0,"skipped":1}'
+  export REVIEWER='Claude 复核'
+  live_head "$H"
+  outcome
+  assert_equal "$status" 0
+  assert_equal "$(step_output judge 2>/dev/null || true)" ""
+  assert_contains "$(fake_last_body "gh pr comment")" "reason=no-fix until=- -->"
+}
+
+@test "outcome: a head that already carries a verdict is neither judged again nor alerted" {
+  outcome_env success '{"pushed":false,"fixed":0,"skipped":1}'
+  export REVIEWER=Codex
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 9 'github-actions[bot]' NONE "x $(m6_marker "$H" no-fix)")")"
+  outcome
+  assert_equal "$status" 0
+  assert_equal "$(step_output judge 2>/dev/null || true)" ""
+  refute_called "gh pr comment"
+  refute_called "curl "
+}
+
 @test "outcome: a forged claude[bot] no-fix marker does not suppress the real alert; a trusted one does" {
   outcome_env success '{"pushed":false,"fixed":0,"skipped":1}'
+  export HAS_PAT=false
   live_head "$H"
   forged="$(jq --arg h "$H" '.body |= gsub("[0-9a-f]{40}"; $h)' "$FIXTURES_DIR/forged/claude-bot-alert-comment.json")"
   assert_contains "$(jq -r .body <<<"$forged")" "reason=no-fix"
@@ -719,6 +761,7 @@ stale_env() { # stale_env <默认分支上那份文件的内容>
 }
 
 @test "outcome: no alert body carries trigger text" {
+  export HAS_PAT=false
   for f in exec-429-weekly-limit.json exec-401-auth.json exec-529-overloaded.json; do
     fake_route "$COMMENTS" '[]'
     outcome_env failure '' "$f"; live_head "$H"; outcome
