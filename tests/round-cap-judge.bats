@@ -539,6 +539,44 @@ issue_input() { fake_last_body 'curl linear:LinearIssueCreate' | jq -c '.variabl
   assert_equal "$(issue_input | jq -r .projectId)" p-new
 }
 
+@test "linear: the project list is read to the last page, so a linked project past the first is not created again" {
+  linear_env
+  fake_linear LinearProjects "$(jq -cn --argjson n "$(json_array "$(project_node p-x other)")" \
+    '{data: {projects: {nodes: $n, pageInfo: {hasNextPage: true, endCursor: "cur-1"}}}}')" 1
+  fake_linear LinearProjects "$(projects_json "$(project_node p-linked 'Some other name' 'https://github.com/o/r')")" 2
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_called 'curl linear:LinearProjects' 2
+  assert_equal "$(fake_last_body 'curl linear:LinearProjects' | jq -r .variables.after)" cur-1
+  refute_called 'curl linear:LinearProjectCreate'
+  assert_equal "$(issue_input | jq -r .projectId)" p-linked
+}
+
+@test "linear: a project page that fails midway files nothing instead of creating a duplicate project" {
+  linear_env
+  fake_linear LinearProjects '{"data":{"projects":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cur-1"}}}}' 1
+  fake_linear_fail LinearProjects 22 2
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_called 'curl linear:LinearProjectCreate'
+  refute_called 'curl linear:LinearIssueCreate'
+  assert_contains "$(m8_post)" '→ 以后做（Linear 接口出错，没记上（看 Actions 日志））'
+}
+
+@test "linear: another team's Improvement label is passed over for one the chosen team can use" {
+  linear_env
+  fake_linear LinearProjects "$(projects_json "$(project_node p-name r)")"
+  fake_linear LinearIssueMeta '{"data":{"workflowStates":{"nodes":[{"id":"state-backlog"}]},"issueLabels":{"nodes":[
+    {"id":"label-other-team","team":{"id":"team-2"}},
+    {"id":"label-own-team","team":{"id":"team-1"}}]}}}'
+  use_verdict "$(verdict merge 's' "$(later_item '补测试')")"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_equal "$(issue_input | jq -c .labelIds)" '["label-own-team"]'
+}
+
 @test "linear: without LINEAR_API_KEY nothing is filed and the PR still merges" {
   unset LINEAR_API_KEY
   use_verdict "$(verdict merge 's' "$(later_item '补测试')" "$(item P2 '措辞')")"

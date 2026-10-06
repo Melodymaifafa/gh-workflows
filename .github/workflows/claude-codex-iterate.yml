@@ -3526,7 +3526,7 @@ jobs:
             jq -c .data <<<"$resp"
           }
           file_followups() {
-            local all items n note repo_name repo_url team projects project meta state label
+            local all items n note repo_name repo_url team projects page cursor project meta state label
             local f fid title reason src marker found created ident url desc link
             all="$(jq -c "$sanitize"' [.findings[] | select(.later == true and .severity == "P2")
               | {id, title: (.title | clean(120) | line1), reason: (.reason | clean(400))}]' <<<"$STRUCTURED_OUTPUT")"
@@ -3542,13 +3542,30 @@ jobs:
               repo_url="${SERVER_URL:-https://github.com}/$REPO"
               team="$(linear 'query LinearTeam($key: String!) { teams(filter: {key: {eq: $key}}) { nodes { id } } }' \
                 "$(jq -cn --arg key "${LINEAR_TEAM:-MEL}" '{key: $key}')" | jq -r '.teams.nodes[0].id // empty')" || team=''
-              projects="$(linear 'query LinearProjects { projects(first: 250) { nodes { id name canceledAt externalLinks { nodes { url } } } } }' '{}')" || projects=''
+              # 项目列表要翻完所有页：只看第一页，挂着链接的项目排在后面就会被当成没有、
+              # 又建一个重复的（Codex 2026-10-06 的 P2）。哪一页出错、翻了 40 页还没完，
+              # 都当接口出错：宁可这次不记，也不建重复项目。攒下的列表走 stdin 不走参数，
+              # 项目多了单个参数会超长。
+              projects='[]'
+              cursor=''
+              for _ in {1..40}; do
+                if ! page="$(linear 'query LinearProjects($after: String) { projects(first: 100, after: $after) { nodes { id name canceledAt externalLinks { nodes { url } } } pageInfo { hasNextPage endCursor } } }' \
+                       "$(jq -cn --arg c "$cursor" '{after: (if $c == "" then null else $c end)}')")" ||
+                   ! projects="$(printf '%s\n%s\n' "$projects" "$page" | jq -ecs '.[0] + (.[1].projects.nodes | arrays)')" ||
+                   ! cursor="$(jq -er '.projects.pageInfo | if .hasNextPage == true then .endCursor | strings else "" end' <<<"$page")"; then
+                  projects=''
+                  cursor=''
+                  break
+                fi
+                [ -n "$cursor" ] || break
+              done
+              [ -z "$cursor" ] || projects=''
               if [ -z "$team" ] || [ -z "$projects" ]; then
                 note='Linear 接口出错，没记上（看 Actions 日志）'
               else
                 project="$(jq -r --arg url "$repo_url" --arg name "$repo_name" '
                   def norm: ascii_downcase | sub("\\.git$"; "") | sub("/+$"; "");
-                  [.projects.nodes[] | select(.canceledAt == null)] as $p
+                  [.[] | select(.canceledAt == null)] as $p
                   | [($p[] | select(any(.externalLinks.nodes[]?; (.url | norm) == ($url | norm)))),
                      ($p[] | select((.name | ascii_downcase) == ($name | ascii_downcase)))]
                   | .[0].id // empty' <<<"$projects")"
@@ -3569,12 +3586,15 @@ jobs:
                   # Backlog 按状态类型找，不按名字：团队把它改了名（如「Later」）按名字就找不到，
                   # 不带 stateId 建票、开了 Triage 的团队会落进 Triage（Codex 2026-10-06 的 P2）。
                   # 类型是 backlog 的有好几个时，先挑名字叫 Backlog 的，再挑排最前的。
-                  meta="$(linear 'query LinearIssueMeta($team: ID!) { workflowStates(filter: {team: {id: {eq: $team}}, type: {eq: "backlog"}}) { nodes { id name position } } issueLabels(filter: {name: {eq: "Improvement"}}) { nodes { id } } }' \
+                  # Improvement 标签只认全工作区的或本团队的：别的团队自己的同名标签挂上去，
+                  # 建票会整个失败（Codex 2026-10-06 的 P2）。
+                  meta="$(linear 'query LinearIssueMeta($team: ID!) { workflowStates(filter: {team: {id: {eq: $team}}, type: {eq: "backlog"}}) { nodes { id name position } } issueLabels(first: 250, filter: {name: {eq: "Improvement"}}) { nodes { id team { id } } } }' \
                     "$(jq -cn --arg team "$team" '{team: $team}')")" || meta='{}'
                   state="$(jq -r '[.workflowStates.nodes[]?]
                     | sort_by([((.name // "") | ascii_downcase) != "backlog", (.position // 0)])
                     | .[0].id // empty' <<<"$meta")"
-                  label="$(jq -r '.issueLabels.nodes[0].id // empty' <<<"$meta")"
+                  label="$(jq -r --arg team "$team" '[.issueLabels.nodes[]? | select(.team == null or .team.id == $team)]
+                    | .[0].id // empty' <<<"$meta")"
                   src="$REPO#$PR_NUMBER"
                   # 查重认整段「来源：o/r#7（」，前后都卡住：光找 o/r#7 会把 o/r#70 同标题的票也认成
                   # 自己的（Codex 2026-10-06 的 P2）。描述里的来源行也用它拼，两边不会对不上。
