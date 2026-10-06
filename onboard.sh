@@ -136,6 +136,8 @@ fi
 
 repo="${1:?usage: onboard.sh <repo> <python|node>}"
 runtime="${2:?usage: onboard.sh <repo> <python|node>}"
+# 巡检摘要里公开仓库列的是 owner/名，照抄过来也能用。
+repo="${repo#"$OWNER"/}"
 slug="$OWNER/$repo"
 
 case "$runtime" in
