@@ -99,7 +99,7 @@ jobs:
       TRIGGERED_AT: ${{ github.event.comment.created_at || github.event.pull_request.updated_at }}
       TARGET_ID: ${{ github.event.comment.id || github.event.pull_request.number }}
       ACTOR_TYPE: ${{ github.event.sender.type }}
-      # 只传「有没有」，不把 PAT 本身交给这个 job。
+      # job 层只传「有没有」；PAT 本身只交给下面那一步里的 gh pr merge。
       HAS_PAT: ${{ secrets.CODEX_TRIGGER_TOKEN != '' }}
       PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
       PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
@@ -114,6 +114,11 @@ jobs:
           # 只交给下面那一条 gh pr merge：等 Codex、读 PR、发告警评论的那些调用照旧用
           # github.token（判定在 merge_credential_source）。
           SELF_WORKFLOWS_TOKEN: ${{ secrets.SELF_WORKFLOWS_TOKEN }}
+          # 主人的 PAT，每个接了流水线的仓库都有。用 github.token 合并时，GitHub 的防递归
+          # 规则让那次 push 不触发任何 workflow：调用方 ci.yml 的 `on: push` 不跑，合并出来的
+          # commit 上一条 CI 都没有，ff-main 就永远不敢挪 main（2026-10-07 wechat-mimic-finetune
+          # 12–15 号 PR 实测）。用它合，push 才算真人推的，CI 照常跑。同样只交给 gh pr merge。
+          CODEX_TRIGGER_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -712,33 +717,50 @@ jobs:
           fi
 
           # 合并这一条用哪一份令牌 —— 只打印名字，值由下面按名字取，绝不打印。
-          # 两个条件同时成立才用本仓库专用的那把：跑在 Melodymaifafa/gh-workflows（别的
-          # 仓库万一也设了同名密钥，一样不许用），且密钥非空。
+          # 本仓库专用的那把要两个条件同时成立：跑在 Melodymaifafa/gh-workflows（别的
+          # 仓库万一也设了同名密钥，一样不许用），且密钥非空。其次是主人的 PAT；都没有才用
+          # github.token —— 能合，但合出来的 commit 上不会有 CI。
           merge_credential_source() {
             if [ "${REPO:-}" = Melodymaifafa/gh-workflows ] &&
               [ -n "${SELF_WORKFLOWS_TOKEN:-}" ]
             then
               echo self-workflows
+            elif [ -n "${CODEX_TRIGGER_TOKEN:-}" ]; then
+              echo codex-trigger
             else
               echo github-token
             fi
           }
+          # merge_with <credential>：合并输出走 stdout，成败看退出码。
+          merge_with() {
+            local token
+            case "$1" in
+              self-workflows) token="$SELF_WORKFLOWS_TOKEN" ;;
+              codex-trigger)  token="$CODEX_TRIGGER_TOKEN" ;;
+              *)              token="$GH_TOKEN" ;;
+            esac
+            echo "the merge request uses the $1 credential" >&2
+            GH_TOKEN="$token" gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch \
+              --match-head-commit "$expected_head" 2>&1
+          }
           merge_credential="$(merge_credential_source)"
-          case "$merge_credential" in
-            self-workflows) merge_token="$SELF_WORKFLOWS_TOKEN" ;;
-            *)              merge_token="$GH_TOKEN" ;;
-          esac
-          echo "the merge request uses the $merge_credential credential"
 
           # GitHub 拒绝合并时不能只让 run 变红：没人会去看，巡检还会一遍遍重新叫审。
-          if merge_out="$(
-            GH_TOKEN="$merge_token" gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch \
-              --match-head-commit "$expected_head" 2>&1
-          )"; then
+          if merge_out="$(merge_with "$merge_credential")"; then
             printf '%s\n' "$merge_out"
             exit 0
           fi
           printf '%s\n' "$merge_out"
+          # PAT 失效或权限不够时退回 github.token，不比改之前更差：照样合，只是没 CI，
+          # 等 ff-main 报「没有 CI 记录」。PR 已被别人合掉的话这次也会失败，交给下面判。
+          if [ "$merge_credential" = codex-trigger ]; then
+            echo "::warning::CODEX_TRIGGER_TOKEN could not merge; retrying with github.token, so CI will not run on the merge commit"
+            if merge_out="$(merge_with github-token)"; then
+              printf '%s\n' "$merge_out"
+              exit 0
+            fi
+            printf '%s\n' "$merge_out"
+          fi
 
           # 合并请求和别人的操作撞车（已合、已关、head 变了）不算事，不告警。
           moved_on="$(
