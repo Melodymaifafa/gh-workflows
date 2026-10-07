@@ -112,7 +112,7 @@ verify_coverage_warning() {
 node_version_warning() {
   local pinned="${NODE_VERSION:-}"
   [ -n "$pinned" ] && [ "$pinned" != 20 ] || return 0
-  echo "    ⚠️  CI 钉在 node $pinned，但修复那一轮固定跑 node 20（中央 iterate 没有" >&2
+  echo "    ⚠️  CI 钉在 node ${pinned}，但修复那一轮固定跑 node 20（中央 iterate 没有" >&2
   echo "        node_version input）。Codex 提出意见后那一轮可能装不上依赖而红。" >&2
 }
 
@@ -167,7 +167,7 @@ echo "==> $slug (runtime=$runtime)"
 
 default_branch="$(gh api "repos/$slug" --jq .default_branch)"
 if [ "$default_branch" != main ]; then
-  echo "    默认分支是 $default_branch，不是 main；跳过，需要人工确认" >&2
+  echo "    默认分支是 ${default_branch}，不是 main；跳过，需要人工确认" >&2
   exit 1
 fi
 
@@ -242,7 +242,7 @@ if [ -f "$SECRETS_FILE" ]; then
     fi
   done
 else
-  echo "    ⚠️  找不到 $SECRETS_FILE，本仓库未设置任何密钥" >&2
+  echo "    ⚠️  找不到 ${SECRETS_FILE}，本仓库未设置任何密钥" >&2
 fi
 
 # Codex connector 是账号级授权，新仓库自动覆盖（2026-07-29 实测），这里不用管。
