@@ -177,7 +177,7 @@ jobs:
           # 巡检才知道要等到新的重置时间；其余原因同 (head, 原因) 只发一次。
           # 第 5 个参数可选：只进评论、不进手机推送的额外标记行（如 carried-findings）。
           alert_once() {
-            local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" prev body resume
+            local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" prev body resume pause
             # 已有可信标记里最大的 until：没有标记 = 空串，有标记但 until=- 记 0
             prev="$(trusted_comments | jq -r --arg m "<!-- pr-guard: alert head=$head reason=$reason " '
               [.[] | .body | select(contains($m))
@@ -196,7 +196,14 @@ jobs:
               return 0
             fi
             [ -z "$extra" ] || body+=$'\n'"$extra"
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$body" >/dev/null
+            # 发不出去隔 10 / 30 / 60 秒再试：有的标记只在这里发一次，一次网络抖动丢了就没人补
+            # （carried-findings 一丢，分支已经换了 head，没修的意见就跟着进了合并）。发重了无妨：
+            # 标记只按「有没有」认。全失败照旧返回非零，红不红由调用处定。
+            for pause in 0 10 30 60; do
+              [ "$pause" -eq 0 ] || { echo "posting the $reason alert failed; retrying in ${pause}s"; sleep "$pause" || true; }
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$body" >/dev/null && return 0
+            done
+            return 1
           }
 
           # findings_review_ids <head>：这个 head 上全部「有意见」的 review id，逗号隔开。判据同
@@ -1425,8 +1432,18 @@ jobs:
               [[ "$carried_review" =~ ^[0-9]+$ ]] || continue
               m7+=$'\n'"<!-- pr-guard: carried-findings-cleared review=$carried_review head=$new_head -->"
             done
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" >/dev/null ||
-              echo "::warning::fix-round marker for $new_head not posted"
+            # 发不出去隔一会儿再试（同 alert_once）：上面那几行 carried-findings-cleared 只在这里
+            # 发一次，丢了的话那几条意见在合并检查眼里一直开着，干净的复审之后也只会停车。
+            # 全失败照旧只警告：推已经成功了，为一条评论打红会让后面召唤复审跟着被跳过。
+            m7_posted=''
+            for pause in 0 10 30 60; do
+              [ "$pause" -eq 0 ] || { echo "fix-round marker for $new_head not posted; retrying in ${pause}s"; sleep "$pause" || true; }
+              if gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" >/dev/null; then
+                m7_posted=1
+                break
+              fi
+            done
+            [ -n "$m7_posted" ] || echo "::warning::fix-round marker for $new_head not posted"
           }
 
           {
@@ -3334,7 +3351,16 @@ jobs:
             fi
           fi
 
-          alert_once "$HEAD_SHA" "$reason" - "$msg" "$carry"
+          # 拦合并的那个标记重试几次还是没发出去：手机上那条已经说了「不会自动合并」，可合并
+          # 检查这时候根本看不到要拦什么。Pushover 不走 GitHub，再推一条说实话，让人自己拦；
+          # 这一步照旧红着停下。
+          if ! alert_once "$HEAD_SHA" "$reason" - "$msg" "$carry"; then
+            if [ -n "$carry" ]; then
+              pushover "🤖 PR #$PR_NUMBER 要你手动拦一下" "上一条说这个 PR 不会自动合并，但拦合并的标记没发到 PR 上（GitHub 连着拒了几次）。它现在可能被自动合并，没修的意见会一起进去。先别让它合，自己处理：$PR_URL"
+            fi
+            echo "::error::the $reason alert could not be posted on PR #$PR_NUMBER"
+            exit 1
+          fi
 
   # 修满 max_fix_rounds 轮、当前 head 上还有意见时，Claude 逐条重判这些意见拦不拦合并。
   # 形状同 codex-approved-merge 的 claude-review：Claude 只读文件、拿只读令牌，根目录是受信任

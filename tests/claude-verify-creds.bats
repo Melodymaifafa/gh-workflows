@@ -1283,6 +1283,23 @@ origin_git() { "$REAL_GIT" --git-dir="$BATS_TEST_TMPDIR/origin.git" "$@"; }
 <!-- pr-guard: carried-findings-cleared review=3002 head=$new -->"
 }
 
+# 关掉 carried 的那几行只随 M7 发这一次：丢了的话合并检查一直当它开着，干净的复审之后
+# 也只会停车（Codex 2026-10-07 的 P2）。所以发不出去隔一会儿再试。
+@test "carried: a round marker that fails to post once is retried, closures and all" {
+  push_workspace 'true'
+  export CARRIED=3001
+  fake_cli_fail pr_comment 1 '' 1
+  fake_cli pr_comment 'https://github.com/o/r/pull/7#issuecomment-1' 2
+
+  run_chain_trusted_push
+
+  assert_equal "$status" 0
+  assert_called 'gh pr comment 7 --repo o/r' 2
+  assert_called 'sleep 10' 1
+  assert_contains "$(fake_last_body 'gh pr comment')" "<!-- pr-guard: carried-findings-cleared review=3001 head=$(git rev-parse HEAD) -->"
+  refute_contains "$output" '::warning::fix-round marker'
+}
+
 @test "carried: only the Claude path closes carried findings; the Codex patch request never saw them" {
   assert_contains "$(step_env_keys "$WF" 'Commit and push the Claude fix')" 'CARRIED'
   refute_contains "$(step_env_keys "$WF" 'Commit and push the Codex fix')" 'CARRIED'

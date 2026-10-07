@@ -1054,6 +1054,39 @@ carry_env() {
   assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: carried-findings review=4001 from=$H -->"
 }
 
+# 那个标记是拦合并的唯一一道，而且只在这里发一次：一次网络抖动丢了它，分支已经换了 head，
+# 复审不再报这条，干净的复审就把没修的意见合了进去（Codex 2026-10-07 的 P1）。
+@test "carry: a carried marker that fails to post is retried until it lands" {
+  carry_env
+  fake_route "$INLINE" '[]'
+  fake_cli_fail pr_comment 1 '' 1
+  fake_cli_fail pr_comment 1 '' 2
+  fake_cli pr_comment 'https://github.com/o/r/pull/7#issuecomment-1' 3
+  stuck
+  assert_equal "$status" 0
+  assert_called "gh pr comment" 3
+  assert_called "sleep 10" 1
+  assert_called "sleep 30" 1
+  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: carried-findings review=4001 from=$H -->"
+  # 重试的是评论，不是告警：手机只响一次
+  assert_called "curl " 1
+}
+
+# 重试完还是发不出去：手机上那条已经说了「不会自动合并」，合并检查却看不到要拦什么。
+# 再推一条说实话，这一步红着停下。
+@test "carry: a carried marker that never lands reds the step and says so on the phone" {
+  carry_env
+  fake_route "$INLINE" '[]'
+  fake_cli_fail pr_comment 1
+  stuck
+  assert_equal "$status" 1
+  assert_called "gh pr comment" 4
+  assert_called "curl " 2
+  assert_contains "$(fake_last_body "curl ")" '拦合并的标记没发到 PR 上'
+  assert_contains "$(fake_last_body "curl ")" 'https://github.com/o/r/pull/7'
+  assert_contains "$output" 'could not be posted'
+}
+
 # 别的步骤红掉时这一步必须闭嘴：那些结局各自已经发过自己的告警，再补一条就是两条。
 @test "stuck: a round that went red somewhere else says nothing here" {
   stuck_env
