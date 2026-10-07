@@ -12,8 +12,8 @@
 # 避免第一次接入就满屏红叉：
 #   INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip ./onboard.sh <repo> node
 #
-# package.json 的 engines 要求比 ci.yml 的默认 node 20 新时，用 NODE_VERSION 钉住，
-# 否则第一次接入就装不上依赖：
+# package.json 的 engines 要求比默认 node 20 新时，用 NODE_VERSION 钉住，
+# 否则第一次接入就装不上依赖。CI 和修复那一轮两处会一起钉：
 #   NODE_VERSION=24 ./onboard.sh <repo> node
 set -euo pipefail
 
@@ -96,6 +96,16 @@ iterate_verify_cmd() {
     "$(verify_line test "${TEST_CMD:-$default_test}")"
 }
 
+# iterate 调用桩的 __NODE_VERSION__ 块。没传 NODE_VERSION 就什么都不打印，
+# 让中央仓库的默认值（20，同 ci.yml）生效 —— 和 ci_overrides 同一个规矩。
+# 两处必须是同一个值：CI 装得上而修复那一轮装不上，是只有接入这一刻看得见的
+# 单向代价（MEL-322，CodexBridge 1 号 PR 就死在这里）。
+iterate_node_version() {
+  local pinned="${NODE_VERSION:-}"
+  [ -n "$pinned" ] || return 0
+  printf "      node_version: '%s'\n" "$pinned"
+}
+
 # 三条全 skip：CI 一条都不跑，修复那一轮的 verify_cmd 也只剩三条 notice ——
 # 等于 Claude 的修复没经过任何检查就推上 PR。这不是新开的洞（CI 本来也不验证），
 # 但它只有在接入这一刻说得出口，之后没人会再看一眼生成出来的调用桩。
@@ -105,17 +115,6 @@ verify_coverage_warning() {
   echo "        Claude 的修复会直接推上 PR。三条里任意一条给上真命令就能恢复验证。" >&2
 }
 
-# NODE_VERSION 只到得了 ci.yml。中央 claude-codex-iterate.yml 的 setup-node 把
-# node-version 写死成 '20' 且没开成 input，所以修复那一轮永远是 node 20 ——
-# 跟 verify_cmd 跟不上 ci.yml 覆盖值时一样的单向代价（MEL-293 / MEL-303）：
-# CI 绿着，修复那一轮装不上依赖必然红。这一刻不说，之后没人会再看一眼生成的桩。
-node_version_warning() {
-  local pinned="${NODE_VERSION:-}"
-  [ -n "$pinned" ] && [ "$pinned" != 20 ] || return 0
-  echo "    ⚠️  CI 钉在 node ${pinned}，但修复那一轮固定跑 node 20（中央 iterate 没有" >&2
-  echo "        node_version input）。Codex 提出意见后那一轮可能装不上依赖而红。" >&2
-}
-
 # 把四个调用桩渲染进 <dest>/.github/workflows/。<dest> 默认当前目录。
 render_stubs() {
   local runtime="$1" dest="${2:-.}" f
@@ -123,10 +122,11 @@ render_stubs() {
   for f in ci claude-codex-iterate codex-approved-merge ff-main; do
     sed "s|__RUNTIME__|$runtime|g" "$STUB_DIR/$f.yml" >"$dest/.github/workflows/$f.yml"
   done
-  # 两个占位符都是多行块，用 python 替换以免 sed 处理多行麻烦
+  # 这几个占位符都是整块替换，用 python 以免 sed 处理多行麻烦
   WORKFLOW_DIR="$dest/.github/workflows" \
   OVERRIDES="$(ci_overrides)" \
   VERIFY_BLOCK="$(iterate_verify_cmd "$runtime")" \
+  ITERATE_NODE_VERSION="$(iterate_node_version)" \
     python3 - <<'PY'
 import os, pathlib
 
@@ -134,6 +134,7 @@ d = pathlib.Path(os.environ["WORKFLOW_DIR"])
 for name, placeholder, key in (
     ("ci.yml", "__OVERRIDES__\n", "OVERRIDES"),
     ("claude-codex-iterate.yml", "__VERIFY_CMD__\n", "VERIFY_BLOCK"),
+    ("claude-codex-iterate.yml", "__NODE_VERSION__\n", "ITERATE_NODE_VERSION"),
 ):
     # 命令替换把块尾的换行吃掉了，补回来；空块整行删掉。
     block = os.environ.get(key, "")
@@ -190,7 +191,6 @@ fi
 #    只写前者的话 CI 绿着、修复那一轮必然红（MEL-303）。
 render_stubs "$runtime"
 verify_coverage_warning
-node_version_warning
 
 # 必须先 add 再比对：调用桩是全新文件时 git diff 看不见未跟踪文件，
 # 会误报「无需提交」。
