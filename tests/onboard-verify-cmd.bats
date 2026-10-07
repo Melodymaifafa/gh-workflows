@@ -125,6 +125,15 @@ print("ok", len(emitted))
   assert_contains "$(onboard_node_version_warning)" '修复那一轮固定跑 node 20'
 }
 
+# macOS 自带的 bash 3.2 在 UTF-8 locale 下把中文的首字节也当成变量名的一部分：
+# `$pinned，` 读成变量「pinned + 半个逗号」，set -u 当场报 unbound variable 退出。
+# Linux 上的 bash 不会，所以只能静态拦：本机跑的脚本里，紧挨非 ASCII 的变量一律加花括号。
+@test "local scripts brace every variable that touches a non-ASCII character" {
+  run env LC_ALL=C grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^[:print:][:space:]]' \
+    "$REPO_ROOT/onboard.sh" "$REPO_ROOT/newrepo.sh"
+  assert_equal "$output" ''
+}
+
 @test "no node_version, or node_version 20, matches the fix round and is not warned" {
   assert_equal "$(onboard_node_version_warning)" ''
   OV_NODE_VERSION=20
