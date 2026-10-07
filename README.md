@@ -10,7 +10,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 - 自动挪安全的前提是**快进不销毁任何东西**：main 原来那个 commit 是新 commit 的祖先，一直在历史里。发现问题就把指针挪回去 —— `gh api -X PATCH repos/<slug>/git/refs/heads/main -f sha=<旧 sha> -F force=true`（往回是非快进，所以要 `force`；往前不用）。旧 sha 在 Actions 那次 run 的摘要里，或仓库 Insights → Network。
 - 定时挪的代价是 `main` 不再等于「我确认过这版能用」。两道闸门是那句话的自动替代品：
   - **泡够 7 天**（`min_age_days`）—— 落点不是 develop 的最新位置，而是它 7 天前的位置。追到最新会让 main 和 develop 一模一样，那就没有可退的点了；泡 7 天保证 main 上每一笔都在 develop 上活过一周。填 `0` 关掉。
-  - **CI 全绿**（`require_green`）—— 落点 commit 有失败、还在跑、或压根没跑过 CI，都跳过并推一条 Pushover。「没跑过 CI」不是「没问题」，是「不知道」。
+  - **CI 全绿**（`require_green`）—— 落点 commit 有失败、还在跑、或压根没跑过 CI，都跳过并推一条 Pushover。「没跑过 CI」不是「没问题」，是「不知道」。合并、快进这两个流水线自己的 check run 不算 CI：它们由 PR 事件 / 评论 / 定时触发，GitHub 把它们挂在当时的最新提交上，不是测过它。
   - 两道都想无视：手动跑一次，`min_age_days` 填 0、取消勾选 `require_green`。
 - 手动等价命令：`git push origin origin/develop:main`。**注意左边要写 `origin/develop`,不是 `develop`** —— `develop` 指的是你本地那个分支,忘了 `git fetch` 就会把 main 推到一个过期的位置,而且这仍然是一次合法快进,git 不报错、你也看不出来。workflow 走 API 读远端,不存在这个坑。
 
@@ -74,6 +74,8 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 改好了却没推上去时，PR 上也一定有一句话（2026-10-05）：验证命令没过 → `verify-failed`；提交了但 push 被拒 → `push-failed`，告警里直接说是哪一种拒（令牌不许改 workflow 文件 / 分支保护 / 分支落后），两条都带 run 链接。`claude-code-action` 因为「PR 分支上的调用桩跟默认分支不一样」把自己整步跳过时 → `stale-workflow`，告警直接写「点 Update branch」。这三种以前在 PR 上一个字都没有，只能等巡检重试两次之后收到一条不说原因的 `retry-exhausted`。
 
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
+
+合并用主人的 PAT（`CODEX_TRIGGER_TOKEN`），不用 `github.token`：GitHub 不让 `github.token` 的 push 触发别的 workflow，那样调用方 `ci.yml` 的 `on: push` 不跑，合并出来的 commit 上没有 CI，`ff-main` 就永远不挪 main（2026-10-07 wechat-mimic-finetune 实测）。仓库没设这把 PAT、或它合不动（失效 / 权限不够），就退回 `github.token`：照样合，只是那个 commit 上没 CI。
 
 **巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused`、CI 红）等人处理。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
 
@@ -163,7 +165,7 @@ jobs:
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | 流水线断了不会推手机通知 |
 | `LINEAR_API_KEY` | judge 判为「以后再做」的意见不记 Linear 票，只写在 PR 评论里；照样合并（Linear 个人 API key，`lin_api_` 开头） |
 
-`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** + **Contents、Workflows read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。Contents、Workflows 写权限是为本仓库把它复用成 `SELF_WORKFLOWS_TOKEN`（见下一段）；巡检读各仓库调用桩也顺带用它的 Contents 权限。代价：每个仓库都存着它，任何一个泄露，别人就能改所有仓库的代码和流水线 —— 2026-10-06 认了这个代价，换「不用再管第二把令牌」。
+`CODEX_TRIGGER_TOKEN` 必须是真人账号建的 fine-grained PAT（GitHub Actions 自带的 bot token 发 `@codex review` 会被 Codex 拒绝）。权限选 **All repositories** + Metadata read + Issues/PR read & write + **Actions read & write** + **Contents、Workflows read & write** —— 覆盖全部仓库，接新仓库不用回去改 PAT。Actions 写权限只用在一处：机器人推的修复提交，它的 CI 在有的仓库会被 GitHub 扣成「等人批准」（`action_required`），召唤复审那一步用这把令牌批掉**本轮自己刚推的那个提交**上被扣的 run，别的不碰；没这个权限只 warning，CI 照旧等人点（MEL-292）。Contents、Workflows 写权限给两处：每个仓库的自动合并用它（这样合并出来的 commit 才跑 CI），本仓库还把它复用成 `SELF_WORKFLOWS_TOKEN`（见下一段）；巡检读各仓库调用桩也顺带用它的 Contents 权限。代价：每个仓库都存着它，任何一个泄露，别人就能改所有仓库的代码和流水线 —— 2026-10-06 认了这个代价，换「不用再管第二把令牌」。
 
 `SELF_WORKFLOWS_TOKEN` 只设在本仓库，值就是 `CODEX_TRIGGER_TOKEN` 那一把，不另建（2026-10-06）：`set -a && source ~/.config/gh-workflows/secrets.env && set +a && printf %s "$CODEX_TRIGGER_TOKEN" | gh secret set SELF_WORKFLOWS_TOKEN --repo Melodymaifafa/gh-workflows`。`onboard.sh` 不刷它 —— 代码只在本仓库读这个名字。GitHub 不许没有 Workflows 权限的令牌推、合 `.github/workflows/` 下的改动，而本仓库的 PR 几乎都改这些文件（2026-09-26 到 10-01，17 / 18 / 19 号 PR 为此停了 5 次里的 4 次）。只交给两处：iterate 推修复那一条 `git push`、codex-approved-merge 那一条 `gh pr merge`；验证命令、跑被审 PR 代码的步骤、Claude / Codex 那几步都拿不到，同一步里的 `gh pr comment` 也照旧用 `github.token`。没设它行为不变 —— 照旧走 `github.token`，推不动 / 合不动就按现有告警走（MEL-295）。
 
