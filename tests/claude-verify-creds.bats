@@ -335,6 +335,50 @@ chmod +x .git/hooks/post-index-change'
   assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by claude'
 }
 
+# ---------- 验证命令要能在自己名下装东西（MEL-322） ----------
+
+# 修复那一轮跑在一个专用的无权限账号下，而 `corepack enable` / `npm i -g` 默认都装到
+# node 工具链自己那个目录 —— 那个目录不归它，于是 EACCES。lark 2 号 PR 的每一轮修复都
+# 死在 `corepack enable` 这一句上，而同一句在那个仓库自己的 CI 里是好的（那边是 runner
+# 用户）。补法是给它一个自己写得动的 bin 目录排在 PATH 最前面。
+@test "claude: the PATH the verify command gets starts with a directory it can write into" {
+  push_workspace 'printf "%s\n" "${PATH%%:*}" >"$BATS_TEST_TMPDIR/first-path.txt"
+printf "%s\n" "${npm_config_prefix:-}" >"$BATS_TEST_TMPDIR/npm-prefix.txt"'
+
+  run_verify
+
+  assert_equal "$status" 0
+  first="$(cat "$BATS_TEST_TMPDIR/first-path.txt")"
+  [ -d "$first" ] || { echo "PATH starts with $first, which is not a directory" >&2; return 1; }
+  [ -w "$first" ] || { echo "PATH starts with $first, which it cannot write" >&2; return 1; }
+  # `npm i -g` 装到 $prefix/bin，所以 prefix 必须正是那个目录的上一级。
+  assert_equal "$(cat "$BATS_TEST_TMPDIR/npm-prefix.txt")/bin" "$first"
+}
+
+# 上一条只证明「有个可写目录」。这一条跑真的 corepack：裸的 `corepack enable`（仓库的
+# verify_cmd 里就是这么一句，照它自己的 CI 抄的）必须成功，而且 shim 要落在那个可写
+# 目录里，不是 node 工具链的目录。
+@test "claude: a bare corepack enable inside the verify command succeeds" {
+  command -v corepack >/dev/null 2>&1 || skip 'no corepack on this machine'
+  push_workspace 'corepack enable
+command -v pnpm >"$BATS_TEST_TMPDIR/pnpm-path.txt"'
+
+  run_verify
+
+  assert_equal "$status" 0
+  assert_contains "$(cat "$BATS_TEST_TMPDIR/pnpm-path.txt")" '/verify-tools-'
+}
+
+# 那个目录归验证命令写，所以它绝不能出现在**我们**那份 PATH 上：我们写得动 = 它也
+# 写得动 = 往里放一个假 git / 假 ps 就能把下面每一道判定变成空转。只加在交给它的那
+# 份 PATH 前面，一个字都不进 $trusted_path。
+@test "claude: the writable bin directory is only on the verify command's PATH, never on ours" {
+  body="$(fix_guard_body verify_the_fix)"
+  assert_contains "$body" 'verify_path="$verify_tools/bin:$verify_path"'
+  refute_contains "$body" 'trusted_path="$verify_tools'
+  refute_contains "$body" 'PATH="$verify_tools'
+}
+
 # 验证留下一个活进程，它盯着 .git/config 等凭据回来。两道各守一半：跑完先按进程组
 # 收掉它，而且凭据摘掉之后再也不还回那个文件 —— 战利品是空的 = 它什么都没等到。
 @test "claude: a process the verify command leaves behind never sees the credentials return" {
@@ -985,8 +1029,9 @@ launch_stub() { # launch_stub >桩脚本
 verify_user=ghwf-verify
 verify_sandbox="$BATS_TEST_TMPDIR/launch-sandbox"
 decoy="$BATS_TEST_TMPDIR/launch-decoy"
-mkdir -p "$verify_sandbox/home" "$decoy"
-verify_path="$PATH"
+verify_tools="$verify_sandbox/tools"
+mkdir -p "$verify_sandbox/home" "$decoy" "$verify_tools/bin"
+verify_path="$verify_tools/bin:$PATH"
 verify_bash=/bin/bash
 [ -x "$verify_bash" ] || verify_bash=/usr/bin/bash
 VERIFY='umask'
