@@ -711,6 +711,29 @@ jobs:
             exit 0
           fi
 
+          # 以前某一轮改好了却没推上去的意见（iterate 发的 carried-findings 标记）：分支被人
+          # 推过，那一轮的修复没落地，而复审只看新 head、不一定再报同一条（wechat-mimic-finetune
+          # PR #15 就这样带着一条 P1 合了进去）。下一轮修复把它们带上、推上去之后会发
+          # carried-findings-cleared 关掉；在那之前不自动合并，等人处理（看过之后手动点 Merge）。
+          # 只认可信作者写的；读不到评论就不合，绝不当成「没有」。
+          carried="$(
+            gh api --paginate --slurp \
+              "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" |
+              jq -r '
+                [(add // [])[]
+                  | select(.user.login == "github-actions[bot]" or .author_association == "OWNER")
+                  | .body // ""] as $b
+                | ([$b[] | scan("<!-- pr-guard: carried-findings review=([0-9]+) ") | .[0]] | unique) as $open
+                | ([$b[] | scan("<!-- pr-guard: carried-findings-cleared review=([0-9]+) ") | .[0]] | unique) as $done
+                | $open - $done | join(",")'
+          )" || { echo "::error::Cannot read PR comments"; exit 1; }
+          if [ -n "$carried" ]; then
+            echo "::notice::Unlanded findings from review(s) $carried are still open; not merging"
+            alert_once "$expected_head" carried-open \
+              "🤖 审查通过、CI 也绿了，但更早一轮改好却没推上去的意见还没人处理（见上面那条「改好了，但推不上去」），先不自动合并。你看过、确认处理好了就直接点 Merge。"
+            exit 0
+          fi
+
           # 合并这一条用哪一份令牌 —— 只打印名字，值由下面按名字取，绝不打印。
           # 两个条件同时成立才用本仓库专用的那把：跑在 Melodymaifafa/gh-workflows（别的
           # 仓库万一也设了同名密钥，一样不许用），且密钥非空。

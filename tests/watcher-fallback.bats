@@ -500,6 +500,73 @@ codex_findings_on_h() { # codex_findings_on_h <id> ...
   refute_called 'gh pr merge'
 }
 
+# ---------- 以前没推上去的意见（carried-findings）：没人处理之前不合 ----------
+#
+# wechat-mimic-finetune PR #15：修复没推上去，下一次复审只看新 head、没再报那条 P1，
+# PR 带着 bug 自动合了进去。iterate 现在留一个 carried-findings 标记，合并前必须是关着的。
+
+carried_comment() { # carried_comment <id> <login> <assoc> <review> [cleared]
+  local m="carried-findings review=$4 from=$OTHER"
+  [ -z "${5:-}" ] || m="carried-findings-cleared review=$4 head=$H"
+  gh_comment "$1" "$2" "$3" "改好了，但推不上去。
+
+<!-- pr-guard: $m -->"
+}
+
+@test "carried: an open carried finding blocks a clean, green head and alerts once" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'Unlanded findings from review(s) 3001 are still open'
+  refute_called 'gh pr merge'
+  assert_called 'curl' 1
+  body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
+  assert_contains "$body" '更早一轮改好却没推上去的意见还没人处理'
+  assert_contains "$body" "<!-- pr-guard: alert head=$H reason=carried-open until=- -->"
+  assert_bodies_inert
+}
+
+@test "carried: once a later fix round closed it, the head merges" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)" \
+    "$(carried_comment 2 'github-actions[bot]' NONE 3001 cleared)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+# 关掉的标记只认可信作者：claude[bot] 写一条「已关掉」放不行。反过来，claude[bot] 写的
+# 「没推上去」也拦不住合并。
+@test "carried: claude[bot] can neither close a carried finding nor open one" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)" \
+    "$(carried_comment 2 'claude[bot]' NONE 3001 cleared)")"
+  run run_block "$WF" "$STEP"
+  refute_called 'gh pr merge'
+
+  : >"$FAKE_LOG"
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'claude[bot]' NONE 3001)")"
+  run run_block "$WF" "$STEP"
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+@test "carried: comments that cannot be read fail closed: no merge" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route_fail "repos/o/r/issues/7/comments?per_page=100" 1
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 1
+  refute_called 'gh pr merge'
+}
+
 @test "reading reviews fails closed: no merge" {
   path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
   green_checks

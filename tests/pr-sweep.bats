@@ -274,6 +274,17 @@ refute_writes() {
   refute_writes
 }
 
+# 审查通过了，合并检查却因为更早一轮没推上去的意见拦着（carried-open）：再叫审只会
+# 再拿一个「通过」、再被拦一次。停车等人。
+@test "a carried-open alert parks the head instead of kicking it again" {
+  one_pr clean 3700
+  comments "$(alert_comment 1 carried-open - 3700)"
+  reviews
+  sweep
+  assert_equal "$status" 0
+  refute_writes
+}
+
 @test "a merge-failed alert does not park: the head is kicked again after 60 idle minutes" {
   one_pr clean 3700
   comments "$(alert_comment 1 merge-failed - 3700)"

@@ -48,8 +48,10 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `fix-retry: head=H review=ID` | PAT（巡检） | 上次修复没完成，再修一次 |
 | `pr-guard: fix-round head=H round=N` | GITHUB_TOKEN | 第 N 轮修复已推送（轮数不靠召唤是否成功） |
 | `pr-guard: alert head=H reason=R until=T` | 各环节 | 已告警 R，同一 head 同一原因只推一次 |
+| `pr-guard: carried-findings review=ID from=H` | GITHUB_TOKEN（iterate） | review ID 的意见改好了却没推上去（分支被人推过），还没人处理：下一轮修复带上它，关掉之前不自动合并 |
+| `pr-guard: carried-findings-cleared review=ID head=H` | GITHUB_TOKEN（iterate，随 M7 一起发） | 带着 review ID 的那一轮推上去了，关掉上面那条 |
 
-告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `verify-failed` `push-failed` `stale-workflow` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
+告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `verify-failed` `push-failed` `findings-carried` `carried-open` `stale-workflow` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
 
 ### 修满轮数之后（2026-10-04）
 
@@ -73,9 +75,11 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 改好了却没推上去时，PR 上也一定有一句话（2026-10-05）：验证命令没过 → `verify-failed`；提交了但 push 被拒 → `push-failed`，告警里直接说是哪一种拒（令牌不许改 workflow 文件 / 分支保护 / 分支落后），两条都带 run 链接。`claude-code-action` 因为「PR 分支上的调用桩跟默认分支不一样」把自己整步跳过时 → `stale-workflow`，告警直接写「点 Update branch」。这三种以前在 PR 上一个字都没有，只能等巡检重试两次之后收到一条不说原因的 `retry-exhausted`。
 
+**分支在修的时候被人推过**（2026-10-07）：push 被判落后（non-fast-forward）时，拉下分支尖、把这一笔修复 rebase 上去、再推一次，只推一次，永不强推。接上去的那一版没在 runner 上重新验证（验证跑的是被审 PR 的代码，不许跟推送凭据同处一步），由 PR 自己的 CI 验，合并前必须全绿；Claude 的总结里会写明这一点。还是没推上去（冲突、拉不下来、重推又被拒）→ 告警 `findings-carried`，点名这一轮没修进去的意见，并留一个 `carried-findings` 标记：下一轮 Claude 修复把那条 review 的意见附在 `.review/findings.md` 后面一并修，推上去之后随 M7 发 `carried-findings-cleared` 关掉；在那之前合并环节告警 `carried-open`、不自动合并，巡检也把它当停车。人看过之后直接点 Merge 即可。起因：wechat-mimic-finetune PR #15（2026-10-06），修复被丢、下一次复审没再报那条 P1，PR 带着 bug 合了进去。Claude 的总结评论署名 github-actions[bot]，所以发之前剥掉 HTML 注释、拆开标记关键字，免得一段被意见带偏的总结伪造出「已关掉」。
+
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
 
-**巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused`、CI 红）等人处理。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
+**巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused` `carried-open`、CI 红）等人处理。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
 
 - **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **漏接的仓库每轮都点名**（2026-10-06，MEL-308）：有开着的 PR 却没装共享调用桩的仓库，run 摘要和 warning 里每次都列出来，并给出 `./onboard.sh <仓库> <python|node>`。`unwatched` 告警是按 head 去重的，head 不变就只响一次 —— 但仓库漏接是仓库级的，换个 head 也不会自己好，所以这条不跟着 head 去重。MEL-308 查出来的就是这个：三个仓库漏接，5 个 PR 全停，最久的两周没人管。
