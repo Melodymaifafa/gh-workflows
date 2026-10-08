@@ -258,12 +258,16 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
 
 # ---------- 第二阶段：judge 确认的 bug 接着修，最多到第 10 轮 ----------
 
-m9_body() { printf '### 🤖 Claude 复核：还有确认的 bug，接着修\n\n- **P1** F2 空列表会崩：越界\n\n<!-- claude-review-findings: %s -->\n<!-- claude-judge-fix: head=%s -->' "$1" "$1"; }
+m9_body() { # m9_body <head> [judged reviews]：不给第二个参数就是没记判过哪几条的旧 M9
+  printf '### 🤖 Claude 复核：还有确认的 bug，接着修\n\n- **P1** F2 空列表会崩：越界\n\n<!-- claude-review-findings: %s -->\n' "$1"
+  [ -z "${2:-}" ] || printf '<!-- claude-judge-fix-reviews: head=%s reviews=%s -->\n' "$1" "$2"
+  printf '<!-- claude-judge-fix: head=%s -->' "$1"
+}
 
-m9_event() { # m9_event <login> <assoc>
+m9_event() { # m9_event <login> <assoc> [judged reviews]
   export REVIEW_ID=5009 REVIEW_COMMIT="$H" REVIEW_LOGIN="${1:-melody}" REVIEW_ASSOC="${2:-OWNER}"
-  REVIEW_BODY="$(m9_body "$H")"; export REVIEW_BODY
-  serve_review 5009 "$(gh_review 5009 "${1:-melody}" "${2:-OWNER}" "$H" "$(m9_body "$H")")"
+  REVIEW_BODY="$(m9_body "$H" "${3:-}")"; export REVIEW_BODY
+  serve_review 5009 "$(gh_review 5009 "${1:-melody}" "${2:-OWNER}" "$H" "$REVIEW_BODY")"
 }
 
 @test "gate: past round 5, the judge's confirmed bugs get fix round 6 with only those bugs" {
@@ -279,19 +283,32 @@ m9_event() { # m9_event <login> <assoc>
   assert_contains "$(cat .review/findings.md)" '空列表会崩'
 }
 
-# judge 确认的 bug（M9）修完推上去，这个 head 上它核过的全部意见一起关：没确认的那些它判过
-# 不拦合并。不一起关的话，原来那几条 Codex review 的账一直开着，合并永远被拦。
-@test "gate: a round on the judge's confirmed bugs closes every findings review on that head once pushed" {
-  m9_event
+# judge 确认的 bug（M9）修完推上去，它核过的那几条 review 一起关：没确认的那些它判过不拦合并。
+# 不一起关的话，原来那几条 Codex review 的账一直开着，合并永远被拦。判完之后才到的（4002）
+# 没被核过，不关：它排着队的那一轮看到 head 变了还要记账（Codex 2026-10-08 的 P1）。
+@test "gate: a round on the judge's confirmed bugs closes only the reviews the judge saw once pushed" {
+  m9_event melody OWNER 4001
   live_head "$H"
   fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
   fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array \
     "$(gh_review 4001 "$CODEX" NONE "$H" 'body')" "$(gh_review 4002 "$CODEX" NONE "$H" 'body')" \
     "$(gh_review 3001 "$CODEX" NONE "$H2" 'older head')" \
-    "$(gh_review 5009 melody OWNER "$H" "$(m9_body "$H")")")"
+    "$(gh_review 5009 melody OWNER "$H" "$REVIEW_BODY")")"
   gate
   assert_equal "$(step_output run)" true
-  assert_equal "$(step_output closes)" 5009,4001,4002,5009
+  assert_equal "$(step_output closes)" 5009,4001
+}
+
+# 没记判过哪几条的旧 M9：不知道 judge 核过哪些，只关它自己，别的照旧开着。
+@test "gate: a confirmed-bug review without the judged list closes only itself" {
+  m9_event
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array \
+    "$(gh_review 4001 "$CODEX" NONE "$H" 'body')" "$(gh_review 5009 melody OWNER "$H" "$REVIEW_BODY")")"
+  gate
+  assert_equal "$(step_output run)" true
+  assert_equal "$(step_output closes)" 5009
 }
 
 @test "gate: confirmed bugs keep getting fixed through round 10" {

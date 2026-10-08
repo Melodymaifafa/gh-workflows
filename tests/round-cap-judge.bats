@@ -98,6 +98,8 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   assert_contains "$body" '- **P1** F2 空列表会崩：读了代码，空数组时访问越界'
   refute_contains "$body" '措辞'
   assert_contains "$body" "<!-- claude-review-findings: $H -->"
+  # 判过的是哪几条记在里面：修完推上去只关这几条（Codex 2026-10-08 的 P1）。
+  assert_contains "$body" "<!-- claude-judge-fix-reviews: head=$H reviews=901,902 -->"
   assert_equal "${body##*$'\n'}" "<!-- claude-judge-fix: head=$H -->"
   assert_called '"event":"COMMENT"' 1
   refute_called 'gh pr comment'

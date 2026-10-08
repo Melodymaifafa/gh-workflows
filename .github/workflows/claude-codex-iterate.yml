@@ -1715,11 +1715,16 @@ jobs:
               exit 1
             }
           fi
-          # 推上去之后关掉哪几条：这一轮的目标；judge 确认的 bug（M9）修完了，这个 head 上它核过的
-          # 全部意见也一起关（没确认的那些它判过不拦合并）。
+          # 推上去之后关掉哪几条：这一轮的目标；judge 确认的 bug（M9）修完了，它核过的那几条
+          # 也一起关（没确认的那些它判过不拦合并）。只认 M9 里记下的那几条，不重新列这个 head
+          # 上的全部意见：判完之后才到的 review 没被核过，跟着关掉的话，它排着队的那一轮看到
+          # head 变了也不再记账，意见就丢了（Codex 2026-10-08 的 P1）。没记的旧 M9 只关它自己。
           closes="$target"
           if [ "$confirmed" = true ]; then
-            closes="$closes,$(findings_review_ids "$H")"
+            judged="$(jq -r --arg h "$H" '(.body // "")
+              | [capture("<!-- claude-judge-fix-reviews: head=" + $h + " reviews=(?<ids>[0-9]+(,[0-9]+)*) -->").ids][0] // ""' \
+              <<<"$review")"
+            closes="$closes${judged:+,$judged}"
           fi
 
           {
@@ -4009,11 +4014,13 @@ jobs:
           # 只有审查方标了 P0 而 Claude 一条都不认的，不替人拿主意，照旧停车。
           # 「以后再做」的没记上 Linear 的（没配 key、接口出错、超过 5 条）也列在这条 review 里、
           # 注明本 PR 不用改：下一轮只看得到这条 review，不列就丢了（Codex 2026-10-06 的 P2）。
+          # 这次判过的是哪几条 review（REVIEWS）也写进去：修完推上去只关它们，判完之后才到的
+          # 意见没被核过，不能跟着关（Codex 2026-10-08 的 P1）。
           if [ -n "$blockers" ] && [ "$ROUND" -le "$MAX_CONFIRMED_FIX_ROUNDS" ]; then
             file_followups || echo '::warning::filing the follow-ups in Linear failed; the verdict is posted anyway'
             body="$(
               jq -r --arg head "$HEAD_SHA" --arg n "$done_rounds" --arg r "$ROUND" --arg cap "$MAX_CONFIRMED_FIX_ROUNDS" --arg why "$park_reason" \
-                --argjson filed "$filed" --argjson unfiled "$unfiled" "$sanitize$later_note"'
+                --arg reviews "$REVIEWS" --argjson filed "$filed" --argjson unfiled "$unfiled" "$sanitize$later_note"'
                 (if $why == "no-fix" then
                   "### 🤖 Claude 复核：修复这一轮判了不用改，但复核确认还有 bug，接着修\n\n"
                 else
@@ -4030,6 +4037,7 @@ jobs:
                         + ([$left[] | item + later_note] | join("\n"))
                     else "" end)
                 + "\n\n<!-- claude-review-findings: " + $head + " -->"
+                + "\n<!-- claude-judge-fix-reviews: head=" + $head + " reviews=" + $reviews + " -->"
                 + "\n<!-- claude-judge-fix: head=" + $head + " -->"
               ' <<<"$STRUCTURED_OUTPUT"
             )"
