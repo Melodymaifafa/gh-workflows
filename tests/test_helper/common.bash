@@ -635,6 +635,12 @@ gh_reaction() {
     }'
 }
 
+# no_running_fix <owner/repo> [branch]：合并前那一步要看这个 PR 上有没有修复在跑
+# （codex-approved-merge），默认一个都没有。分支名跟各测试 PR JSON 里的 head.ref 一致。
+no_running_fix() {
+  fake_route "repos/$1/actions/runs?event=pull_request_review&branch=${2:-topic}&per_page=100" '{"workflow_runs":[]}'
+}
+
 # json_array [obj ...]：没参数输出 []
 json_array() {
   if [ "$#" -eq 0 ]; then echo '[]'; return; fi

@@ -147,11 +147,12 @@ merge_setup() {
     jq -n --arg h "$H" --arg r "$1" '{
       state: "open", draft: false, title: "feat: x", merged: false,
       mergeable: true, mergeable_state: "clean",
-      base: {ref: "develop"}, head: {sha: $h, repo: {full_name: $r}}
+      base: {ref: "develop"}, head: {sha: $h, ref: "topic", repo: {full_name: $r}}
     }'
   )"
   fake_route "repos/$1/pulls/7/reviews?per_page=100" '[]'
   fake_route "repos/$1/issues/7/comments?per_page=100" '[]'
+  no_running_fix "$1"
   fake_route "repos/$1/issues/7/reactions?per_page=100" \
     "$(json_array "$(gh_reaction +1 "$CODEX" 2026-09-18T08:01:00Z)")"
   fake_cli pr_checks \
