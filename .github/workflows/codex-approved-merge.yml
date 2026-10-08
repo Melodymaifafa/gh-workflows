@@ -772,24 +772,29 @@ jobs:
             # 它们」就落了空，PR 一直卡着等人（Codex 2026-10-08 的 P2）。所以用主人的 PAT 在这个 head
             # 上补一条有意见的 review（M3 的形状，正文只点这几条的名）：iterate 照常开一轮，把它们附在
             # findings.md 后面一并交给修的人；推上去就关掉，判「不用改」由 judge 核过、点名关掉；
-            # 那一轮失败了，这条 review 就是 head 上的意见，巡检照常重修。每个 head 只补一次（看 H 上
-            # 有没有带 carried-reraise 标记的可信 review）：补过还拦着 = 那一轮没把它们关掉，再补只会
-            # 原地转圈。补过了、没有 PAT、标题带 [no-claude]（iterate 不接，补了只会悄悄卡住）、或者
-            # 发不出去，照旧告警停下等人。正文只有 review id 和 sha。
+            # 那一轮失败了，这条 review 就是 head 上的意见，巡检照常重修。同一批意见在每个 head 上只补
+            # 一次（看 H 上带 carried-reraise 标记的可信 review 点过哪些 review id）：补过还拦着 = 那一轮
+            # 没把它们关掉，再补只会原地转圈。但那一轮开修之后才记上账的意见不在它带上的那批里，judge
+            # 也不会替它们放行 —— 只按 head 算「补过」，它们就跟着停车、再没人修（Codex 2026-10-08 的
+            # P2）。所以开着的意见里有没点过名的，就再补一条。都点过了、没有 PAT、标题带 [no-claude]
+            # （iterate 不接，补了只会悄悄卡住）、或者发不出去，照旧告警停下等人。正文只有 review id 和 sha。
             reraised="$(
               gh api --paginate --slurp \
                 "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" |
-                jq -r --arg h "$expected_head" '
-                  (add // []) | any(.[];
-                    .commit_id == $h and
-                    (.user.login == "github-actions[bot]" or .author_association == "OWNER") and
-                    ((.body // "") | contains("<!-- pr-guard: carried-reraise head=" + $h + " -->")))'
+                jq -r --arg h "$expected_head" --arg open "$carried" '
+                  [(add // [])[]
+                    | select(.commit_id == $h and
+                        (.user.login == "github-actions[bot]" or .author_association == "OWNER"))
+                    | (.body // "")
+                    | scan("<!-- pr-guard: carried-reraise head=" + $h + " reviews=([0-9]+(,[0-9]+)*) -->")
+                    | .[0] | split(",")[]] as $asked
+                  | ($open | split(",")) - $asked | length == 0'
             )" || { echo "::error::Cannot read PR reviews"; exit 1; }
             if [ "$reraised" != true ] && [ -n "${CODEX_TRIGGER_TOKEN:-}" ] &&
               [[ "$title" != *'[no-claude]'* ]]
             then
-              printf -v reraise '🤖 这个提交审查通过了，但更早的 review %s 里还有没修完的意见（开修了没推上去，或者到的时候 PR 已经换了提交），没有下一轮修复会来带上它们，所以补这一条请自动修复开一轮：那几条意见附在后面，逐条对照当前代码，还没修好的修，已经改好了的跳过。\n\n<!-- claude-review-findings: %s -->\n<!-- pr-guard: carried-reraise head=%s -->' \
-                "$carried" "$expected_head" "$expected_head"
+              printf -v reraise '🤖 这个提交审查通过了，但更早的 review %s 里还有没修完的意见（开修了没推上去，或者到的时候 PR 已经换了提交），没有下一轮修复会来带上它们，所以补这一条请自动修复开一轮：那几条意见附在后面，逐条对照当前代码，还没修好的修，已经改好了的跳过。\n\n<!-- claude-review-findings: %s -->\n<!-- pr-guard: carried-reraise head=%s reviews=%s -->' \
+                "$carried" "$expected_head" "$expected_head" "$carried"
               if GH_TOKEN="$CODEX_TRIGGER_TOKEN" gh api -X POST "repos/$REPO/pulls/$PR_NUMBER/reviews" \
                 -f event=COMMENT -f "commit_id=$expected_head" -f "body=$reraise" --silent
               then

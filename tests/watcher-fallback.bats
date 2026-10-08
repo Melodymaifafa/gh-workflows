@@ -537,11 +537,11 @@ carried_comment() { # carried_comment <id> <login> <assoc> <review> [cleared]
 # Codex 2026-10-08 的 P2：新 head 审查通过了，就没有「下一轮修复」来带上开着的旧意见 ——
 # iterate 只在 head 上有意见时开修，巡检又把 carried-open 当停车，PR 一直卡着等人。
 # 所以有主人的 PAT 时，在这个 head 上补一条有意见的 review（M3 形状），iterate 照常开一轮。
-reraise_review() { # reraise_review <id>：合并检查补过的那条
+reraise_review() { # reraise_review <id> <reviews>：合并检查补过的那条，点了这几条的名
   gh_review "$1" Melodymaifafa OWNER "$H" "🤖 补一条请修复。
 
 <!-- claude-review-findings: $H -->
-<!-- pr-guard: carried-reraise head=$H -->"
+<!-- pr-guard: carried-reraise head=$H reviews=$2 -->"
 }
 
 @test "carried: with the owner PAT, a clean head held only by old findings asks iterate for a fix round" {
@@ -564,15 +564,15 @@ reraise_review() { # reraise_review <id>：合并检查补过的那条
   body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
   assert_contains "$body" '更早的 review 3001 里还有没修完的意见'
   assert_contains "$body" "<!-- claude-review-findings: $H -->"
-  assert_contains "$body" "<!-- pr-guard: carried-reraise head=$H -->"
+  assert_contains "$body" "<!-- pr-guard: carried-reraise head=$H reviews=3001 -->"
   assert_bodies_inert
 }
 
-# 每个 head 只补一次：补过的那一轮判完（M8 点了它的名）旧意见还开着，再补只会原地转圈。
+# 同一批意见在每个 head 上只补一次：补过的那一轮判完（M8 点了它的名）旧意见还开着，再补只会原地转圈。
 @test "carried: a head that already asked for a fix round parks with the alert instead of asking again" {
   export CODEX_TRIGGER_TOKEN=owner-pat
   path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 950)")"
-  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(reraise_review 950)")"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(reraise_review 950 3001)")"
   green_checks
   fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
     "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
@@ -584,6 +584,28 @@ reraise_review() { # reraise_review <id>：合并检查补过的那条
   body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
   assert_contains "$body" '已经请自动修复带上它们修过一轮，还是没关掉'
   assert_contains "$body" "<!-- pr-guard: alert head=$H reason=carried-open until=- -->"
+}
+
+# Codex 2026-10-08 的 P2：补过的那一轮开修之后才记上账的意见（3002）不在它带上的那批里，
+# judge 也只放行了那一批。只按 head 算「补过」，3002 就跟着停车、再没人修 —— 它得再补一条。
+@test "carried: a finding recorded after this head's fix round started gets its own fix round" {
+  export CODEX_TRIGGER_TOKEN=owner-pat
+  m8="$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 950,3001)")"
+  path_d "$m8"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(reraise_review 950 3001)")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)" \
+    "$(carried_comment 2 'github-actions[bot]' NONE 3002)" "$m8")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called 'gh pr merge'
+  refute_called 'curl'
+  refute_called 'reason=carried-open'
+  assert_called 'gh api POST repos/o/r/pulls/7/reviews' 1
+  body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
+  assert_contains "$body" '更早的 review 3002 里还有没修完的意见'
+  assert_contains "$body" "<!-- pr-guard: carried-reraise head=$H reviews=3002 -->"
 }
 
 # iterate 不接 [no-claude] 的 PR：补了那条 review 也没人修，它还会拦着合并、悄悄卡住。
