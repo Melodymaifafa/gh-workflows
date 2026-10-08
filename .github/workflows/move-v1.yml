@@ -1,0 +1,59 @@
+# 每天把 v1 标签移到 develop 上 CI 全绿的最新提交（规则和理由见 scripts/move-v1.sh）。
+# 各仓库钉的是 @v1，所以这一步就是「发布」。移了推一条手机通知（带回滚办法），不再逐次问人。
+name: Move v1
+
+on:
+  # 每天 01:47 UTC（北京时间 09:47）。不卡整点：整点全球排队，GitHub 会往后拖更久。
+  schedule:
+    - cron: '47 1 * * *'
+  # 手动：仓库 → Actions → Move v1 → Run workflow。to 填旧的 sha 就是回滚。
+  workflow_dispatch:
+    inputs:
+      to:
+        description: 移到哪个提交（留空 = develop 上 CI 全绿的最新一个；填旧的 sha = 回滚）
+        type: string
+        default: ''
+      dry_run:
+        description: 只看会怎么移，不真的移
+        type: boolean
+        default: false
+
+# 读 CI 结果、比较提交用 job 自带的令牌；改标签用 SELF_WORKFLOWS_TOKEN（见脚本）。
+# actions: write 只用来给自己的定时任务保活。
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: move-v1
+  cancel-in-progress: false
+
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # 公开仓库 60 天没提交，定时 workflow 会被自动停用；每轮都显式启用一次。
+      - name: Keep the schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/$REPO/actions/workflows/move-v1.yml/enable" --silent ||
+            echo "::warning::保活调用失败"
+
+      - name: Move v1 to the newest green develop commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WRITE_TOKEN: ${{ secrets.SELF_WORKFLOWS_TOKEN }}
+          TO: ${{ inputs.to }}
+          DRY_RUN: ${{ inputs.dry_run == true }}
+          UNATTENDED: ${{ github.event_name == 'schedule' }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+        run: ./scripts/move-v1.sh

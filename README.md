@@ -23,6 +23,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 | 先等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop） |
 | `pr-sweeper.yml` | 定时（cron 写每 15 分钟，实测 2–7 小时一次；只在本仓库跑） | 扫 owner 名下所有仓库，集成分支取各仓库调用桩的 `base_branch`；给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
 | `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
+| `move-v1.yml` | 每天 09:47（北京时间），也可手动点（只在本仓库跑） | 把 `v1` 标签移到 develop 上 CI 全绿的最新提交 —— 各仓库钉的是 `@v1`，这一步就是发布。移了推一条手机通知（带了哪些 PR、怎么回滚）；只往前挪 |
 
 ## 审核：Codex 优先，Claude 兜底（2026-09-18）
 
@@ -144,7 +145,7 @@ jobs:
 
 **Codex 接手不跑在 runner 上，也不要 OpenAI 的 API key（2026-10-02）。** 流水线用主人的 PAT 在 PR 上留一句写死的话（`@codex fix … paste the complete change as one unified diff …`），等 `chatgpt-codex-connector[bot]` 回复，取出回复里**恰好一个** diff 代码块、`git apply` 打到工作区，之后的验证 / 推送 / 召唤复审原样复用。Codex 走的是主人自己的 ChatGPT 订阅，所以**每个仓库都要在 [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments) 建一个环境**（默认设置即可），没建它只回一句「先建环境」。下面任一情况这一轮红着停下、发一次告警、什么都不推（巡检之后会再叫 Claude）：15 分钟没回（`codex-no-patch`）、回的是「先建环境」（`codex-no-env`）、额度 / 限流提示、没有 diff 块、贴了两段、回复被截断、补丁打不上或碰到 `.github/workflows/`（`codex-patch-rejected`）。**只有 Codex 自己写的 review 走这条路**：Claude 代审写的意见里没有「your review」的指代对象，那种轮次直接红（`codex-no-review`）。
 
-`claude-codex-iterate.yml` 和 `codex-approved-merge.yml` 都收 `claude_model`（默认 `claude-opus-5-5`）和 `claude_effort`（默认 `xhigh`）。**默认值永远钉死，永远是 Opus 及以上**：不钉，action 就用 Claude Code 的账号默认模型 —— 2026-09 之前那是 Sonnet，静静跑了几周没人发现（PR #17 两轮修复都是它做的）。只认明确写出的 Opus 及以上（`opus` / `fable` 别名或 `claude-opus-*` 这类 id）；Sonnet、Haiku、`default`、`opusplan` 整轮直接红。Opus 5.5 自带的思考力度是 medium，所以钉 xhigh。每条 Claude 总结评论末尾写出实际跑的模型名（从 SDK 执行记录里读，不是配置里抄的）—— 哪天默认值悄悄变了，PR 上一眼看得到。换新模型：改这两个默认值 → 合入 → 移 `v1` 标签。
+`claude-codex-iterate.yml` 和 `codex-approved-merge.yml` 都收 `claude_model`（默认 `claude-opus-5-5`）和 `claude_effort`（默认 `xhigh`）。**默认值永远钉死，永远是 Opus 及以上**：不钉，action 就用 Claude Code 的账号默认模型 —— 2026-09 之前那是 Sonnet，静静跑了几周没人发现（PR #17 两轮修复都是它做的）。只认明确写出的 Opus 及以上（`opus` / `fable` 别名或 `claude-opus-*` 这类 id）；Sonnet、Haiku、`default`、`opusplan` 整轮直接红。Opus 5.5 自带的思考力度是 medium，所以钉 xhigh。每条 Claude 总结评论末尾写出实际跑的模型名（从 SDK 执行记录里读，不是配置里抄的）—— 哪天默认值悄悄变了，PR 上一眼看得到。换新模型：改这两个默认值 → 合入，第二天 `v1` 自动跟上（急的话手动点 Move v1）。
 
 `claude-codex-iterate.yml` 还收一个 `verify_writable_paths`：允许验证命令重写哪些被跟踪的文件，一行一个、精确路径、**默认一个都不许**。**两条路都归它管**（Claude 那条从 MEL-254 起也走同一个验证步骤）：验证命令来自被审的那个 PR，它跑完还要补一次 `git add -u`（否则推出去的是一棵没验过的树），于是它改过的被跟踪文件会跟着修复一起提交推送 —— 外部 PR 借此就能把复审机器人从没产出过的改动发布进仓库。验证会重新生成 lock 文件的仓库（`python` 的 `uv sync --dev` 重写 `uv.lock`、`node` 的 `npm ci` 重写 `package-lock.json`）**必须在调用桩里列出来**，否则那一轮红着停下，错误信息里就是被改的路径。这份清单只从调用方默认分支上的工作流文件读，被审 PR 改不到它 —— 改成从 PR 内容里读，白名单就等于攻击者自己签发的通行证。
 
@@ -181,11 +182,11 @@ jobs:
 
 调用桩放在 `.github/workflows/self-*.yml`。**必须换个文件名** —— 定义文件已经占了 `ci.yml` 那四个名字，同名会把定义覆盖掉（试过一次，当场翻车）。
 
-**自动合入是安全的，因为各仓库钉的是 `@v1`。** 合进 develop / main 不改变任何仓库的行为，只有手动移 `v1` 标签才生效 —— 那一步就是真正的闸门，而它一直在人手里。
+**自动合入是安全的，因为各仓库钉的是 `@v1`。** 合进 develop / main 不改变任何仓库的行为，`v1` 动了才生效。`v1` 每天自动移到 develop 上 CI 全绿的最新提交（`move-v1.yml`，2026-10-08 起；以前每个 PR 合完都要问人一次，问多了就有人忘，MEL-290 那次 19 个仓库照旧踩着修好的 bug）。合并前的闸门是 CI + Codex 审查；坏了一条命令回滚，见下面「版本」。
 
 ## 有新 Opus 了提醒一声（2026-10-04）
 
-`opus-model-probe.yml` 每周一 09:17 跑一次（也可手动点）：查一次模型列表，挑出最新的 `claude-opus-*`，跟上面那两个 workflow 的 `claude_model` 默认值比。不一样推一条 Pushover，一样什么都不发。**只提醒，不自动改默认值** —— 改默认要改一行 + 合 PR + 移 `v1`，那一步是闸门，留在人手里。
+`opus-model-probe.yml` 每周一 09:17 跑一次（也可手动点）：查一次模型列表，挑出最新的 `claude-opus-*`，跟上面那两个 workflow 的 `claude_model` 默认值比。不一样推一条 Pushover，一样什么都不发。**只提醒，不自动改默认值** —— 换哪个模型由人定：改一行 + 合 PR，第二天 `v1` 自动跟上。
 
 **别拿别名 `opus` 当「最新」**：别名跟的是 Claude Code 的版本，不是模型发布。2026-10-04 在 Claude Code 2.1.266 上实测 `claude -p --model opus --output-format json`，回报的是 `claude-opus-5`，而当天最新的 Opus 已经是 `claude-opus-5-5`（2026-09-21 发布）—— 落后整整一代。所以探测走 `GET /v1/models`：只读、带发布时间、一次 HTTP 就够，不烧推理额度（令牌用现成的 `CLAUDE_CODE_OAUTH_TOKEN`，OAuth 令牌走 `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`，不是 `x-api-key`）。
 
@@ -193,13 +194,9 @@ jobs:
 
 ## 版本
 
-各仓库的调用桩固定引用 `@v1`。改完这里的逻辑后要移动 tag 才会生效：
+各仓库的调用桩固定引用 `@v1`。`v1` 每天 09:47（北京时间）由 `move-v1.yml` 自动移到 develop 上 CI 全绿的最新提交，只往前挪；有人手动把它挪到了别处，自动这一步就不动、推通知等人看。agent 不用再问「要不要移 v1」。
 
-```
-git tag -f v1 && git push -f origin v1
-```
-
-回退到 Claude 兜底之前的版本：`git tag -f v1 34645cf && git push -f origin v1`。
+急着发、或者要回滚：Actions → **Move v1** → Run workflow。`to` 留空 = 现在就移到最新的绿提交；填一个旧的 sha = 回滚（必须在 develop 这条线上）。手边只有命令行时：`git tag -f v1 <sha> && git push -f origin v1`。
 
 ## 踩过的坑
 

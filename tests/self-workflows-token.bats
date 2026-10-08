@@ -224,9 +224,18 @@ Commit and push the Codex fix'
 
 @test "scope: no other workflow or caller stub mentions it" {
   for wf in "$REPO_ROOT"/.github/workflows/*.yml "$REPO_ROOT"/stubs/*.yml; do
-    case "${wf##*/}" in claude-codex-iterate.yml | codex-approved-merge.yml) continue ;; esac
+    case "${wf##*/}" in claude-codex-iterate.yml | codex-approved-merge.yml | move-v1.yml) continue ;; esac
     refute_contains "$(cat "$wf")" 'SELF_WORKFLOWS_TOKEN'
   done
+}
+
+# 每天移 v1 那一步也要它：普通令牌改不了指向含 workflow 改动的提交的标签。它能拿，是因为
+# 那个 workflow 只由定时和手动触发、只 checkout 默认分支 —— 没有任何 PR 的代码会在那里跑。
+# 谁给它加上 pull_request / issue_comment 之类的触发，这条就红。
+@test "scope: the daily v1 move only ever runs on a schedule or by hand" {
+  triggers="$(awk '/^on:/ { f = 1; next } f && /^[a-z]/ { exit } f && /^  [a-z_]+:/ { sub(/:.*/, ""); sub(/^  /, ""); print }' \
+    "$REPO_ROOT/.github/workflows/move-v1.yml" | sort | tr '\n' ' ')"
+  assert_equal "$triggers" 'schedule workflow_dispatch '
 }
 
 # 进了这三个文件，密钥就会被刷到所有接了流水线的仓库 —— 而它能改大家共用的流水线。
