@@ -35,12 +35,15 @@ trouble() {
   return 0
 }
 
+# ahead / identical = 这个提交在 develop 这条线上（develop 就是它，或者在它后面）。
+develop_status() { gh api "repos/$REPO/compare/$1...develop" --jq .status; }
+
 current="$(gh api "repos/$REPO/git/ref/tags/v1" --jq '.object.sha')"
 
 if [ -n "${TO:-}" ]; then
   goal="$(gh api "repos/$REPO/commits/$TO" --jq .sha)"
   # 回滚也只认 develop 这条线上的提交：别的分支上的提交没人审过。
-  on_develop="$(gh api "repos/$REPO/compare/$goal...develop" --jq .status)"
+  on_develop="$(develop_status "$goal")"
   case "$on_develop" in
     ahead | identical) ;;
     *) trouble "指定的提交不在 develop 上" "\`${goal:0:7}\` 不在 develop 这条线上（${on_develop}），没有动。"; exit 1 ;;
@@ -59,6 +62,19 @@ fi
 if [ "$goal" = "$current" ]; then
   say "v1 已经在 \`${goal:0:7}\`，不用动。"
   exit 0
+fi
+
+# develop 被强推过、新的 CI 还没跑完或是红的时候，上面那条绿记录指的可能是已经不在 develop 上的
+# 旧提交。移过去就把 v1 带离了 develop 这条线，之后每天都会报「不在这条线后面」。
+if [ -z "${TO:-}" ]; then
+  on_develop="$(develop_status "$goal")"
+  case "$on_develop" in
+    ahead | identical) ;;
+    *)
+      trouble "最新的绿提交已经不在 develop 上" "\`${goal:0:7}\` 相对 develop 是 ${on_develop}（develop 可能被强推过），这一轮没有动，v1 还在 \`${current:0:7}\`。"
+      exit 0
+      ;;
+  esac
 fi
 
 cmp="$(gh api "repos/$REPO/compare/$current...$goal")"

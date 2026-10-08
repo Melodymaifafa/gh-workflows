@@ -35,6 +35,19 @@ jobs:
     env:
       REPO: ${{ github.repository }}
     steps:
+      # 手动跑时 GitHub 让人选分支，跑的是那个分支上的这份 workflow 和脚本；而改标签的令牌能改
+      # 所有仓库共用的流水线。没合进默认分支的版本没人审过，不许它走到拿令牌那一步。定时跑
+      # 永远在默认分支上。（连这份文件一起改了的分支删得掉这一步 —— 但能推分支的人本来就能在
+      # 任何 workflow 里读仓库密钥；这一步挡的是只改了脚本、或者手滑选错分支。）
+      - name: Only run the version on the default branch
+        if: github.event_name == 'workflow_dispatch' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          RUN_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          echo "::error::Move v1 只能在默认分支 $DEFAULT_BRANCH 上跑，这次选的是 $RUN_REF，没有动。"
+          exit 1
+
       - uses: actions/checkout@v5
         with:
           persist-credentials: false

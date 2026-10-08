@@ -230,7 +230,8 @@ Commit and push the Codex fix'
 }
 
 # 每天移 v1 那一步也要它：普通令牌改不了指向含 workflow 改动的提交的标签。它能拿，是因为
-# 那个 workflow 只由定时和手动触发、只 checkout 默认分支 —— 没有任何 PR 的代码会在那里跑。
+# 那个 workflow 只由定时和手动触发，手动选了别的分支第一步就停（move-v1.bats 守着）—— 没有任何
+# PR 的代码会在那里跑。
 # 谁给它加上 pull_request / issue_comment 之类的触发，这条就红。
 @test "scope: the daily v1 move only ever runs on a schedule or by hand" {
   triggers="$(awk '/^on:/ { f = 1; next } f && /^[a-z]/ { exit } f && /^  [a-z_]+:/ { sub(/:.*/, ""); sub(/^  /, ""); print }' \

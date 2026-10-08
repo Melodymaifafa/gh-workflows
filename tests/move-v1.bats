@@ -17,6 +17,7 @@ setup() {
   export PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
   fake_route repos/o/r/git/ref/tags/v1 "{\"object\":{\"sha\":\"$V1\"}}"
   fake_route "$GREEN" "{\"workflow_runs\":[{\"head_sha\":\"$G\"}]}"
+  fake_route "repos/o/r/compare/$G...develop" '{"status":"identical"}'
   compare "$V1" "$G" ahead 'feat: one (#58)' 'fix: two (#60)'
 }
 
@@ -65,6 +66,19 @@ move() { run "$REPO_ROOT/$MOVE"; }
     refute_called 'PATCH'
     assert_called 'curl ' 1
     assert_contains "$(fake_last_body 'curl ')" "相对它是 $s"
+  done
+}
+
+# develop 被强推过、新 CI 还没绿：最新那条绿记录指的旧提交已经不在 develop 上，哪怕它在 v1 前面也不跟。
+@test "a green commit that has fallen off develop is left alone and reported" {
+  for s in diverged behind; do
+    : >"$FAKE_LOG"
+    fake_route "repos/o/r/compare/$G...develop" "{\"status\":\"$s\"}"
+    move
+    assert_equal "$status" 0
+    refute_called 'PATCH'
+    assert_called 'curl ' 1
+    assert_contains "$(fake_last_body 'curl ')" "相对 develop 是 $s"
   done
 }
 
@@ -121,4 +135,18 @@ move() { run "$REPO_ROOT/$MOVE"; }
   assert_contains "$wf" "- cron: '47 1 * * *'"
   assert_equal "$(step_env_keys .github/workflows/move-v1.yml 'Keep the schedule alive' | grep -c WRITE_TOKEN)" 0
   assert_contains "$(step_env_keys .github/workflows/move-v1.yml 'Move v1 to the newest green develop commit')" WRITE_TOKEN
+}
+
+# 手动跑时选了别的分支：那边的 workflow / 脚本没人审过，走不到拿令牌那一步。
+@test "workflow: a manual run from another branch stops before the write token is handed out" {
+  wf="$REPO_ROOT/.github/workflows/move-v1.yml"
+  guard='Only run the version on the default branch'
+  # 第一步就是它（在 checkout 之前），只拦手动跑、只放默认分支
+  assert_equal "$(grep -m1 '^      - ' "$wf")" "      - name: $guard"
+  assert_contains "$(cat "$wf")" "if: github.event_name == 'workflow_dispatch' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch)"
+  refute_contains "$(step_env_keys "$wf" "$guard")" WRITE_TOKEN
+  export RUN_REF=refs/heads/topic DEFAULT_BRANCH=main
+  run run_step "$wf" "$guard"
+  assert_equal "$status" 1
+  assert_contains "$output" '只能在默认分支 main 上跑，这次选的是 refs/heads/topic'
 }
