@@ -154,11 +154,13 @@ gate_env() {
 #   clean   两边改的是不同的文件
 #   delete  develop 删了 app.txt，topic 改了它
 #   many    16 个文件两边都改了同一行
+#   heading 同 text，但 app.txt 开头有个 Markdown 标题，下划线正好是 7 个等号
 conflict_repo() {
-  local kind="$1" seed="$BATS_TEST_TMPDIR/seed" i
+  local kind="$1" seed="$BATS_TEST_TMPDIR/seed" i top=''
+  [ "$kind" != heading ] || top=$'Title\n=======\n'
   "$REAL_GIT" init -q -b develop "$seed"
   g() { "$REAL_GIT" -C "$seed" -c user.email=t@e -c user.name=t "$@"; }
-  printf 'one\ntwo\nthree\n' >"$seed/app.txt"
+  printf '%sone\ntwo\nthree\n' "$top" >"$seed/app.txt"
   printf 'notes\n' >"$seed/notes.md"
   for i in $(seq 1 16); do printf 'v\n' >"$seed/f$i.txt"; done
   g add -A
@@ -167,14 +169,14 @@ conflict_repo() {
   case "$kind" in
     clean) printf 'notes from topic\n' >"$seed/notes.md" ;;
     many) for i in $(seq 1 16); do printf 'topic\n' >"$seed/f$i.txt"; done ;;
-    *) printf 'one\ntwo from topic\nthree\n' >"$seed/app.txt" ;;
+    *) printf '%sone\ntwo from topic\nthree\n' "$top" >"$seed/app.txt" ;;
   esac
   g commit -q -am 'feat: topic change'
   g checkout -q develop
   case "$kind" in
     delete) g rm -q app.txt ;;
     many) for i in $(seq 1 16); do printf 'develop\n' >"$seed/f$i.txt"; done ;;
-    *) printf 'one\ntwo from develop\nthree\n' >"$seed/app.txt" ;;
+    *) printf '%sone\ntwo from develop\nthree\n' "$top" >"$seed/app.txt" ;;
   esac
   g commit -q -am 'fix: develop change'
   "$REAL_GIT" clone -q --bare "$seed" "$BATS_TEST_TMPDIR/origin.git"
@@ -219,8 +221,9 @@ claude_resolves() {
   assert_equal "$(cat .conflict/pr-log.md)" '- feat: topic change'
   # PR 正文里的 HTML 注释给 Claude 之前就去掉。
   assert_equal "$(cat .conflict/pr.md)" "# feat: x"$'\n\n'"why  this"
-  # 后面几步认的清单不在 Claude 改得到的地方。
+  # 后面几步认的清单和 git 留下的原样不在 Claude 改得到的地方。
   [ -s "$RUNNER_TEMP/conflicted.z" ]
+  cmp -s "$RUNNER_TEMP/conflicted/1" pr/app.txt
   assert_equal "$(origin_topic)" "$HEAD_SHA"
 }
 
@@ -310,6 +313,68 @@ claude_resolves() {
   assert_equal "$(step_output stuck)" markers-left
   assert_contains "$(step_output detail)" app.txt
   assert_equal "$(pr_git rev-parse HEAD)" "$HEAD_SHA"
+}
+
+@test "check: a leftover ======= separator throws the result away; a heading underline already there does not" {
+  conflict_repo text
+  merge_step
+  claude_resolves
+  printf 'one\ntwo from topic\n=======\ntwo from develop\nthree\n' >pr/app.txt
+  run run_step "$WF" "$CHECK"
+  assert_equal "$status" 0
+  assert_equal "$(step_output stuck)" markers-left
+  assert_equal "$(pr_git rev-parse HEAD)" "$HEAD_SHA"
+
+  rm -rf "$BATS_TEST_TMPDIR/seed" "$BATS_TEST_TMPDIR/origin.git" "$BATS_TEST_TMPDIR/ws"
+  : >"$GITHUB_OUTPUT"
+  conflict_repo heading
+  merge_step
+  claude_resolves
+  printf 'Title\n=======\none\ntwo from topic\n=======\ntwo from develop\nthree\n' >pr/app.txt
+  run run_step "$WF" "$CHECK"
+  assert_equal "$(step_output stuck)" markers-left
+  assert_equal "$(pr_git rev-parse HEAD)" "$HEAD_SHA"
+
+  : >"$GITHUB_OUTPUT"
+  printf 'Title\n=======\none\ntwo from topic and develop\nthree\n' >pr/app.txt
+  run run_step "$WF" "$CHECK"
+  assert_equal "$status" 0
+  assert_equal "$(step_output ready)" true
+  assert_equal "$(pr_git show HEAD:app.txt)" $'Title\n=======\none\ntwo from topic and develop\nthree'
+}
+
+# 冲突段落以外的行：改了、删了、跟新内容粘成一行，都算动过。
+@test "check: a touched line outside the conflict hunks throws the result away" {
+  local now
+  for now in 'one, edited\ntwo from topic and develop\nthree\n' 'one\ntwo from topic and develop\n' \
+    'one\ntwo from topic and developthree\n' 'one\ntwo from topic and develop\nthree\nfour\n'; do
+    rm -rf "$BATS_TEST_TMPDIR/seed" "$BATS_TEST_TMPDIR/origin.git" "$BATS_TEST_TMPDIR/ws"
+    : >"$GITHUB_OUTPUT"
+    conflict_repo text
+    merge_step
+    claude_resolves
+    printf '%b' "$now" >pr/app.txt
+    run run_step "$WF" "$CHECK"
+    assert_equal "$status" 0
+    assert_equal "$(step_output stuck)" touched-outside
+    assert_contains "$(step_output detail)" app.txt
+    assert_equal "$(pr_git rev-parse HEAD)" "$HEAD_SHA"
+  done
+}
+
+@test "check: a hunk may become several lines, or none, as long as everything around it stays" {
+  local now
+  for now in 'one\ntwo from topic\ntwo from develop\nthree\n' 'one\nthree\n'; do
+    rm -rf "$BATS_TEST_TMPDIR/seed" "$BATS_TEST_TMPDIR/origin.git" "$BATS_TEST_TMPDIR/ws"
+    : >"$GITHUB_OUTPUT"
+    conflict_repo text
+    merge_step
+    claude_resolves
+    printf '%b' "$now" >pr/app.txt
+    run run_step "$WF" "$CHECK"
+    assert_equal "$status" 0
+    assert_equal "$(step_output ready)" true
+  done
 }
 
 @test "check: any change outside the conflicted files throws the result away" {
@@ -513,6 +578,7 @@ stuck_env() { # stuck_env <reason> [detail]
     'unsupported|app.txt|没法逐段合（一边删了或改了名、二进制文件或链接）：app.txt。' \
     'too-many|16|有 16 个文件冲突，超过一次自动解的上限（15 个）。' \
     'markers-left|app.txt|还留着冲突标记：app.txt。' \
+    'touched-outside|app.txt|Claude 改了冲突段落以外的行（app.txt）' \
     'touched-other|notes.md|Claude 改了冲突以外的文件（notes.md）' \
     'git-tampered||git 配置被改过' \
     'claude-failed||Claude 这次没跑成' \

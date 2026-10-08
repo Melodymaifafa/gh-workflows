@@ -1450,7 +1450,7 @@ jobs:
           [ -z "$odd" ] || stuck unsupported "$odd"
 
           # 给 Claude 的材料，全是不可信数据。放在根目录：Claude 只改得动 pr/ 下的文件。
-          mkdir -p .conflict/diffs
+          mkdir -p .conflict/diffs "$RUNNER_TEMP/conflicted"
           : >.conflict/files.txt
           i=0
           for f in "${files[@]}"; do
@@ -1458,13 +1458,15 @@ jobs:
             printf '%s\t%s\n' "$i" "$f" >>.conflict/files.txt
             sealed_git diff "$merge_base" "$base" -- "$f" >".conflict/diffs/$i.base.diff"
             sealed_git diff "$merge_base" "$HEAD_SHA" -- "$f" >".conflict/diffs/$i.pr.diff"
+            # git 合完留下的原样（带冲突标记），检查那一步拿它比对冲突段落以外有没有被动过。
+            cp -- "pr/$f" "$RUNNER_TEMP/conflicted/$i"
           done
           sealed_git log -n 30 --format='- %s' "$merge_base..$base" >.conflict/base-log.md
           sealed_git log -n 30 --format='- %s' "$merge_base..$HEAD_SHA" >.conflict/pr-log.md
           gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '"# " + (.title // "") + "\n\n" + (.body // "")' |
             perl -0pe 's/<!--.*?-->//gs; s/<!--.*//s' >.conflict/pr.md
 
-          # 后面几步认的清单放在 Claude 读不到也改不了的地方。
+          # 后面几步认的清单和上面那份原样都放在 Claude 读不到也改不了的地方。
           printf '%s\0' "${files[@]}" >"$RUNNER_TEMP/conflicted.z"
           {
             echo "conflicted=${#files[@]}"
@@ -1549,7 +1551,8 @@ jobs:
 
             规则：
             1. 两边的意图都要保住：两边加的东西不一样就都留下、按合理的顺序排；一边是另一边的扩展就留扩展后的。
-            2. 只改冲突标记之间的内容，并删掉标记本身。标记以外的行不要动，清单以外的文件不要碰。
+            2. 只改冲突标记之间的内容，并删掉标记本身。标记以外的行不要动，清单以外的文件不要碰
+               （改完会逐行核对，动了就整轮作废；非得改段落以外才合得对，就按第 3 条 give_up）。
             3. 两边真的矛盾时（同一个值改成了不同的值、一边删了另一边正在改的东西、两种写法只能留一种
                而且看不出哪个对），不要猜：verdict 写 give_up，summary_zh 用一两句大白话说清哪个文件、哪里矛盾。
             4. 你没有跑命令的工具，也不需要：推上去以后 CI 会跑测试，Codex 会再审一遍。
@@ -1609,13 +1612,53 @@ jobs:
 
           files=()
           while IFS= read -r -d '' f; do files+=("$f"); done <"$RUNNER_TEMP/conflicted.z"
+          # 分隔线 ======= 在 Markdown、reST 里也可能是正文（标题下划线）：git 留下的原样里每段冲突
+          # 自带一条，结果里的比原样减掉这些还多，才算没删干净。
+          count() { grep -cE -- "$1" "$2" || true; }
           left=''
+          i=0
           for f in "${files[@]}"; do
+            i=$((i + 1))
             if [ ! -f "pr/$f" ] || grep -qE '^(<<<<<<<|\|\|\|\|\|\|\||>>>>>>>)( |$)' "pr/$f"; then
               left+="$f"$'\n'
+              continue
             fi
+            was="$RUNNER_TEMP/conflicted/$i"
+            seps_now="$(count '^=======[[:space:]]*$' "pr/$f")"
+            seps_was="$(count '^=======[[:space:]]*$' "$was")"
+            hunks="$(count '^<<<<<<< ' "$was")"
+            [ "$seps_now" -le "$((seps_was - hunks))" ] || left+="$f"$'\n'
           done
           [ -z "$left" ] || stuck markers-left "$left"
+
+          # 冲突段落以外一行都不许动：把 git 留下的原样按冲突段落切开，段落以外的那几截得原样、
+          # 按顺序留在结果里，每段冲突只能换成整行的新内容。
+          # shellcheck disable=SC2016  # perl 程序
+          kept_outside='
+            sub slurp { open my $fh, "<", $_[0] or die "$_[0]: $!\n"; local $/; scalar <$fh> }
+            my ($was, $now) = map { slurp($_) } @ARGV;
+            my @keep = split /^<<<<<<< [^\n]*\n.*?^>>>>>>> [^\n]*(?:\n|\z)/ms, $was, -1;
+            my ($first, $last) = (shift @keep, pop @keep);
+            exit 1 unless defined $last && substr($now, 0, length $first) eq $first;
+            my $pos = length $first;
+            # 中间几截各取行首最早出现的位置：给后面留的余地最大，有解就找得到。
+            for my $part (@keep) {
+              my $at = $pos;
+              $at++ while ($at = index($now, $part, $at)) > $pos && substr($now, $at - 1, 1) ne "\n";
+              exit 1 if $at < 0;
+              $pos = $at + length $part;
+            }
+            my $at = length($now) - length($last);
+            exit 1 if $at < $pos || substr($now, $at) ne $last
+              || ($last ne "" && $at > $pos && substr($now, $at - 1, 1) ne "\n");
+          '
+          outside=''
+          i=0
+          for f in "${files[@]}"; do
+            i=$((i + 1))
+            perl -e "$kept_outside" "$RUNNER_TEMP/conflicted/$i" "pr/$f" || outside+="$f"$'\n'
+          done
+          [ -z "$outside" ] || stuck touched-outside "$outside"
 
           sealed_git add -- "${files[@]}"
           # 清单以外的文件一个都不许动：冲突段落以外的改动没人审过怎么合。
@@ -1705,6 +1748,7 @@ jobs:
               unsupported)    why="这几个文件没法逐段合（一边删了或改了名、二进制文件或链接）：${detail}。" ;;
               claude-gave-up) why="Claude 判断两边的改动互相矛盾，要人来定：${reason}" ;;
               markers-left)   why="Claude 改完以后这几个文件里还留着冲突标记：${detail}。" ;;
+              touched-outside) why="Claude 改了冲突段落以外的行（${detail}），这次的结果作废。" ;;
               touched-other)  why="Claude 改了冲突以外的文件（${detail}），这次的结果作废。" ;;
               git-tampered)   why="解冲突的过程中仓库的 git 配置被改过，这次的结果作废。" ;;
               claude-failed)  why="Claude 这次没跑成（额度用完、令牌失效都会这样），日志：$run_url 。" ;;
