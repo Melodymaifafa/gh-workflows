@@ -64,6 +64,17 @@ gate_env() {
   assert_equal "$(step_output run)" true
   assert_equal "$(step_output head)" "$H"
   assert_equal "$(step_output ref)" topic
+  assert_equal "$(step_output no_claude)" false
+}
+
+@test "gate: a [no-claude] title still proceeds, flagged so Claude never touches it" {
+  gate_env
+  export WATCH_CONFLICT=true WATCH_HEAD="$H" COMMENT_BODY=''
+  fake_route repos/o/r/pulls/7 "$(pr_json "$H" dirty '[no-claude] feat: x')"
+  run run_step "$WF" "$GATE"
+  assert_equal "$status" 0
+  assert_equal "$(step_output run)" true
+  assert_equal "$(step_output no_claude)" true
 }
 
 @test "gate: the merge watcher hands a conflicted head over directly" {
@@ -236,6 +247,26 @@ claude_resolves() {
   assert_equal "$status" 0
   assert_equal "$(step_output ready)" true
   [ ! -e "$BATS_TEST_TMPDIR/hook-ran" ]
+}
+
+@test "merge: a [no-claude] PR still gets a clean merge; no Claude is needed for that" {
+  conflict_repo clean
+  export NO_CLAUDE=true
+  run run_step "$WF" "$MERGE"
+  assert_equal "$status" 0
+  assert_equal "$(step_output ready)" true
+  refute_output_key stuck
+}
+
+@test "merge: a [no-claude] text conflict is never laid out for Claude" {
+  conflict_repo text
+  export NO_CLAUDE=true
+  run run_step "$WF" "$MERGE"
+  assert_equal "$status" 0
+  assert_equal "$(step_output stuck)" no-claude
+  refute_output_key conflicted
+  [ ! -e .conflict ]
+  assert_equal "$(origin_topic)" "$HEAD_SHA"
 }
 
 @test "merge: a file deleted on one side goes to a person, not to Claude" {
@@ -478,6 +509,7 @@ stuck_env() { # stuck_env <reason> [detail]
 @test "hand over: every reason gets a plain message, Pushover first, then the marker" {
   local spec reason detail want
   for spec in \
+    'no-claude||标题带 [no-claude]，不让 Claude 改这个 PR。' \
     'unsupported|app.txt|没法逐段合（一边删了或改了名、二进制文件或链接）：app.txt。' \
     'too-many|16|有 16 个文件冲突，超过一次自动解的上限（15 个）。' \
     'markers-left|app.txt|还留着冲突标记：app.txt。' \

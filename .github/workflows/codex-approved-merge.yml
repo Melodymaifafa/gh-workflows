@@ -1355,10 +1355,15 @@ jobs:
             exit 0
           fi
 
+          # 标题带 [no-claude]（同 claude-codex-iterate.yml 的逃生阀）：git 自己合得上照样推，
+          # 要 Claude 改的冲突交给人。
+          no_claude=false
+          [[ "$(jq -r .title <<<"$pr")" != *'[no-claude]'* ]] || no_claude=true
           {
             echo run=true
             echo "head=$want"
             echo "ref=$(jq -r .head.ref <<<"$pr")"
+            echo "no_claude=$no_claude"
           } >>"$GITHUB_OUTPUT"
 
       # 根目录是 base 分支（受信任）：Claude 从这里启动，读不到 PR 自带的 .claude 配置。
@@ -1384,6 +1389,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.gate.outputs.head }}
           HEAD_REF: ${{ steps.gate.outputs.ref }}
+          NO_CLAUDE: ${{ steps.gate.outputs.no_claude }}
         run: |
           set -euo pipefail
 
@@ -1427,6 +1433,7 @@ jobs:
             echo ready=true >>"$GITHUB_OUTPUT"
             exit 0
           fi
+          [ "${NO_CLAUDE:-}" != true ] || stuck no-claude
 
           files=()
           while IFS= read -r -d '' f; do files+=("$f"); done < <(sealed_git diff -z --name-only --diff-filter=U)
@@ -1693,7 +1700,8 @@ jobs:
             detail="$(printf '%s' "${DETAIL:-}" | clean 300)"
             reason="$(jq -r '.summary_zh // ""' <<<"${STRUCTURED_OUTPUT:-}" 2>/dev/null | clean 300)" || reason=''
             case "${STUCK:-}" in
-              too-many)       why="有 ${detail} 个文件冲突，超过一次自动解的上限（15 个）。" ;;
+              no-claude)      why="标题带 [no-claude]，不让 Claude 改这个 PR。" ;;
+              too-many)      why="有 ${detail} 个文件冲突，超过一次自动解的上限（15 个）。" ;;
               unsupported)    why="这几个文件没法逐段合（一边删了或改了名、二进制文件或链接）：${detail}。" ;;
               claude-gave-up) why="Claude 判断两边的改动互相矛盾，要人来定：${reason}" ;;
               markers-left)   why="Claude 改完以后这几个文件里还留着冲突标记：${detail}。" ;;
