@@ -729,8 +729,10 @@ jobs:
           # 没修的意见照样跟着进去（Codex 2026-10-07 的 P1）。等它最多一分钟；还在跑就不合 ——
           # 它收尾时要么推出新 head 重新走审查，要么发标记拦住，要么召唤复审，总有下一次合并
           # 检查。先查 run、后读评论：一轮 run 结束之前，它的标记已经发完了。列不出 run 就不合。
-          [ -n "$head_ref" ] && [ "$head_ref" != null ] ||
-            { echo "::error::PR head branch unknown; cannot tell whether a fix round is running"; exit 1; }
+          if [ -z "$head_ref" ] || [ "$head_ref" = null ]; then
+            echo "::error::PR head branch unknown; cannot tell whether a fix round is running"
+            exit 1
+          fi
           for look in 1 2 3 4; do
             fixers="$(
               gh api --paginate --slurp -X GET "repos/$REPO/actions/runs" \
