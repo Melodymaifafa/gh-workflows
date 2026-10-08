@@ -31,11 +31,12 @@ setup() {
     jq -n --arg h "$H" '{
       state: "open", draft: false, title: "feat: x", merged: false,
       mergeable: true, mergeable_state: "clean",
-      base: {ref: "develop"}, head: {sha: $h, repo: {full_name: "o/r"}}
+      base: {ref: "develop"}, head: {sha: $h, ref: "topic", repo: {full_name: "o/r"}}
     }'
   )"
   fake_route "repos/o/r/pulls/7/reviews?per_page=100" '[]'
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
+  no_running_fix o/r
   fake_route "repos/o/r/issues/7/reactions?per_page=100" \
     "$(json_array "$(gh_reaction +1 "$CODEX" 2026-09-18T08:01:00Z)")"
   fake_cli pr_checks \
@@ -70,11 +71,12 @@ setup() {
     jq -n --arg h "$H" '{
       state: "open", draft: false, title: "feat: x", merged: false,
       mergeable: true, mergeable_state: "clean",
-      base: {ref: "develop"}, head: {sha: $h, repo: {full_name: "Melodymaifafa/gh-workflows"}}
+      base: {ref: "develop"}, head: {sha: $h, ref: "topic", repo: {full_name: "Melodymaifafa/gh-workflows"}}
     }'
   )"
   fake_route "repos/Melodymaifafa/gh-workflows/pulls/7/reviews?per_page=100" '[]'
   fake_route "repos/Melodymaifafa/gh-workflows/issues/7/comments?per_page=100" '[]'
+  no_running_fix Melodymaifafa/gh-workflows
   fake_route "repos/Melodymaifafa/gh-workflows/issues/7/reactions?per_page=100" \
     "$(json_array "$(gh_reaction +1 "$CODEX" 2026-09-18T08:01:00Z)")"
 

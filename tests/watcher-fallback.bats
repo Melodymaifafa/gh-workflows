@@ -28,6 +28,7 @@ setup() {
   fake_route repos/o/r/pulls/7 "$(pr_json)"
   fake_route "repos/o/r/pulls/7/reviews?per_page=100" '[]'
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
+  no_running_fix o/r
 }
 
 # pr_json [head] [mergeable_state] [merged]
@@ -35,7 +36,7 @@ pr_json() {
   jq -n --arg h "${1:-$H}" --arg ms "${2:-clean}" --argjson merged "${3:-false}" '{
     state: "open", draft: false, title: "feat: x", merged: $merged,
     mergeable: true, mergeable_state: $ms,
-    base: {ref: "develop"}, head: {sha: $h, repo: {full_name: "o/r"}}
+    base: {ref: "develop"}, head: {sha: $h, ref: "topic", repo: {full_name: "o/r"}}
   }'
 }
 
@@ -497,6 +498,129 @@ codex_findings_on_h() { # codex_findings_on_h <id> ...
   green_checks
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
+  refute_called 'gh pr merge'
+}
+
+# ---------- 以前没推上去的意见（carried-findings）：没人处理之前不合 ----------
+#
+# wechat-mimic-finetune PR #15：修复没推上去，下一次复审只看新 head、没再报那条 P1，
+# PR 带着 bug 自动合了进去。iterate 现在留一个 carried-findings 标记，合并前必须是关着的。
+
+carried_comment() { # carried_comment <id> <login> <assoc> <review> [cleared]
+  local m="carried-findings review=$4 from=$OTHER"
+  [ -z "${5:-}" ] || m="carried-findings-cleared review=$4 head=$H"
+  gh_comment "$1" "$2" "$3" "改好了，但推不上去。
+
+<!-- pr-guard: $m -->"
+}
+
+@test "carried: an open carried finding blocks a clean, green head and alerts once" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'Unlanded findings from review(s) 3001 are still open'
+  refute_called 'gh pr merge'
+  assert_called 'curl' 1
+  body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
+  assert_contains "$body" '更早一轮改好却没推上去的意见还没人处理'
+  assert_contains "$body" "<!-- pr-guard: alert head=$H reason=carried-open until=- -->"
+  assert_bodies_inert
+}
+
+@test "carried: once a later fix round closed it, the head merges" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)" \
+    "$(carried_comment 2 'github-actions[bot]' NONE 3001 cleared)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+# 关掉的标记只认可信作者：claude[bot] 写一条「已关掉」放不行。反过来，claude[bot] 写的
+# 「没推上去」也拦不住合并。
+@test "carried: claude[bot] can neither close a carried finding nor open one" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)" \
+    "$(carried_comment 2 'claude[bot]' NONE 3001 cleared)")"
+  run run_block "$WF" "$STEP"
+  refute_called 'gh pr merge'
+
+  : >"$FAKE_LOG"
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'claude[bot]' NONE 3001)")"
+  run run_block "$WF" "$STEP"
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+# Codex 2026-10-07 的 P1：标记是修复那一轮推不上去之后才发的。新 head 审查通过得快时，
+# 合并会赶在旧那轮发标记之前做完。所以合并前先看这个 PR 上有没有修复在跑。
+FIX_RUNS="repos/o/r/actions/runs?event=pull_request_review&branch=topic&per_page=100"
+fix_run() { # fix_run <status> [workflow name]
+  jq -n --arg s "$1" --arg n "${2:-Claude iterates on Codex review}" \
+    '{workflow_runs: [{id: 1, name: $n, status: $s, head_branch: "topic"}]}'
+}
+
+@test "carried: a fix round still running on the PR holds the merge" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "$FIX_RUNS" "$(fix_run in_progress)"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'A fix round is still running on this PR'
+  # 等了一分钟（3 次 20 秒）才放弃
+  assert_called 'sleep 20' 3
+  refute_called 'gh pr merge'
+  # 还没有可说的：等它收尾，不告警
+  refute_called 'curl'
+}
+
+# 等的那一分钟里它收尾了、留下了标记：先查 run、后读评论，这条标记一定看得见。
+@test "carried: a fix round that settles during the wait and leaves a carry still blocks" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "$FIX_RUNS" "$(fix_run queued)" 1
+  fake_route "$FIX_RUNS" "$(fix_run completed)" 2
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called 'sleep 20' 1
+  assert_contains "$output" 'Unlanded findings from review(s) 3001 are still open'
+  refute_called 'gh pr merge'
+}
+
+@test "carried: other workflows still running on the branch do not hold the merge" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "$FIX_RUNS" "$(fix_run in_progress CI)"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+@test "carried: fix rounds that cannot be listed fail closed: no merge" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route_fail "$FIX_RUNS" 1
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 1
+  assert_contains "$output" 'Cannot list the fix rounds on this PR'
+  refute_called 'gh pr merge'
+}
+
+@test "carried: comments that cannot be read fail closed: no merge" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route_fail "repos/o/r/issues/7/comments?per_page=100" 1
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 1
   refute_called 'gh pr merge'
 }
 

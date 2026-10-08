@@ -7,7 +7,7 @@
 # 每个 open、非草稿、同仓库、标题不带 [no-codex-merge]/[no-claude] 的 PR，按顺序只走第一条命中的规则：
 #   0. 没人管            → 仓库没接共享自动化、或 PR 没打向集成分支：空闲 ≥ 60 分钟时告警一次（unwatched），停。
 #   1. 有冲突            → 告警一次（conflict），停。
-#   2. 这个 head 已停车  → 停（no-fix、round-cap、retry-exhausted、merge-refused、CI 红且 unstable）。
+#   2. 这个 head 已停车  → 停（no-fix、round-cap、retry-exhausted、merge-refused、carried-open、CI 红且 unstable）。
 #   3. 额度还没恢复      → 停（这个 head 上最晚的 until 还没到）。
 #   4. head 有审查意见   → 空闲 ≥ 60 分钟或额度已恢复时发 M5 让 iterate 再修，每个 head 最多算 2 次
 #                          （M5 之后又撞额度的那次不算），但 M5 总数封顶 6 次；用完且空闲 ≥ 60 分钟就告警一次
@@ -246,7 +246,9 @@ sweep_pr() {
   fi
 
   # 2. 已停车：等人处理，巡检不插手。
-  case ",$alerts," in *,no-fix,*|*,round-cap,*|*,retry-exhausted,*|*,merge-refused,*) echo "  已停车"; return 0 ;; esac
+  # carried-open：审查通过了，但更早一轮没推上去的意见还开着，合并检查拦着等人。再叫审只会
+  # 再拿一个「通过」、再被拦一次。
+  case ",$alerts," in *,no-fix,*|*,round-cap,*|*,retry-exhausted,*|*,merge-refused,*|*,carried-open,*) echo "  已停车"; return 0 ;; esac
   case ",$alerts," in *,ci,*) [ "$state" != unstable ] || { echo "  CI 红，已停车"; return 0; } ;; esac
 
   # 3. 额度还没恢复（取这个 head 上最晚的 until）。
