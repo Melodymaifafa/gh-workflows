@@ -1311,11 +1311,11 @@ origin_git() { "$REAL_GIT" --git-dir="$BATS_TEST_TMPDIR/origin.git" "$@"; }
   assert_equal "$(grep -c 'credentialed_git push' <<<"$body")" 1
 }
 
-# 这一轮输入里带着以前没推上去的意见（Gate 交出的 carried）：推上去了就在 M7 里逐条关掉，
+# 这一轮处理过的意见（Gate 交出的 closes 和 carried）：推上去了就在 M7 里逐条关掉，
 # 自动合并不再因它们拦着。不是纯数字的一律不认 —— 那是我们自己往评论里拼的标记。
 @test "carried: a pushed round closes the carried findings in its round marker" {
   push_workspace 'true'
-  export CARRIED='3001,x;rm -rf,3002'
+  export CLOSES='3001,x;rm -rf,3002'
 
   run_chain_trusted_push
 
@@ -1332,7 +1332,7 @@ origin_git() { "$REAL_GIT" --git-dir="$BATS_TEST_TMPDIR/origin.git" "$@"; }
 # 也只会停车（Codex 2026-10-07 的 P2）。所以发不出去隔一会儿再试。
 @test "carried: a round marker that fails to post once is retried, closures and all" {
   push_workspace 'true'
-  export CARRIED=3001
+  export CLOSES=3001
   fake_cli_fail pr_comment 1 '' 1
   fake_cli pr_comment 'https://github.com/o/r/pull/7#issuecomment-1' 2
 
@@ -1345,10 +1345,18 @@ origin_git() { "$REAL_GIT" --git-dir="$BATS_TEST_TMPDIR/origin.git" "$@"; }
   refute_contains "$output" '::warning::fix-round marker'
 }
 
-@test "carried: only the Claude path closes carried findings; the Codex patch request never saw them" {
-  assert_contains "$(step_env_keys "$WF" 'Commit and push the Claude fix')" 'CARRIED'
-  refute_contains "$(step_env_keys "$WF" 'Commit and push the Codex fix')" 'CARRIED'
-  assert_contains "$(claude_prompt)" '上一轮没推上去的意见'
+# 两条路都关掉这一轮的目标；只有 Claude 那条路关掉带进来的以前没修完的那几条 —— Codex 的
+# 补丁请求里没有它们，推上去也不算处理过。
+@test "carried: both paths close the round's target; only the Claude path closes carried findings" {
+  closes_env() {
+    awk -v want="      - name: $1" '$0 == want { f = 1; next } f && /^      - / { exit }
+      f && /^          CLOSES: / { sub(/^          CLOSES: /, ""); print }' "$REPO_ROOT/$WF"
+  }
+  # shellcheck disable=SC2016  # 找的就是字面量 ${{
+  assert_equal "$(closes_env 'Commit and push the Claude fix')" '${{ steps.gate.outputs.closes }},${{ steps.gate.outputs.carried }}'
+  # shellcheck disable=SC2016
+  assert_equal "$(closes_env 'Commit and push the Codex fix')" '${{ steps.gate.outputs.closes }}'
+  assert_contains "$(claude_prompt)" '以前没修完的意见'
 }
 
 # ---------- 总结评论 ----------

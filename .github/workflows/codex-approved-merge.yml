@@ -99,7 +99,7 @@ jobs:
       TRIGGERED_AT: ${{ github.event.comment.created_at || github.event.pull_request.updated_at }}
       TARGET_ID: ${{ github.event.comment.id || github.event.pull_request.number }}
       ACTOR_TYPE: ${{ github.event.sender.type }}
-      # job 层只传「有没有」；PAT 本身只交给下面那一步里的 gh pr merge。
+      # job 层只传「有没有」；PAT 本身只交给下面那一步（gh pr merge 和补请修复的那条 review）。
       HAS_PAT: ${{ secrets.CODEX_TRIGGER_TOKEN != '' }}
       PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
       PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
@@ -117,7 +117,8 @@ jobs:
           # 主人的 PAT，每个接了流水线的仓库都有。用 github.token 合并时，GitHub 的防递归
           # 规则让那次 push 不触发任何 workflow：调用方 ci.yml 的 `on: push` 不跑，合并出来的
           # commit 上一条 CI 都没有，ff-main 就永远不敢挪 main（2026-10-07 wechat-mimic-finetune
-          # 12–15 号 PR 实测）。用它合，push 才算真人推的，CI 照常跑。同样只交给 gh pr merge。
+          # 12–15 号 PR 实测）。用它合，push 才算真人推的，CI 照常跑。同样只交给 gh pr merge；
+          # 另外只有一处用它：审查通过却被没修完的旧意见拦着时，补一条请修复的 review（见 carried）。
           CODEX_TRIGGER_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
         run: |
           set -euo pipefail
@@ -718,11 +719,12 @@ jobs:
             exit 0
           fi
 
-          # 以前某一轮改好了却没推上去的意见（iterate 发的 carried-findings 标记）：分支被人
-          # 推过，那一轮的修复没落地，而复审只看新 head、不一定再报同一条（wechat-mimic-finetune
-          # PR #15 就这样带着一条 P1 合了进去）。下一轮修复把它们带上、推上去之后会发
-          # carried-findings-cleared 关掉；在那之前不自动合并，等人处理（看过之后手动点 Merge）。
-          # 只认可信作者写的；读不到评论就不合，绝不当成「没有」。
+          # 还没人处理的意见（iterate 发的 carried-findings 标记）：开修前、或者 review 到的时候
+          # head 已经变了，iterate 就记一笔；推上去的那一轮发 carried-findings-cleared 关掉，主人写的
+          # 放行标记（M8）点了名的也算关掉（judge 逐条核过）。开着的就是还没修完 —— 修复失败或者
+          # 分支被人推过之后，复审只看新 head、不一定再报同一条（wechat-mimic-finetune PR #15 就这样
+          # 带着一条 P1 合了进去）。在关掉之前不自动合并，等下一轮修复，或者人看过之后手动点 Merge。
+          # 判据同 iterate 的 carried_reviews。只认可信作者写的；读不到评论就不合，绝不当成「没有」。
           #
           # 这个标记是修复那一轮推不上去之后才发的。所以先看这个 PR 上还有没有修复在跑（或排着
           # 队）：分支被人推过、新 head 审查又通过得快时，这一次合并会赶在旧那轮发标记之前做完，
@@ -754,15 +756,64 @@ jobs:
               jq -r '
                 [(add // [])[]
                   | select(.user.login == "github-actions[bot]" or .author_association == "OWNER")
-                  | .body // ""] as $b
-                | ([$b[] | scan("<!-- pr-guard: carried-findings review=([0-9]+) ") | .[0]] | unique) as $open
-                | ([$b[] | scan("<!-- pr-guard: carried-findings-cleared review=([0-9]+) ") | .[0]] | unique) as $done
+                  | {owner: (.author_association == "OWNER"), body: (.body // "")}] as $c
+                | ([$c[].body | scan("<!-- pr-guard: carried-findings review=([0-9]+) ") | .[0]] | unique) as $open
+                | ([$c[].body | scan("<!-- pr-guard: carried-findings-cleared review=([0-9]+) ") | .[0]]
+                    + [$c[] | select(.owner) | .body
+                        | scan("<!-- claude-judge-clean: head=[0-9a-f]{40} reviews=([0-9]+(,[0-9]+)*) -->")
+                        | .[0] | split(",")[]]
+                    | unique) as $done
                 | $open - $done | join(",")'
           )" || { echo "::error::Cannot read PR comments"; exit 1; }
           if [ -n "$carried" ]; then
-            echo "::notice::Unlanded findings from review(s) $carried are still open; not merging"
+            echo "::notice::Unfinished findings from review(s) $carried are still open; not merging"
+            # 这个 head 审查通过了，就不会有下一轮修复来带上它们：iterate 只在 head 上有意见时开修，
+            # 巡检也只重修 head 上的意见、把 carried-open 当停车 —— 不补一脚，「下一轮自动修复会带上
+            # 它们」就落了空，PR 一直卡着等人（Codex 2026-10-08 的 P2）。所以用主人的 PAT 在这个 head
+            # 上补一条有意见的 review（M3 的形状，正文只点这几条的名）：iterate 照常开一轮，把它们附在
+            # findings.md 后面一并交给修的人；推上去就关掉，判「不用改」由 judge 核过、点名关掉；
+            # 那一轮失败了，这条 review 就是 head 上的意见，巡检照常重修。同一批意见在每个 head 上只补
+            # 一次（看 H 上带 carried-reraise 标记的可信 review 点过哪些 review id）：补过还拦着 = 那一轮
+            # 没把它们关掉，再补只会原地转圈。但那一轮开修之后才记上账的意见不在它带上的那批里，judge
+            # 也不会替它们放行 —— 只按 head 算「补过」，它们就跟着停车、再没人修（Codex 2026-10-08 的
+            # P2）。所以开着的意见里有没点过名的，就再补一条。都点过了、没有 PAT、标题带 [no-claude]
+            # （iterate 不接，补了只会悄悄卡住）、或者发不出去，照旧告警停下等人。正文只有 review id 和 sha。
+            reraised="$(
+              gh api --paginate --slurp \
+                "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" |
+                jq -r --arg h "$expected_head" --arg open "$carried" '
+                  [(add // [])[]
+                    | select(.commit_id == $h and
+                        (.user.login == "github-actions[bot]" or .author_association == "OWNER"))
+                    | (.body // "")
+                    | scan("<!-- pr-guard: carried-reraise head=" + $h + " reviews=([0-9]+(,[0-9]+)*) -->")
+                    | .[0] | split(",")[]] as $asked
+                  | ($open | split(",")) - $asked | length == 0'
+            )" || { echo "::error::Cannot read PR reviews"; exit 1; }
+            if [ "$reraised" != true ] && [ -n "${CODEX_TRIGGER_TOKEN:-}" ] &&
+              [[ "$title" != *'[no-claude]'* ]]
+            then
+              printf -v reraise '🤖 这个提交审查通过了，但更早的 review %s 里还有没修完的意见（开修了没推上去，或者到的时候 PR 已经换了提交），没有下一轮修复会来带上它们，所以补这一条请自动修复开一轮：那几条意见附在后面，逐条对照当前代码，还没修好的修，已经改好了的跳过。\n\n<!-- claude-review-findings: %s -->\n<!-- pr-guard: carried-reraise head=%s reviews=%s -->' \
+                "$carried" "$expected_head" "$expected_head" "$carried"
+              if GH_TOKEN="$CODEX_TRIGGER_TOKEN" gh api -X POST "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+                -f event=COMMENT -f "commit_id=$expected_head" -f "body=$reraise" --silent
+              then
+                echo "::notice::Asked iterate for a fix round on $expected_head that carries review(s) $carried"
+                exit 0
+              fi
+              echo "::warning::Could not post the review that asks for a fix round; alerting instead"
+            fi
+            if [ "$reraised" = true ]; then
+              why='已经请自动修复带上它们修过一轮，还是没关掉'
+            elif [ -z "${CODEX_TRIGGER_TOKEN:-}" ]; then
+              why='仓库没配 CODEX_TRIGGER_TOKEN，没法自动请一轮修复'
+            elif [[ "$title" == *'[no-claude]'* ]]; then
+              why='标题带 [no-claude]，不自动修'
+            else
+              why='请自动修复的那条 review 没发出去'
+            fi
             alert_once "$expected_head" carried-open \
-              "🤖 审查通过、CI 也绿了，但更早一轮改好却没推上去的意见还没人处理（见上面那条「改好了，但推不上去」），先不自动合并。你看过、确认处理好了就直接点 Merge。"
+              "🤖 审查通过、CI 也绿了，但更早的 review $carried 里的意见还没修完（开修了没推上去，或者到的时候 PR 已经换了提交），先不自动合并：$why。你看过、确认处理好了就直接点 Merge。"
             exit 0
           fi
 
