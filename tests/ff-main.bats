@@ -138,7 +138,7 @@ setup() {
     awk 'FNR == 1 {on = 0} /^jobs:/{on=1; next} on && /^  [A-Za-z0-9_-]+:$/{sub(/^  /,""); sub(/:$/,""); print}' \
       "$REPO_ROOT/.github/workflows/codex-approved-merge.yml" "$REPO_ROOT/.github/workflows/ff-main.yml"
   )
-  assert_equal "${#keys[@]}" 3
+  assert_equal "${#keys[@]}" 4
   for key in "${keys[@]}"; do
     rm -rf "$FAKE_DIR"; setup
     fake_route "$CHECKS" "$(check_runs \

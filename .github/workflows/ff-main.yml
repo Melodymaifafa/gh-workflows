@@ -202,7 +202,7 @@ jobs:
               gh api --paginate "repos/$REPO/commits/$goal/check-runs?per_page=100" --jq '.check_runs[]' |
                 jq -s --arg own "/actions/runs/${GITHUB_RUN_ID:-none}/" '
                   [.[] | select(((.details_url // "") | contains($own)) | not)
-                       | select(.name | test(" / (watch-and-merge|claude-review|fast-forward)$") | not)]'
+                       | select(.name | test(" / (watch-and-merge|claude-review|resolve-conflict|fast-forward)$") | not)]'
             )"
             total="$(jq length <<<"$runs")"
             pending="$(jq -r '[.[] | select(.status != "completed")] | length' <<<"$runs")"
