@@ -155,6 +155,7 @@ gate_env() {
 #   delete  develop 删了 app.txt，topic 改了它
 #   many    16 个文件两边都改了同一行
 #   heading 同 text，但 app.txt 开头有个 Markdown 标题，下划线正好是 7 个等号
+#   underline 同 text，但 topic 那边改成的是个 Markdown 标题，下划线正好是 7 个等号，落在冲突段落里
 conflict_repo() {
   local kind="$1" seed="$BATS_TEST_TMPDIR/seed" i top=''
   [ "$kind" != heading ] || top=$'Title\n=======\n'
@@ -169,6 +170,7 @@ conflict_repo() {
   case "$kind" in
     clean) printf 'notes from topic\n' >"$seed/notes.md" ;;
     many) for i in $(seq 1 16); do printf 'topic\n' >"$seed/f$i.txt"; done ;;
+    underline) printf 'one\nTopic\n=======\nthree\n' >"$seed/app.txt" ;;
     *) printf '%sone\ntwo from topic\nthree\n' "$top" >"$seed/app.txt" ;;
   esac
   g commit -q -am 'feat: topic change'
@@ -279,6 +281,18 @@ claude_resolves() {
   assert_equal "$(step_output stuck)" unsupported
   assert_contains "$(step_output detail)" app.txt
   refute_output_key conflicted
+}
+
+# 段落里自带的那行跟 git 的分隔线长得一样：检查那一步只数条数，分不出 Claude 删的是哪一条。
+@test "merge: a conflict hunk that itself holds a ======= line goes to a person, not to Claude" {
+  conflict_repo underline
+  run run_step "$WF" "$MERGE"
+  assert_equal "$status" 0
+  assert_equal "$(step_output stuck)" separator-in-hunk
+  assert_contains "$(step_output detail)" app.txt
+  refute_output_key conflicted
+  [ ! -e .conflict ]
+  assert_equal "$(origin_topic)" "$HEAD_SHA"
 }
 
 @test "merge: more than 15 conflicted files go to a person" {
@@ -576,6 +590,7 @@ stuck_env() { # stuck_env <reason> [detail]
   for spec in \
     'no-claude||标题带 [no-claude]，不让 Claude 改这个 PR。' \
     'unsupported|app.txt|没法逐段合（一边删了或改了名、二进制文件或链接）：app.txt。' \
+    'separator-in-hunk|app.txt|跟 git 的分隔线长得一样，没法核对 Claude 有没有删干净：app.txt。' \
     'too-many|16|有 16 个文件冲突，超过一次自动解的上限（15 个）。' \
     'markers-left|app.txt|还留着冲突标记：app.txt。' \
     'touched-outside|app.txt|Claude 改了冲突段落以外的行（app.txt）' \

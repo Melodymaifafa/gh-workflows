@@ -1448,6 +1448,21 @@ jobs:
             fi
           done
           [ -z "$odd" ] || stuck unsupported "$odd"
+          # 分隔线 ======= 也可能是正文（Markdown、reST 的标题下划线）。冲突段落里本身就有这种行时，
+          # 检查那一步只数得出条数，分不出 Claude 删掉的是正文还是 git 的分隔线，交给人。
+          # shellcheck disable=SC2016  # perl 程序
+          one_sep='
+            while (/^<<<<<<< [^\n]*\n(.*?)^>>>>>>> [^\n]*$/msg) {
+              my $hunk = $1;
+              my $seps = () = $hunk =~ /^=======[^\S\n]*$/mg;
+              exit 1 if $seps != 1;
+            }
+          '
+          twin=''
+          for f in "${files[@]}"; do
+            perl -0777 -ne "$one_sep" "pr/$f" || twin+="$f"$'\n'
+          done
+          [ -z "$twin" ] || stuck separator-in-hunk "$twin"
 
           # 给 Claude 的材料，全是不可信数据。放在根目录：Claude 只改得动 pr/ 下的文件。
           mkdir -p .conflict/diffs "$RUNNER_TEMP/conflicted"
@@ -1613,7 +1628,8 @@ jobs:
           files=()
           while IFS= read -r -d '' f; do files+=("$f"); done <"$RUNNER_TEMP/conflicted.z"
           # 分隔线 ======= 在 Markdown、reST 里也可能是正文（标题下划线）：git 留下的原样里每段冲突
-          # 自带一条，结果里的比原样减掉这些还多，才算没删干净。
+          # 自带一条，结果里的比原样减掉这些还多，才算没删干净。冲突段落里本身就有这种行的，合并那一步
+          # 已经交给人了，所以这里多出来的只会是没删的分隔线。
           count() { grep -cE -- "$1" "$2" || true; }
           left=''
           i=0
@@ -1746,6 +1762,7 @@ jobs:
               no-claude)      why="标题带 [no-claude]，不让 Claude 改这个 PR。" ;;
               too-many)      why="有 ${detail} 个文件冲突，超过一次自动解的上限（15 个）。" ;;
               unsupported)    why="这几个文件没法逐段合（一边删了或改了名、二进制文件或链接）：${detail}。" ;;
+              separator-in-hunk) why="这几个文件的冲突段落里本身就有一行 7 个等号（像标题下划线），跟 git 的分隔线长得一样，没法核对 Claude 有没有删干净：${detail}。" ;;
               claude-gave-up) why="Claude 判断两边的改动互相矛盾，要人来定：${reason}" ;;
               markers-left)   why="Claude 改完以后这几个文件里还留着冲突标记：${detail}。" ;;
               touched-outside) why="Claude 改了冲突段落以外的行（${detail}），这次的结果作废。" ;;
