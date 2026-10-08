@@ -184,7 +184,7 @@ jobs:
           # 巡检才知道要等到新的重置时间；其余原因同 (head, 原因) 只发一次。
           # 第 5 个参数可选：只进评论、不进手机推送的额外标记行（如 carried-findings）。
           alert_once() {
-            local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" prev body resume pause
+            local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" prev body resume pause err
             # 已有可信标记里最大的 until：没有标记 = 空串，有标记但 until=- 记 0
             prev="$(trusted_comments | jq -r --arg m "<!-- pr-guard: alert head=$head reason=$reason " '
               [.[] | .body | select(contains($m))
@@ -206,9 +206,13 @@ jobs:
             # 发不出去隔 10 / 30 / 60 秒再试：有的标记只在这里发一次，一次网络抖动丢了就没人补
             # （carried-findings 一丢，分支已经换了 head，没修的意见就跟着进了合并）。发重了无妨：
             # 标记只按「有没有」认。全失败照旧返回非零，红不红由调用处定。
+            # 找不到 gh、或者 GitHub 回 4xx（令牌、权限、PR 不对）时再试也一样，立刻返回：不然每次
+            # 都白等 100 秒（测试里发评论本来就会失败，整套测试因此慢了几倍）。
             for pause in 0 10 30 60; do
               [ "$pause" -eq 0 ] || { echo "posting the $reason alert failed; retrying in ${pause}s"; sleep "$pause" || true; }
-              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$body" >/dev/null && return 0
+              err="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$body" 2>&1 >/dev/null)" && return 0
+              printf '%s\n' "$err" >&2
+              case "$err" in *'command not found'* | *'HTTP 4'*) return 1 ;; esac
             done
             return 1
           }
@@ -1467,13 +1471,16 @@ jobs:
             # 发不出去隔一会儿再试（同 alert_once）：上面那几行 carried-findings-cleared 只在这里
             # 发一次，丢了的话那几条意见在合并检查眼里一直开着，干净的复审之后也只会停车。
             # 全失败照旧只警告：推已经成功了，为一条评论打红会让后面召唤复审跟着被跳过。
+            # 找不到 gh、或者 GitHub 回 4xx 就不再试（同 alert_once）。
             m7_posted=''
             for pause in 0 10 30 60; do
               [ "$pause" -eq 0 ] || { echo "fix-round marker for $new_head not posted; retrying in ${pause}s"; sleep "$pause" || true; }
-              if gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" >/dev/null; then
+              if m7_err="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" 2>&1 >/dev/null)"; then
                 m7_posted=1
                 break
               fi
+              printf '%s\n' "$m7_err" >&2
+              case "$m7_err" in *'command not found'* | *'HTTP 4'*) break ;; esac
             done
             [ -n "$m7_posted" ] || echo "::warning::fix-round marker for $new_head not posted"
           }
