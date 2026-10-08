@@ -1720,17 +1720,20 @@ jobs:
           push_auth="AUTHORIZATION: basic $(printf '%s' "x-access-token:$push_secret" | base64 | tr -d '\n')"
           new_head="$(sealed_git rev-parse HEAD)"
           push_log="$(mktemp "$RUNNER_TEMP/push-stderr-XXXXXX")"
-          # 普通推送，永不强推：分支在这段时间里被人推过就被拒，交给下一轮看新的 head。
+          # 只在远端分支还停在解冲突时那个 head 上才推（合并提交是它的后代，推上去就是快进）。
+          # 普通推送不够：分支在这段时间里被删了或被倒回到更早的提交，合并提交对它照样是快进，
+          # 会把分支建回来、把作者删掉的提交又带回去。被推过、删过、倒回过都被拒，交给下一轮。
           if ! GIT_CONFIG_COUNT=1 \
             GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
             GIT_CONFIG_VALUE_0="$push_auth" \
-            sealed_git push -q origin "HEAD:refs/heads/$HEAD_REF" 2>"$push_log"
+            sealed_git push -q --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" \
+              origin "HEAD:refs/heads/$HEAD_REF" 2>"$push_log"
           then
             err="$(<"$push_log")"
             printf '%s\n' "$err" >&2
             # 报错原文里有 PR 能控制的文件名，不往评论里带；只按类型写固定文案。
             case "$err" in
-              *non-fast-forward* | *'fetch first'*)
+              *'stale info'* | *non-fast-forward* | *'fetch first'*)
                 echo "::notice::$HEAD_REF moved while the conflict was being resolved; the next run handles the new head"
                 ;;
               *'workflows` permission'* | *'create or update workflow'*)

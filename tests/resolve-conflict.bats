@@ -389,7 +389,7 @@ nth_body() {
   assert_equal "$(origin_topic)" "$NEW"
 }
 
-# 永不强推：分支在解冲突的这段时间里被人推过，就让那一笔留着，下一轮看新的 head。
+# 只认原来那个 head：分支在解冲突的这段时间里被人推过，就让那一笔留着，下一轮看新的 head。
 @test "push: a branch that moved meanwhile keeps the other push; nothing is posted" {
   resolved_and_committed
   local other="$BATS_TEST_TMPDIR/other"
@@ -403,6 +403,27 @@ nth_body() {
   assert_equal "$status" 0
   assert_contains "$output" 'moved while the conflict was being resolved'
   assert_equal "$(origin_topic)" "$human"
+  refute_called 'gh api POST'
+  refute_called curl
+}
+
+# 合并提交对删掉的分支、倒回去的分支都算快进，普通推送会把它们改回来；只认原来那个 head。
+@test "push: a branch deleted or rewound meanwhile is left as the author made it" {
+  resolved_and_committed
+  base="$("$REAL_GIT" -C "$BATS_TEST_TMPDIR/origin.git" rev-parse "$HEAD_SHA^")"
+  "$REAL_GIT" -C "$BATS_TEST_TMPDIR/origin.git" update-ref refs/heads/topic "$base"
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  assert_contains "$output" 'moved while the conflict was being resolved'
+  assert_equal "$(origin_topic)" "$base"
+  refute_called 'gh api POST'
+
+  "$REAL_GIT" -C "$BATS_TEST_TMPDIR/origin.git" update-ref -d refs/heads/topic
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  assert_contains "$output" 'moved while the conflict was being resolved'
+  run "$REAL_GIT" -C "$BATS_TEST_TMPDIR/origin.git" rev-parse --verify -q refs/heads/topic
+  assert_equal "$status" 1
   refute_called 'gh api POST'
   refute_called curl
 }
