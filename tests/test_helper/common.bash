@@ -93,12 +93,6 @@ onboard_render() { # onboard_render <python|node>
       _ "$REPO_ROOT/onboard.sh" "$1" "$BATS_TEST_TMPDIR/out"
 }
 
-# 只跑「CI 钉了 node 版本、修复那一轮跟不上」那一段，stderr 并进 stdout 好断言。
-onboard_node_version_warning() {
-  NODE_VERSION="${OV_NODE_VERSION-}" \
-    bash -c '. "$1"; node_version_warning' _ "$REPO_ROOT/onboard.sh" 2>&1
-}
-
 # 只跑「三条全 skip 就警告」那一段，stderr 并进 stdout 好断言。
 onboard_coverage_warning() {
   INSTALL_CMD="${OV_INSTALL-}" \

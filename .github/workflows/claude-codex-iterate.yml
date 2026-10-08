@@ -12,6 +12,13 @@ on:
         description: python | node | shell — picks the toolchain, verify commands and tool allowlist.
         type: string
         default: python
+      node_version:
+        description: >-
+          Node for the fix round, same meaning as ci.yml's node_version. It must match what
+          the caller's ci.yml pins: a repo whose package.json engines wants 24 installs
+          nothing on 20, so CI stays green while every fix round goes red (MEL-322, CodexBridge PR 1).
+        type: string
+        default: '20'
       review_fixer:
         description: auto | claude | codex — who fixes the PR this round. auto runs Claude first and hands over to Codex only when the provider itself fails.
         type: string
@@ -613,7 +620,7 @@ jobs:
               # $RUNNER_TEMP 都删不掉。
               sandbox="$(mktemp -d "$RUNNER_TEMP/verify-user-XXXXXX")" || return 1
               mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cache" "$sandbox/run" \
-                       "$sandbox/decoy" || return 1
+                       "$sandbox/decoy" "$sandbox/tools/bin" || return 1
               # 它那一侧的 git 要认这个工作区：目录所有者还是我们，另一个用户跑 git
               # 默认判 dubious ownership 直接拒。这份配置在它自己的 HOME 里，它改得动
               # 也只伤得到自己 —— 我们这头每一条 git 都走 sealed_git，全局和系统两个
@@ -669,6 +676,28 @@ jobs:
             decoy="$RUNNER_TEMP/verify-decoy-$$"
             [ -z "$verify_sandbox" ] || decoy="$verify_sandbox/decoy"
             mkdir -p "$decoy"
+
+            # 验证命令还要能在自己名下装东西。`corepack enable` 把 pnpm / yarn 的 shim 装到
+            # 「which corepack 的那个目录」（corepack 0.32 实测，它 --help 自己就这么写），
+            # `npm i -g` 装到 npm 的 prefix —— 两个默认都落在 node 工具链自己那个目录，而那个
+            # 目录不归验证用户：分离出去之后当场 EACCES，lark 2 号 PR 的每一轮修复都死在
+            # `corepack enable` 这一句上（MEL-322）。同一句在那个仓库自己的 CI 里是好的，
+            # 因为那边跑的是 runner 用户 —— 所以这是修复轮自己的环境缺了一块，不是命令选错。
+            # 补法：给它一个归它自己的 bin 目录、排在它那份 PATH 最前面，再把 corepack 链进去。
+            # 于是裸的 `corepack enable` 落点就是这个可写目录，`npm i -g` 也有 prefix 可写，
+            # 用 pnpm / yarn 的仓库都不用在 verify_cmd 里为此绕一下。
+            # 它只进验证命令那份 PATH，不进我们自己的 $trusted_path —— 它写得动的目录我们一律不信。
+            verify_tools="$RUNNER_TEMP/verify-tools-$$"
+            [ -z "$verify_sandbox" ] || verify_tools="$verify_sandbox/tools"
+            mkdir -p "$verify_tools/bin"
+            # corepack 得从「原样那份 PATH」里找：工具链目录归 runner 写得动，上面那道过滤
+            # 正好把它滤掉了，拿我们自己这份 PATH 一个都找不到。
+            corepack_on_path="$(PATH="$verify_path"; command -v corepack 2>/dev/null || true)"
+            if [ -n "$corepack_on_path" ] && [ ! -e "$verify_tools/bin/corepack" ]; then
+              ln -s "$corepack_on_path" "$verify_tools/bin/corepack" ||
+                echo '::warning::could not put a writable corepack on the PATH the verify command gets; a bare `corepack enable` will fail here the way it did on lark PR 2'
+            fi
+            verify_path="$verify_tools/bin:$verify_path"
 
             # 验证命令对工作副本有写权限，所以它能往 .git 里种「后面某一步会去跑」的
             # 东西：.git/hooks/ 下的钩子，或者 .git/config 里任意一个「会去跑命令」的键
@@ -936,6 +965,7 @@ jobs:
               if [ -z "$verify_user" ]; then
                 env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
                     GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
+                    npm_config_prefix="$verify_tools" \
                     PATH="$verify_path" \
                     bash -euo pipefail -c "$VERIFY"
                 return
@@ -947,7 +977,8 @@ jobs:
               # 的清点，sudoers 没写 use_pty 的机器上由它兜住。
               # -E 留着整份环境：这一步的 env: 里一个凭据都没有（MEL-254 的前提），而
               # 调用方仓库的测试套件照旧读得到 CI / GITHUB_* 那一堆。只有指向 runner
-              # 那个用户私有目录的几个（HOME、XDG_*、uv / npm 的缓存）换成沙箱里的 ——
+              # 那个用户私有目录的几个（HOME、XDG_*、uv / npm 的缓存、npm 的全局 prefix）
+              # 换成沙箱里的 ——
               # 漏一个的长相是「权限不够」当场失败，不是静默跑在我们的目录上。
               # umask 002 设在 sudo **里面**：sudo 取「调用者的」和 sudoers 那个（默认
               # 0022）的并集，设外面到不了验证进程，它造的 .venv 就 0755、组写不动，
@@ -963,6 +994,7 @@ jobs:
                     XDG_RUNTIME_DIR="$verify_sandbox/run" \
                     UV_CACHE_DIR="$verify_sandbox/cache/uv" \
                     npm_config_cache="$verify_sandbox/cache/npm" \
+                    npm_config_prefix="$verify_tools" \
                     GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
                     GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
                     PATH="$verify_path" \
@@ -1745,7 +1777,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: inputs.runtime == 'node'
         with:
-          node-version: '20'
+          node-version: ${{ inputs.node_version }}
 
       # shell runtime（本仓库自己修自己的 PR）：版本钉死，同 ci.yml。
       # 装到 /usr/local，不落进被修的工作区。shellcheck runner 自带。

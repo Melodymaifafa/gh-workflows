@@ -187,14 +187,22 @@ jobs:
           # 定时跑时没人替 target 背书「这版能用」，绿灯是唯一的替代品。
           # skipped / neutral 算过 —— 有些仓库还没配 lint 或测试。
           if [ "$REQUIRE_GREEN" = true ]; then
-            # 落点是 $SOURCE 的最新提交时（min_age_days 填 0），本次 run 自己的 check run 也挂在
-            # 这个 commit 上，而它此刻正在跑 —— 不排除的话「填 0 立刻挪」永远报「1 项未完成」
-            # （2026-09-29 linear-agent-team 实测，CI 早已全绿）。按 run id 排除，不按 job 名：
-            # 调用桩里的 job 名各仓库自己定。
+            # 只算真测过这个 commit 的 check run，两类不算：
+            # 1. 本次 run 自己的。落点是 $SOURCE 的最新提交时（min_age_days 填 0）它也挂在这上面、
+            #    此刻正在跑，不排除就永远报「1 项未完成」（2026-09-29 linear-agent-team 实测）。
+            #    按 run id 排除：调用桩里的 job 名各仓库自己定。
+            # 2. 流水线自己的 job（合并、快进）。它们由 PR 事件 / 评论 / 定时触发，GitHub 一律挂到默认分支
+            #    最新提交上，跟测没测过这个 commit 无关。被新一轮顶掉的合并 run 是 cancelled，不排除
+            #    就卡成「CI 没全绿」；只挂着它们的 commit 又会被当成全绿（2026-10-07
+            #    wechat-mimic-finetune fa97fd0 实测）。按 check run 名的后半截（被调用方的 job key，
+            #    我们自己定）认，因为拿不到触发事件：那要 actions: read，各仓库调用桩没给。
+            #    job key 改名或新增 job 要同步这里，tests/ff-main.bats 守着。
+            # 一个提交上能挂几十条合并 run，默认一页 30 条会把真 CI 挤到后面，所以翻全部页。
             runs="$(
-              gh api "repos/$REPO/commits/$goal/check-runs" --jq '.check_runs' |
-                jq --arg own "/actions/runs/${GITHUB_RUN_ID:-none}/" \
-                  '[.[] | select(((.details_url // "") | contains($own)) | not)]'
+              gh api --paginate "repos/$REPO/commits/$goal/check-runs?per_page=100" --jq '.check_runs[]' |
+                jq -s --arg own "/actions/runs/${GITHUB_RUN_ID:-none}/" '
+                  [.[] | select(((.details_url // "") | contains($own)) | not)
+                       | select(.name | test(" / (watch-and-merge|claude-review|fast-forward)$") | not)]'
             )"
             total="$(jq length <<<"$runs")"
             pending="$(jq -r '[.[] | select(.status != "completed")] | length' <<<"$runs")"
