@@ -135,6 +135,20 @@ gate() { run run_block "$WF" "Gate the fix round"; }
   refute_contains "$(cat "$GITHUB_OUTPUT")" 'run=true'
 }
 
+# 账记在预取意见之前：读行内评论一抖整步红掉，账也已经记上了，之后有人推一笔意见也丢不了
+# （Codex 2026-10-08 的 P1）。
+@test "gate: the pending record lands even when prefetching the findings fails" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route_fail "repos/o/r/pulls/7/reviews/4001/comments?per_page=100" 1
+  gate
+  [ "$status" -ne 0 ]
+  refute_contains "$(cat "$GITHUB_OUTPUT")" 'run=true'
+  assert_called "gh pr comment" 1
+  assert_contains "$(fake_last_body "gh pr comment")" "<!-- pr-guard: carried-findings review=4001 from=$H -->"
+}
+
 @test "gate: Codex review, no earlier summon -> round 1, findings prefetched with HTML comments stripped" {
   real_h=a4c2a6bc1fb3d88b21b68ad9490d2db55517196c
   export REVIEW_ID=4863267293 REVIEW_COMMIT="$real_h" REVIEW_LOGIN="$CODEX" REVIEW_ASSOC=NONE REVIEW_BODY=x

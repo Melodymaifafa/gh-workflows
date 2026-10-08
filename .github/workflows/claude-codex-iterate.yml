@@ -1647,6 +1647,21 @@ jobs:
             skip "round $round exceeds max_fix_rounds $MAX_FIX_ROUNDS; the round-cap judge takes the leftover findings"
           fi
 
+          # 开修之前先记账：这条 review 在推上去之前算「没人处理」。以前只在推不上去之后才记，
+          # 而这一轮也可能验证没过、撞额度、Claude 没跑成 —— 这时候有人往分支推一笔，head 一变，
+          # 复审不一定再报同一条，意见就丢了；合并检查也可能赶在「推不上去」那一笔记账之前就合了
+          # （Codex 2026-10-07 的 P1）。巡检重修同一条 review 时账已经开着，不再记第二笔。
+          # 记不上就不修：没有这一笔，这一轮一失败意见就可能丢。定下这一轮要修就记，排在下面
+          # 预取意见、读旧意见那几次 API 之前：哪次一抖整步红掉，账也已经记上了（Codex 2026-10-08 的 P1）。
+          if [[ " $(carried_reviews open) " != *" $target "* ]]; then
+            printf -v pending '🤖 第 %s 轮开始修 review %s（%s）。修好推上去之前，这批意见算没处理，这个 PR 不会自动合并。\n\n<!-- pr-guard: carried-findings review=%s from=%s -->' \
+              "$round" "$target" "$reviewer" "$target" "$H"
+            post_comment_retry "the pending marker for review $target" "$pending" || {
+              echo "::error::cannot record review $target as pending; not fixing it without that record"
+              exit 1
+            }
+          fi
+
           # 预取意见（总评 + 行内评论）成文件，去掉 HTML 注释；Claude 不再需要 gh api。
           # .review/ 加进本地 exclude，免得被 git add 进 PR。
           if [ -d .git ]; then
@@ -1702,19 +1717,6 @@ jobs:
             carried_ok="${carried_ok:+$carried_ok,}$id"
           done
 
-          # 开修之前先记账：这条 review 在推上去之前算「没人处理」。以前只在推不上去之后才记，
-          # 而这一轮也可能验证没过、撞额度、Claude 没跑成 —— 这时候有人往分支推一笔，head 一变，
-          # 复审不一定再报同一条，意见就丢了；合并检查也可能赶在「推不上去」那一笔记账之前就合了
-          # （Codex 2026-10-07 的 P1）。巡检重修同一条 review 时账已经开着，不再记第二笔。
-          # 记不上就不修：没有这一笔，这一轮一失败意见就可能丢。
-          if [[ " $(carried_reviews open) " != *" $target "* ]]; then
-            printf -v pending '🤖 第 %s 轮开始修 review %s（%s）。修好推上去之前，这批意见算没处理，这个 PR 不会自动合并。\n\n<!-- pr-guard: carried-findings review=%s from=%s -->' \
-              "$round" "$target" "$reviewer" "$target" "$H"
-            post_comment_retry "the pending marker for review $target" "$pending" || {
-              echo "::error::cannot record review $target as pending; not fixing it without that record"
-              exit 1
-            }
-          fi
           # 推上去之后关掉哪几条：这一轮的目标；judge 确认的 bug（M9）修完了，它核过的那几条
           # 也一起关（没确认的那些它判过不拦合并）。只认 M9 里记下的那几条，不重新列这个 head
           # 上的全部意见：判完之后才到的 review 没被核过，跟着关掉的话，它排着队的那一轮看到
