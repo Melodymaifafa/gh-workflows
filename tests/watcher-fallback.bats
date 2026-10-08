@@ -834,6 +834,20 @@ $(m6_marker "$H" ci)")")"
   assert_bodies_inert
 }
 
+# 冲突交给 resolve-conflict 把集成分支合进来，不告警；它解不了才告警 conflict-stuck。
+@test "a conflicted PR is handed to resolve-conflict instead of alerting" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route repos/o/r/pulls/7 "$(pr_json "$H" dirty)"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_equal "$(step_output conflict)" true
+  assert_equal "$(step_output head)" "$H"
+  refute_called 'curl'
+  refute_called 'gh api POST'
+  refute_called 'gh pr merge'
+}
+
 # ── 合并请求被 GitHub 拒绝 ──
 
 REFUSED='GraphQL: refusing to allow a GitHub App to create or update workflow `.github/workflows/<!-- claude-review-clean: x -->.yml` without `workflows` permission (mergePullRequest)'

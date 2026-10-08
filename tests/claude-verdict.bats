@@ -470,7 +470,7 @@ $markers" 'src/`x`.sh' 5)" \
 # ---------- job 形状（配置写错就没有安全边界） ----------
 
 @test "claude-review job is locked down as the spec requires" {
-  job="$(awk '/^  claude-review:/{on=1} on' "$REPO_ROOT/$WF")"
+  job="$(awk '/^  claude-review:/{on=1} /^  resolve-conflict:/{exit} on' "$REPO_ROOT/$WF")"
   assert_contains "$job" "if: needs.watch-and-merge.outputs.fallback == 'true' && github.event.sender.type == 'User'"
   assert_contains "$job" 'group: claude-fallback-review-${{ github.event.pull_request.number || github.event.issue.number }}'
   assert_contains "$job" 'cancel-in-progress: true'
@@ -500,7 +500,7 @@ $markers" 'src/`x`.sh' 5)" \
 }
 
 @test "the --json-schema matches the contract" {
-  schema="$(sed -nE "s/^ *--json-schema '(.*)'$/\1/p" "$REPO_ROOT/$WF")"
+  schema="$(awk '/^  claude-review:/{on=1} /^  resolve-conflict:/{exit} on' "$REPO_ROOT/$WF" | sed -nE "s/^ *--json-schema '(.*)'$/\1/p")"
   jq -e '
     .properties.verdict.enum == ["clean", "findings"]
     and .properties.summary_zh.maxLength == 400

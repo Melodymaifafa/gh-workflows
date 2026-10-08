@@ -207,11 +207,14 @@ declaring_steps() {
 }
 
 # 这把令牌能改所有仓库共用的流水线，所以只交给「推送」和「合并」。任何人把它加到第
-# 四步，这一条就红 —— 而新加的那一步很可能正是跑被审 PR 代码的那种（MEL-254）。
-@test "scope: exactly three steps declare the token — the two pushes and the merge" {
+# 五步，这一条就红 —— 而新加的那一步很可能正是跑被审 PR 代码的那种（MEL-254）。
+# 解冲突那一步推的是合并提交，合进来的集成分支常带着 workflow 改动，所以也要它；那个 job
+# 不运行 PR 里的任何代码（tests/resolve-conflict.bats 守着）。
+@test "scope: exactly four steps declare the token — the two fix pushes, the merge and the conflict merge push" {
   assert_equal "$(declaring_steps "$ITERATE")" 'Commit and push the Claude fix
 Commit and push the Codex fix'
-  assert_equal "$(declaring_steps "$MERGE")" "$MERGE_STEP"
+  assert_equal "$(declaring_steps "$MERGE")" "$MERGE_STEP
+Push the merge or hand it to a person"
 }
 
 @test "scope: the steps that run the PR's own verify command never see it" {
