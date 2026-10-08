@@ -521,11 +521,11 @@ carried_comment() { # carried_comment <id> <login> <assoc> <review> [cleared]
     "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
-  assert_contains "$output" 'Unlanded findings from review(s) 3001 are still open'
+  assert_contains "$output" 'Unfinished findings from review(s) 3001 are still open'
   refute_called 'gh pr merge'
   assert_called 'curl' 1
   body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
-  assert_contains "$body" '更早一轮改好却没推上去的意见还没人处理'
+  assert_contains "$body" '更早的 review 3001 里的意见还没修完'
   assert_contains "$body" "<!-- pr-guard: alert head=$H reason=carried-open until=- -->"
   assert_bodies_inert
 }
@@ -539,6 +539,26 @@ carried_comment() { # carried_comment <id> <login> <assoc> <review> [cleared]
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+# judge 逐条核过、在主人写的放行标记（M8）里点了名的 review，也算处理过：Claude 判「不用改」
+# 交给 judge 放行时，那一轮没推任何东西，没有 M7 来关它。只认主人写的 M8。
+@test "carried: a review the judge released by name no longer blocks the merge" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)" \
+    "$(gh_comment 2 Melodymaifafa OWNER "放行 <!-- claude-judge-clean: head=$OTHER reviews=3000,3001 -->")")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+
+  : >"$FAKE_LOG"
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)" \
+    "$(gh_comment 2 'github-actions[bot]' NONE "放行 <!-- claude-judge-clean: head=$OTHER reviews=3001 -->")")"
+  run run_block "$WF" "$STEP"
+  refute_called 'gh pr merge'
 }
 
 # 关掉的标记只认可信作者：claude[bot] 写一条「已关掉」放不行。反过来，claude[bot] 写的
@@ -592,7 +612,7 @@ fix_run() { # fix_run <status> [workflow name]
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   assert_called 'sleep 20' 1
-  assert_contains "$output" 'Unlanded findings from review(s) 3001 are still open'
+  assert_contains "$output" 'Unfinished findings from review(s) 3001 are still open'
   refute_called 'gh pr merge'
 }
 

@@ -44,7 +44,9 @@ live_head() { fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$1\"}}"; }
 
 gate() { run run_block "$WF" "Gate the fix round"; }
 
-@test "gate: a review on an old head is skipped without touching anything" {
+# 旧 head 上的 review 这一轮不修，但意见要记账：分支被人推过之后，复审只看新 head、不一定再报
+# 同一条（PR #58 上 Codex 审旧 head 的那条 P1 就这样被跳过）。下一轮修复带上它。
+@test "gate: a Codex review on an old head is not fixed, but its findings are recorded for the next round" {
   codex_event
   live_head "$H2"
   gate
@@ -52,8 +54,85 @@ gate() { run run_block "$WF" "Gate the fix round"; }
   assert_equal "$(step_output run)" false
   assert_contains "$output" "stale review"
   refute_called "reviews/4001"
-  refute_called "gh pr comment"
   [ ! -e .review/findings.md ]
+  assert_called "gh pr comment" 1
+  assert_equal "$(fake_last_body "gh pr comment")" "🤖 review 4001 到的时候 PR 已经换了新提交，这批意见先记下：下一轮自动修复会带上它们，在那之前这个 PR 不会自动合并。
+
+<!-- pr-guard: carried-findings review=4001 from=$H -->"
+}
+
+# 记过账的（开着的、或者已经关掉的）不再记第二笔；巡检的重修请求（M5）、不可信的人写的 review
+# 不是意见本身，不记。
+@test "gate: a late review already on the books, a late M5 and an untrusted late review record nothing" {
+  live_head "$H2"
+  for known in "$(gh_comment 1 'github-actions[bot]' NONE "x <!-- pr-guard: carried-findings review=4001 from=$H -->")" \
+               "$(gh_comment 1 'github-actions[bot]' NONE "x <!-- pr-guard: carried-findings-cleared review=4001 head=$H2 -->")" \
+               "$(gh_comment 1 Melodymaifafa OWNER "x <!-- claude-judge-clean: head=$H reviews=4001 -->")"; do
+    : >"$FAKE_LOG"
+    fake_route "$COMMENTS" "$(json_array "$known")"
+    codex_event
+    gate
+    assert_equal "$status" 0
+    refute_called "gh pr comment"
+  done
+
+  fake_route "$COMMENTS" '[]'
+  m5_event 4001 "$H"
+  gate
+  refute_called "gh pr comment"
+
+  : >"$FAKE_LOG"
+  export REVIEW_ID=4002 REVIEW_COMMIT="$H" REVIEW_LOGIN=someone REVIEW_ASSOC=CONTRIBUTOR
+  export REVIEW_BODY="<!-- claude-review-findings: $H -->"
+  gate
+  refute_called "gh pr comment"
+}
+
+@test "gate: a late review that cannot be recorded goes red instead of vanishing" {
+  codex_event
+  live_head "$H2"
+  fake_cli_fail pr_comment 1
+  gate
+  assert_equal "$status" 1
+  assert_contains "$output" 'cannot record late review 4001'
+}
+
+# 开修之前先记账：这一轮也可能验证没过、撞额度、Claude 没跑成，这时有人推一笔，意见就丢了；
+# 合并检查也可能赶在「推不上去」那一笔之前合掉（Codex 2026-10-07 的 P1）。
+@test "gate: a fix round records its review as pending before fixing begins" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  gate
+  assert_equal "$status" 0
+  assert_equal "$(step_output run)" true
+  assert_equal "$(step_output closes)" 4001
+  assert_called "gh pr comment" 1
+  assert_equal "$(fake_last_body "gh pr comment")" "🤖 第 1 轮开始修 review 4001（Codex）。修好推上去之前，这批意见算没处理，这个 PR 不会自动合并。
+
+<!-- pr-guard: carried-findings review=4001 from=$H -->"
+}
+
+@test "gate: a retry of a review already on the books records nothing new" {
+  m5_event 4001 "$H"
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 'github-actions[bot]' NONE "x <!-- pr-guard: carried-findings review=4001 from=$H -->")")"
+  gate
+  assert_equal "$(step_output run)" true
+  refute_called "gh pr comment"
+}
+
+@test "gate: a round whose pending record cannot be posted does not start fixing" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_cli_fail pr_comment 1
+  gate
+  assert_equal "$status" 1
+  assert_contains "$output" 'cannot record review 4001 as pending'
+  refute_contains "$(cat "$GITHUB_OUTPUT")" 'run=true'
 }
 
 @test "gate: Codex review, no earlier summon -> round 1, findings prefetched with HTML comments stripped" {
@@ -198,6 +277,21 @@ m9_event() { # m9_event <login> <assoc>
   assert_equal "$(step_output reviewer)" 'Claude 复核'
   refute_contains "$(cat "$GITHUB_OUTPUT")" "judge=true"
   assert_contains "$(cat .review/findings.md)" '空列表会崩'
+}
+
+# judge 确认的 bug（M9）修完推上去，这个 head 上它核过的全部意见一起关：没确认的那些它判过
+# 不拦合并。不一起关的话，原来那几条 Codex review 的账一直开着，合并永远被拦。
+@test "gate: a round on the judge's confirmed bugs closes every findings review on that head once pushed" {
+  m9_event
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array \
+    "$(gh_review 4001 "$CODEX" NONE "$H" 'body')" "$(gh_review 4002 "$CODEX" NONE "$H" 'body')" \
+    "$(gh_review 3001 "$CODEX" NONE "$H2" 'older head')" \
+    "$(gh_review 5009 melody OWNER "$H" "$(m9_body "$H")")")"
+  gate
+  assert_equal "$(step_output run)" true
+  assert_equal "$(step_output closes)" 5009,4001,4002,5009
 }
 
 @test "gate: confirmed bugs keep getting fixed through round 10" {
@@ -468,7 +562,7 @@ carried_review() { # carried_review <id> <login> <assoc> <inline title>
   assert_equal "$(step_output target)" 4001
   assert_equal "$(step_output carried)" 3001
   f="$(cat .review/findings.md)"
-  assert_contains "$f" "# 上一轮没推上去的意见（review 3001，commit $H0）"
+  assert_contains "$f" "# 以前没修完的意见（review 3001，commit $H0）"
   assert_contains "$f" '行号可能已经对不上'
   assert_contains "$f" '### scripts/gpu_gate.py:42'
   assert_contains "$f" 'Reject runs with no step-one loss'
@@ -494,8 +588,21 @@ carried_review() { # carried_review <id> <login> <assoc> <inline title>
   gate
   assert_equal "$(step_output run)" true
   assert_equal "$(step_output carried)" ''
-  refute_contains "$(cat .review/findings.md)" '上一轮没推上去'
+  refute_contains "$(cat .review/findings.md)" '以前没修完'
   assert_contains "$output" 'carried review 3003 is not a findings review'
+}
+
+# judge 在主人的放行标记（M8）里点了名的，算处理过，不再带进修复。
+@test "gate: a carried review the judge released by name is not handed on" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  carried_review 3001 "$CODEX" NONE 'judged already'
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 1 'github-actions[bot]' NONE "$(carried_marker 3001)")" \
+    "$(gh_comment 2 Melodymaifafa OWNER "<!-- claude-judge-clean: head=$H0 reviews=3001 -->")")"
+  gate
+  assert_equal "$(step_output carried)" ''
 }
 
 # 主人的 Claude 代审（M3）同样算有意见的 review，按它自己那个 commit 认标记。
