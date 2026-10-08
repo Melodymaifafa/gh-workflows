@@ -595,6 +595,15 @@ jobs:
                 <<<"$relevant_checks"
             )"
             check_count="$(jq length <<<"$relevant_checks")"
+            # 跟 base 冲突的 PR 上 GitHub 不跑 pull_request 触发的 CI，一条检查也等不来：
+            # 直接交给 resolve-conflict，别干等到超时再报「CI 一直没跑完」。
+            if [ "$check_count" -eq 0 ] &&
+              [ "$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .mergeable_state 2>/dev/null)" = dirty ]
+            then
+              echo "::notice::PR #$PR_NUMBER conflicts with $BASE_BRANCH, so its CI cannot start; resolve-conflict merges it in"
+              { echo conflict=true; echo "head=$expected_head"; } >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
             if [ "$check_count" -gt 0 ] && [ "$pending_count" -eq 0 ]; then
               stable_check_polls="$((stable_check_polls + 1))"
               if [ "$stable_check_polls" -ge 2 ]; then
@@ -1253,9 +1262,9 @@ jobs:
               "Claude 代审这次没跑成（不是额度问题），巡检稍后会自动重试；一直这样就去看 Actions 日志。"
           fi
 
-  # PR 跟 base 冲突时把 base 合进 PR 分支。两种情况叫醒它：合并检查看到 dirty（审查、CI 都过了，
-  # 只差冲突），或巡检留了 conflict 标记（主人 PAT 发的；issue_comment 在冲突的 PR 上照样触发，
-  # pull_request / pull_request_review 不触发，所以修复工作流接不住这件事）。
+  # PR 跟 base 冲突时把 base 合进 PR 分支。两种情况叫醒它：合并检查看到 dirty（审查过了，
+  # CI 也过了或者因为冲突根本跑不起来），或巡检留了 conflict 标记（主人 PAT 发的；issue_comment
+  # 在冲突的 PR 上照样触发，pull_request / pull_request_review 不触发，所以修复工作流接不住这件事）。
   # 跟 claude-review 一样不运行 PR 里的任何代码：git 用封死的配置跑，Claude 只能改 pr/ 下的
   # 文件、不能跑命令；测试交给推上去以后的 CI，CI 绿、Codex 过才照常合并。解不了就推手机交给人。
   resolve-conflict:

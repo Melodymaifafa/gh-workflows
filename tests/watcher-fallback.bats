@@ -848,6 +848,37 @@ $(m6_marker "$H" ci)")")"
   refute_called 'gh pr merge'
 }
 
+# 一开就冲突的 PR 上 GitHub 不跑 pull_request 的 CI：不干等到超时报 ci，直接交给 resolve-conflict。
+@test "a conflicted PR with no CI checks is handed to resolve-conflict without waiting" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  fake_cli pr_checks '[{"name":"iterate","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/333/job/1","workflow":"Claude iterates on Codex review"}]'
+  fake_route repos/o/r/pulls/7 "$(pr_json "$H" dirty)"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_equal "$(step_output conflict)" true
+  assert_equal "$(step_output head)" "$H"
+  refute_contains "$output" 'did not settle'
+  refute_called 'sleep'
+  refute_called 'curl'
+  refute_called 'gh api POST'
+  refute_called 'gh pr merge'
+}
+
+# 还没有检查、也不冲突时照旧等 CI，不交给 resolve-conflict。
+@test "no CI checks on a PR without conflicts keeps waiting and alerts ci" {
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  fake_cli pr_checks '[]'
+  fast_sleep 60
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'did not settle'
+  assert_called "reason=ci until=-" 1
+  if step_output conflict >/dev/null; then
+    echo "unexpected conflict output: $(step_output conflict)" >&2
+    return 1
+  fi
+}
+
 # ── 合并请求被 GitHub 拒绝 ──
 
 REFUSED='GraphQL: refusing to allow a GitHub App to create or update workflow `.github/workflows/<!-- claude-review-clean: x -->.yml` without `workflows` permission (mergePullRequest)'
