@@ -215,31 +215,53 @@ refute_writes() {
 
 # ── 规则 1：冲突 ──
 
-@test "backlog: a conflicted PR alerts once, Pushover first, then the marker" {
+# 冲突先交给合并工作流的 resolve-conflict：这条留言（主人 PAT 发的）就是叫醒它的那一下，
+# 人还不用管，所以不推手机。
+@test "backlog: a conflicted PR gets one quiet marker that wakes the merge workflow" {
   one_pr dirty 900
   export PUSHOVER_TOKEN=t PUSHOVER_USER=u
   sweep
   assert_equal "$status" 0
-  assert_called "curl" 1
+  refute_called "curl"
   assert_called "gh api POST repos/$R/issues/7/comments" 1
-  curl_line="$(grep -n '^curl' "$FAKE_LOG" | cut -d: -f1)"
-  post_line="$(grep -n '^gh api POST' "$FAKE_LOG" | cut -d: -f1)"
-  [ "$curl_line" -lt "$post_line" ]
   body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  # resolve-conflict 的 if 认的就是这一串（codex-approved-merge.yml）。
   assert_contains "$body" "<!-- pr-guard: alert head=$H reason=conflict until=- -->"
-  assert_contains "$body" "这个 PR 和 develop 有冲突"
+  assert_contains "$body" "合并工作流会先自动把 develop 合进来"
   refute_contains "$body" "@codex review"
   refute_contains "$body" "claude-review-clean:"
 
-  # 下一轮：标记已在，什么也不做（也不踢）。
+  # 下一轮：标记已在、自动解冲突还在跑，什么也不做（也不踢）。
   : >"$FAKE_LOG"
   comments "$(owner_comment 5 "$body" 1)"
   sweep
   refute_writes
 }
 
+@test "a conflict nobody resolved within 2 hours is handed to a person once" {
+  one_pr dirty 900
+  export PUSHOVER_TOKEN=t PUSHOVER_USER=u
+  comments "$(alert_comment 5 conflict - 119)"
+  sweep
+  refute_writes
+
+  comments "$(alert_comment 5 conflict - 121)"
+  sweep
+  assert_called "curl" 1
+  body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  assert_contains "$body" "<!-- pr-guard: alert head=$H reason=conflict-stuck until=- -->"
+  assert_contains "$body" "自动解冲突 2 小时都没结果"
+
+  # resolve-conflict 自己交给人了（或巡检告过了）：不再管这个 head。
+  : >"$FAKE_LOG"
+  comments "$(alert_comment 5 conflict - 300)" "$(alert_comment 6 conflict-stuck - 200)"
+  sweep
+  refute_writes
+}
+
 @test "a Pushover failure posts no marker, so the next sweep retries" {
   one_pr dirty 900
+  comments "$(alert_comment 5 conflict - 180)"
   export PUSHOVER_TOKEN=t PUSHOVER_USER=u
   echo 22 >"$FAKE_GH_DIR/curl.exit"
   sweep
@@ -974,7 +996,7 @@ EOF
     refute_contains "$all" "secret-branch"
   done
   # Pushover 和 PR 评论是私人通道，照写真名和分支名。
-  assert_contains "$(fake_calls curl)" "$R#1"
+  assert_contains "$(fake_calls curl)" "$R#4"
   assert_contains "$(fake_last_body "gh api POST repos/$R/issues/1/comments")" "这个 PR 和 $B 有冲突"
   assert_contains "$(fake_last_body "gh api POST repos/$R/issues/4/comments")" "把 base 改成 $B"
   assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
