@@ -206,13 +206,17 @@ jobs:
             # 发不出去隔 10 / 30 / 60 秒再试：有的标记只在这里发一次，一次网络抖动丢了就没人补
             # （carried-findings 一丢，分支已经换了 head，没修的意见就跟着进了合并）。发重了无妨：
             # 标记只按「有没有」认。全失败照旧返回非零，红不红由调用处定。
-            # 找不到 gh、或者 GitHub 回 4xx（令牌、权限、PR 不对）时再试也一样，立刻返回：不然每次
-            # 都白等 100 秒（测试里发评论本来就会失败，整套测试因此慢了几倍）。
+            # 找不到 gh、或者 GitHub 回的是再试也一样的错（401 令牌不对、403 没权限、404、422），
+            # 立刻返回：不然每次都白等 100 秒（测试里发评论本来就会失败，整套测试因此慢了几倍）。
+            # 限流（403 / 429，正文里有 rate limit）是暂时的，照样等着重试（Codex 2026-10-08 的 P1）。
             for pause in 0 10 30 60; do
               [ "$pause" -eq 0 ] || { echo "posting the $reason alert failed; retrying in ${pause}s"; sleep "$pause" || true; }
               err="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$body" 2>&1 >/dev/null)" && return 0
               printf '%s\n' "$err" >&2
-              case "$err" in *'command not found'* | *'HTTP 4'*) return 1 ;; esac
+              case "$err" in
+                *'rate limit'*) ;;
+                *'command not found'* | *'HTTP 401'* | *'HTTP 403'* | *'HTTP 404'* | *'HTTP 422'*) return 1 ;;
+              esac
             done
             return 1
           }
@@ -1471,7 +1475,7 @@ jobs:
             # 发不出去隔一会儿再试（同 alert_once）：上面那几行 carried-findings-cleared 只在这里
             # 发一次，丢了的话那几条意见在合并检查眼里一直开着，干净的复审之后也只会停车。
             # 全失败照旧只警告：推已经成功了，为一条评论打红会让后面召唤复审跟着被跳过。
-            # 找不到 gh、或者 GitHub 回 4xx 就不再试（同 alert_once）。
+            # 再试也一样的错就不再试，限流照样重试（判据同 alert_once，两处逐字一样）。
             m7_posted=''
             for pause in 0 10 30 60; do
               [ "$pause" -eq 0 ] || { echo "fix-round marker for $new_head not posted; retrying in ${pause}s"; sleep "$pause" || true; }
@@ -1480,7 +1484,10 @@ jobs:
                 break
               fi
               printf '%s\n' "$m7_err" >&2
-              case "$m7_err" in *'command not found'* | *'HTTP 4'*) break ;; esac
+              case "$m7_err" in
+                *'rate limit'*) ;;
+                *'command not found'* | *'HTTP 401'* | *'HTTP 403'* | *'HTTP 404'* | *'HTTP 422'*) break ;;
+              esac
             done
             [ -n "$m7_posted" ] || echo "::warning::fix-round marker for $new_head not posted"
           }

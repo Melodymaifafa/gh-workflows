@@ -1013,6 +1013,40 @@ carry_env() {
   [ "${#push}" -lt 1024 ] || { echo "push message is ${#push} chars" >&2; return 1; }
 }
 
+# 发评论失败时重不重试：限流（403 / 429）是暂时的，要等着再试 —— 拦合并的标记只在这里
+# 发一次（Codex 2026-10-08 的 P1）；令牌不对、没权限、找不到 gh 再试也一样，立刻放弃，
+# 不白等 100 秒。gh / sleep 换成函数，只看 alert_once 自己怎么判。
+retry_count() { # retry_count <gh 打到 stderr 的那句话>
+  (
+    eval "$PR_GUARD"
+    trusted_comments() { echo '[]'; }
+    pushover() { :; }
+    gh() { printf '%s\n' "$GH_ERR" >&2; return 1; }
+    sleep() { echo slept >>"$BATS_TEST_TMPDIR/slept"; }
+    : >"$BATS_TEST_TMPDIR/slept"
+    GH_ERR="$1" alert_once "$H" findings-carried - msg '<!-- x -->' >/dev/null 2>&1 && echo posted
+    wc -l <"$BATS_TEST_TMPDIR/slept" | tr -d ' '
+  )
+}
+
+@test "carry: a rate-limited marker post is retried; one that can never succeed is not" {
+  assert_equal "$(retry_count 'HTTP 403: You have exceeded a secondary rate limit')" 3
+  assert_equal "$(retry_count 'HTTP 429: API rate limit exceeded')" 3
+  assert_equal "$(retry_count 'HTTP 502: Bad Gateway')" 3
+  assert_equal "$(retry_count 'error connecting to api.github.com')" 3
+  assert_equal "$(retry_count 'HTTP 401: Bad credentials (https://api.github.com/graphql)')" 0
+  assert_equal "$(retry_count 'HTTP 403: Resource not accessible by integration')" 0
+  assert_equal "$(retry_count 'HTTP 404: Not Found')" 0
+  assert_equal "$(retry_count 'bash: gh: command not found')" 0
+}
+
+# 发轮数标记（M7，里面带着关掉旧意见的标记）那段重试跟 alert_once 用同一套判据。
+@test "carry: the round-marker retry gives up on exactly the same errors as alert_once" {
+  pat() { grep -A3 "case \"\$$1\" in" "$REPO_ROOT/$WF" | sed -n '2,3p' | sed 's/ *) [a-z]* 1* *;;$//; s/ *) [a-z]* ;;$//; s/^ *//'; }
+  [ -n "$(pat err)" ] || { echo 'no retry case found in alert_once' >&2; return 1; }
+  assert_equal "$(pat m7_err)" "$(pat err)"
+}
+
 @test "carry: each way the replay fails gets its own wording" {
   for c in conflict::同一处 fetch-failed::拉不下 refused:workflow-permission:令牌不许改 \
            refused:protected-branch:分支保护 refused:non-fast-forward:又被推了一次 refused::原因在这次运行的日志里; do
