@@ -515,6 +515,7 @@ carried_comment() { # carried_comment <id> <login> <assoc> <review> [cleared]
 }
 
 @test "carried: an open carried finding blocks a clean, green head and alerts once" {
+  unset CODEX_TRIGGER_TOKEN
   path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
   green_checks
   fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
@@ -523,11 +524,99 @@ carried_comment() { # carried_comment <id> <login> <assoc> <review> [cleared]
   assert_equal "$status" 0
   assert_contains "$output" 'Unfinished findings from review(s) 3001 are still open'
   refute_called 'gh pr merge'
+  # 没有主人的 PAT，补不了请修复的那条 review：照旧告警停下
+  refute_called 'gh api POST repos/o/r/pulls/7/reviews'
   assert_called 'curl' 1
   body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
   assert_contains "$body" '更早的 review 3001 里的意见还没修完'
+  assert_contains "$body" '仓库没配 CODEX_TRIGGER_TOKEN'
   assert_contains "$body" "<!-- pr-guard: alert head=$H reason=carried-open until=- -->"
   assert_bodies_inert
+}
+
+# Codex 2026-10-08 的 P2：新 head 审查通过了，就没有「下一轮修复」来带上开着的旧意见 ——
+# iterate 只在 head 上有意见时开修，巡检又把 carried-open 当停车，PR 一直卡着等人。
+# 所以有主人的 PAT 时，在这个 head 上补一条有意见的 review（M3 形状），iterate 照常开一轮。
+reraise_review() { # reraise_review <id>：合并检查补过的那条
+  gh_review "$1" Melodymaifafa OWNER "$H" "🤖 补一条请修复。
+
+<!-- claude-review-findings: $H -->
+<!-- pr-guard: carried-reraise head=$H -->"
+}
+
+@test "carried: with the owner PAT, a clean head held only by old findings asks iterate for a fix round" {
+  export CODEX_TRIGGER_TOKEN=owner-pat
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called 'gh pr merge'
+  # 不停车、不推手机：iterate 会开一轮把它们带上
+  refute_called 'curl'
+  refute_called 'reason=carried-open'
+  assert_called 'gh api POST repos/o/r/pulls/7/reviews' 1
+  call="$(fake_calls 'gh api POST repos/o/r/pulls/7/reviews')"
+  assert_contains "$call" '[token=owner-pat]'
+  assert_contains "$call" 'event=COMMENT'
+  assert_contains "$call" "commit_id=$H"
+  body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
+  assert_contains "$body" '更早的 review 3001 里还有没修完的意见'
+  assert_contains "$body" "<!-- claude-review-findings: $H -->"
+  assert_contains "$body" "<!-- pr-guard: carried-reraise head=$H -->"
+  assert_bodies_inert
+}
+
+# 每个 head 只补一次：补过的那一轮判完（M8 点了它的名）旧意见还开着，再补只会原地转圈。
+@test "carried: a head that already asked for a fix round parks with the alert instead of asking again" {
+  export CODEX_TRIGGER_TOKEN=owner-pat
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 950)")"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(reraise_review 950)")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called 'gh pr merge'
+  refute_called 'gh api POST repos/o/r/pulls/7/reviews'
+  assert_called 'curl' 1
+  body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
+  assert_contains "$body" '已经请自动修复带上它们修过一轮，还是没关掉'
+  assert_contains "$body" "<!-- pr-guard: alert head=$H reason=carried-open until=- -->"
+}
+
+# iterate 不接 [no-claude] 的 PR：补了那条 review 也没人修，它还会拦着合并、悄悄卡住。
+@test "carried: a [no-claude] PR is not asked for a fix round; it parks with the alert" {
+  export CODEX_TRIGGER_TOKEN=owner-pat
+  fake_route repos/o/r/pulls/7 "$(pr_json | jq '.title = "[no-claude] feat: x"')"
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called 'gh pr merge'
+  refute_called 'gh api POST repos/o/r/pulls/7/reviews'
+  body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
+  assert_contains "$body" '标题带 [no-claude]，不自动修'
+  assert_contains "$body" "<!-- pr-guard: alert head=$H reason=carried-open until=- -->"
+}
+
+@test "carried: a fix-round request that cannot be posted falls back to the alert" {
+  export CODEX_TRIGGER_TOKEN=owner-pat
+  path_d "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")"
+  green_checks
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(carried_comment 1 'github-actions[bot]' NONE 3001)")"
+  fake_route_fail -X POST "repos/o/r/pulls/7/reviews" 1
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called 'gh pr merge'
+  assert_contains "$output" 'Could not post the review that asks for a fix round'
+  body="$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')"
+  assert_contains "$body" '请自动修复的那条 review 没发出去'
+  assert_contains "$body" "<!-- pr-guard: alert head=$H reason=carried-open until=- -->"
 }
 
 @test "carried: once a later fix round closed it, the head merges" {

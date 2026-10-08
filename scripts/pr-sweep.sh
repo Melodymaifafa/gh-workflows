@@ -246,8 +246,9 @@ sweep_pr() {
   fi
 
   # 2. 已停车：等人处理，巡检不插手。
-  # carried-open：审查通过了，但更早一轮没推上去的意见还开着，合并检查拦着等人。再叫审只会
-  # 再拿一个「通过」、再被拦一次。
+  # carried-open：审查通过了，但更早的意见还开着，合并检查拦着等人 —— 它已经在这个 head 上补过
+  # 一条请修复的 review、修过一轮还没关掉，或者没有主人的 PAT 补不了。再叫审只会再拿一个「通过」、
+  # 再被拦一次。
   case ",$alerts," in *,no-fix,*|*,round-cap,*|*,retry-exhausted,*|*,merge-refused,*|*,carried-open,*) echo "  已停车"; return 0 ;; esac
   case ",$alerts," in *,ci,*) [ "$state" != unstable ] || { echo "  CI 红，已停车"; return 0; } ;; esac
 
