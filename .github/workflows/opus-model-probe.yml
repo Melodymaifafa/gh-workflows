@@ -1,6 +1,6 @@
 # 每周探一次「现在最新的 Opus 是哪个」，跟本仓库钉死的 claude_model 默认值比，
 # 不一样推一条 Pushover，一样什么都不发（规则和去重见 scripts/probe-latest-opus.sh）。
-# 只提醒，不自动改默认值 —— 改默认 = 改一行 + 合 PR + 移 v1 标签，那一步在人手里。
+# 只提醒，不自动改默认值 —— 改默认 = 改一行 + 合 PR（第二天 v1 自动跟上），改哪个模型由人定。
 # 只在 gh-workflows 里跑（它读的就是本仓库的那两个默认值；公开仓库，分钟免费）。
 name: Opus model probe
 
