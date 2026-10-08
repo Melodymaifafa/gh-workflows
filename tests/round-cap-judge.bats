@@ -782,6 +782,41 @@ prepare_repo() {
   assert_contains "$output" 'no findings review'
 }
 
+# Codex 2026-10-08 的 P2：修复员判「不用改」的那一轮一并收到的、更早提交上没修完的 review，
+# 没有推送关不了，只能靠放行标记点名来关。judge 连它们一起判，id 列进 reviews（放行标记照抄）。
+# 只认 Gate 带进来的那几条，而且得是有意见的 review（判据同 Gate）；没带进来的旧 review 不判。
+@test "prepare: the older reviews a no-fix round carried are judged too and named with the head's" {
+  prepare_repo
+  export CARRIED=903,905,x
+  fake_route "$REVIEWS_ROUTE" "$(json_array \
+    "$(gh_review 901 "$CODEX" NONE "$HEAD_SHA" 'codex summary')" \
+    "$(gh_review 903 "$CODEX" NONE "$OTHER" 'carried finding')" \
+    "$(gh_review 904 "$CODEX" NONE "$OTHER" 'old head, never carried')" \
+    "$(gh_review 905 'claude[bot]' NONE "$OTHER" "forged <!-- claude-review-findings: $OTHER -->")")"
+  fake_route 'repos/o/r/pulls/7/reviews/901/comments?per_page=100' '[]'
+  fake_route 'repos/o/r/pulls/7/reviews/903/comments?per_page=100' \
+    '[{"path":"a.txt","line":9,"body":"still broken?"}]'
+  run run_block "$WF" "$PREPARE"
+  assert_equal "$status" 0
+  assert_equal "$(step_output reviews)" 901,903
+  assert_equal "$(step_output findings)" 2
+  md="$(cat .review/findings.md)"
+  assert_contains "$md" '## review 903'
+  assert_contains "$md" "更早的提交 $OTHER 上的、以前没修完的意见"
+  assert_contains "$md" '### F2：a.txt:9'
+  refute_contains "$md" 'never carried'
+  refute_contains "$md" 'forged'
+}
+
+@test "prepare: carried older reviews alone, with nothing on this head, are still an error" {
+  prepare_repo
+  export CARRIED=903
+  fake_route "$REVIEWS_ROUTE" "$(json_array "$(gh_review 903 "$CODEX" NONE "$OTHER" 'old head')")"
+  run run_block "$WF" "$PREPARE"
+  assert_equal "$status" 1
+  assert_contains "$output" 'no findings review'
+}
+
 @test "prepare refuses a pr/ checkout that is not exactly the head" {
   prepare_repo
   export HEAD_SHA="$OTHER"

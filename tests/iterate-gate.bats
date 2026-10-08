@@ -878,6 +878,29 @@ stale_env() { # stale_env <默认分支上那份文件的内容>
   refute_called "curl "
 }
 
+# Codex 2026-10-08 的 P2：带进来的以前没修完的意见在新 head 上已经改好了，Claude 一行不改，
+# 这一轮没有推送、关不了它们。已有的放行标记只点了这个 head 上的 review，没点它们：照样交给
+# judge，让它连它们一起判、放行标记点它们的名，不然它们一直开着、合并一直拦着。
+@test "outcome: an M8 that skipped the carried reviews does not count as a verdict for this round" {
+  outcome_env success '{"pushed":false,"fixed":0,"skipped":2}'
+  export REVIEWER=Codex CARRIED=3001
+  live_head "$H"
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" "$(json_array "$(gh_review 4001 "$CODEX" NONE "$H" 'body')")"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=4001 -->")")"
+  outcome
+  assert_equal "$status" 0
+  assert_equal "$(step_output judge)" true
+  assert_equal "$(step_output judge_reason)" no-fix
+  : >"$GITHUB_OUTPUT"
+  fake_route "$COMMENTS" "$(json_array \
+    "$(gh_comment 3 melody OWNER "可合。<!-- claude-judge-clean: head=$H reviews=4001,3001 -->")")"
+  outcome
+  assert_equal "$status" 0
+  assert_equal "$(step_output judge 2>/dev/null || true)" ""
+  assert_contains "$output" "already has a verdict"
+}
+
 @test "outcome: a forged claude[bot] no-fix marker does not suppress the real alert; a trusted one does" {
   outcome_env success '{"pushed":false,"fixed":0,"skipped":1}'
   export HAS_PAT=false
