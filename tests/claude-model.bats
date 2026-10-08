@@ -45,7 +45,7 @@ setup() {
   refute_contains "$model" sonnet
   refute_contains "$model" haiku
   assert_equal "$(input_default "$MERGE_WF" claude_effort)" xhigh
-  job="$(awk '/^  claude-review:/{on=1} on' "$REPO_ROOT/$MERGE_WF")"
+  job="$(awk '/^  claude-review:/{on=1} /^  resolve-conflict:/{exit} on' "$REPO_ROOT/$MERGE_WF")"
   assert_contains "$job" '--model ${{ inputs.claude_model }}'
   assert_contains "$job" '--effort ${{ inputs.claude_effort }}'
 }
@@ -183,9 +183,27 @@ judge_guard_block() {
   assert_equal "$status" 0
 }
 
+# 解冲突那个 job 是第四份同样的块：冲突解完同样会被自动合并，降级模型不能混进来。
+@test "merge: the conflict resolver carries the very same guard, before Claude runs" {
+  job="$(awk '/^  resolve-conflict:/{on=1} on' "$REPO_ROOT/$MERGE_WF")"
+  resolver="$(awk '
+    /case "\$CLAUDE_MODEL" in/ { on = 1 }
+    on { print }
+    on && /^ *esac$/ { if (++n == 2) exit }
+  ' <<<"$job")"
+  assert_equal "$resolver" "$(model_guard_block "$WF")"
+  guard_at="$(awk '/- name: Check the resolver model and effort/{print NR; exit}' <<<"$job")"
+  claude_at="$(awk '/- name: Claude resolves the conflicts$/{print NR; exit}' <<<"$job")"
+  [ -n "$guard_at" ] && [ -n "$claude_at" ] || { echo 'guard or resolver step missing' >&2; return 1; }
+  [ "$guard_at" -lt "$claude_at" ] || { echo "guard at $guard_at is after Claude at $claude_at" >&2; return 1; }
+  export CLAUDE_MODEL=claude-sonnet-5 CLAUDE_EFFORT=xhigh
+  run run_block "$MERGE_WF" "Check the resolver model and effort"
+  assert_equal "$status" 1
+}
+
 # 先验必须排在 Claude 那一步前面，否则 action 已经带着错值启动了。
 @test "merge: the guard runs before the Claude review step" {
-  job="$(awk '/^  claude-review:/{on=1} on' "$REPO_ROOT/$MERGE_WF")"
+  job="$(awk '/^  claude-review:/{on=1} /^  resolve-conflict:/{exit} on' "$REPO_ROOT/$MERGE_WF")"
   guard_at="$(awk '/- name: Check the review model and effort/{print NR; exit}' <<<"$job")"
   review_at="$(awk '/- name: Claude review$/{print NR; exit}' <<<"$job")"
   [ -n "$guard_at" ] && [ -n "$review_at" ] || { echo 'guard or review step missing' >&2; return 1; }

@@ -6,7 +6,8 @@
 # 集成分支 = 仓库默认分支上合并调用桩的 base_branch（见 integration_base）。
 # 每个 open、非草稿、同仓库、标题不带 [no-codex-merge]/[no-claude] 的 PR，按顺序只走第一条命中的规则：
 #   0. 没人管            → 仓库没接共享自动化、或 PR 没打向集成分支：空闲 ≥ 60 分钟时告警一次（unwatched），停。
-#   1. 有冲突            → 告警一次（conflict），停。
+#   1. 有冲突            → 留一条不推手机的 conflict 标记叫醒合并工作流，由它把集成分支合进来、停；
+#                          它解不了会自己告警（conflict-stuck）；留言后空闲 ≥ 2 小时还没动静就由巡检告警。
 #   2. 这个 head 已停车  → 停（no-fix、round-cap、retry-exhausted、merge-refused、carried-open、CI 红且 unstable）。
 #   3. 额度还没恢复      → 停（这个 head 上最晚的 until 还没到）。
 #   4. head 有审查意见   → 空闲 ≥ 60 分钟或额度已恢复时发 M5 让 iterate 再修，每个 head 最多算 2 次
@@ -162,13 +163,14 @@ head_unchanged() {
   return 1
 }
 
-# alert_once <reason> <until> <一句话>：(H, reason) 已有可信 M6 就什么也不做；否则先推送再留标记。
+# alert_once <reason> <until> <一句话> [quiet]：(H, reason) 已有可信 M6 就什么也不做；否则先推送再留标记。
+# quiet：只留标记不推手机（标记本身就是给别的工作流看的，人还不用管）。
 alert_once() {
   local reason="$1" until="$2" msg="$3"
   case ",$alerts," in *",$reason,"*) return 0 ;; esac
   if [ "$MODE" = dry ]; then summary "- would alert $who reason=$reason$hs"; return 0; fi
   head_unchanged || return 0
-  if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
+  if [ "${4:-}" != quiet ] && [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
     # 推送失败就不留标记，下一轮巡检重发，免得告警丢了还当作已发。
     curl -sf -X POST https://api.pushover.net/1/messages.json \
       --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
@@ -239,9 +241,21 @@ sweep_pr() {
     return 0
   fi
 
-  # 1. 冲突：只有人能解。
+  # 1. 冲突：这条留言（主人 PAT 发的）叫醒合并工作流的 resolve-conflict，由它把 $base 合进来。
+  #    冲突的 PR 上 pull_request 类事件都不触发，issue_comment 照样触发，所以靠留言叫。
+  #    合好了 head 就变了；解不了它自己告警 conflict-stuck。留言后 2 小时还没动静，说明它没跑起来。
   if [ "$state" = dirty ]; then
-    alert_once conflict - "🤖 巡检：这个 PR 和 $base 有冲突，自动流程停了；请在本地解决冲突后推上来。"
+    case ",$alerts," in
+      *,conflict-stuck,*) echo "  冲突已交给人" ;;
+      *,conflict,*)
+        if [ "$idle" -ge 7200 ]; then
+          alert_once conflict-stuck - "🤖 巡检：这个 PR 和 ${base} 有冲突，自动解冲突 2 小时都没结果。请在本地把 ${base} 合进来、解完冲突后推上来。"
+        else
+          echo "  等自动解冲突"
+        fi
+        ;;
+      *) alert_once conflict - "🤖 巡检：这个 PR 和 ${base} 有冲突，合并工作流会先自动把 ${base} 合进来；解不了会再通知你。" quiet ;;
+    esac
     return 0
   fi
 

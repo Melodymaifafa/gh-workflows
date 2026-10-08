@@ -20,7 +20,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 |---|---|---|
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
 | `claude-codex-iterate.yml` | Codex 或 Claude 代审提交意见后 | 选一个 fixer 读意见、只改代码；验证、push、发中文总结由不带凭据/带凭据的独立步骤接手，然后召唤复审；最多连修 5 轮，修满还有意见就让 Claude 逐条判断剩下的意见拦不拦合并（见下方「修满轮数之后」）。默认 Claude 先上，撞额度/限流/认证失效才换 Codex 接手 |
-| `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 | 先等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop） |
+| `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 / 巡检发现冲突 | 先等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop）。跟集成分支冲突就先把它合进 PR 分支（见下方「冲突」） |
 | `pr-sweeper.yml` | 定时（cron 写每 15 分钟，实测 2–7 小时一次；只在本仓库跑） | 扫 owner 名下所有仓库，集成分支取各仓库调用桩的 `base_branch`；给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
 | `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
 | `move-v1.yml` | 每天 09:47（北京时间），也可手动点（只在本仓库跑） | 把 `v1` 标签移到 develop 上 CI 全绿的最新提交 —— 各仓库钉的是 `@v1`，这一步就是发布。移了推一条手机通知（带了哪些 PR、怎么回滚）；只往前挪 |
@@ -40,6 +40,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | 标记 | 谁写 | 意思 |
 |---|---|---|
 | `codex-review-head: H` | PAT（iterate / 巡检） | 请审 H；可带 `fix-round: N` 或 `pr-sweeper: kick` |
+| `pr-guard: conflict-merged head=H new=N` | PAT（合并环节的 resolve-conflict） | H 跟集成分支冲突，已把集成分支合进来、推成 N；后面紧跟一条请 Codex 审 N 的 M1 |
 | `pr-guard: fallback head=H` | GITHUB_TOKEN | Codex 这次不行，换 Claude |
 | `claude-review-findings: H` | PAT | Claude 代审有意见（一条 COMMENT review） |
 | `claude-review-clean: H` | PAT | Claude 代审无意见，CI 绿就合 |
@@ -54,7 +55,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | `pr-guard: carried-findings-cleared review=ID head=H` | GITHUB_TOKEN（iterate，随 M7 一起发） | 处理过 review ID 的那一轮推上去了，关掉上面那条；主人的放行标记点了它的名也算关掉 |
 | `pr-guard: carried-reraise head=H reviews=A,B` | PAT（codex-approved-merge，和 `claude-review-findings: H` 在同一条 COMMENT review 里） | H 审查通过却被没修完的旧意见 A、B 拦着，请 iterate 开一轮把它们带上；同一批意见每个 head 只补一次，开着的意见里有没点过名的才再补 |
 
-告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `verify-failed` `push-failed` `findings-carried` `carried-open` `stale-workflow` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
+告警原因 R：`ci` `unmergeable` `merge-refused` `merge-failed` `conflict` `conflict-stuck` `review-quota` `fix-quota` `auth` `pat-missing` `review-failed` `fix-failed` `no-fix` `verify-failed` `push-failed` `findings-carried` `carried-open` `stale-workflow` `round-cap` `retry-exhausted` `stalled` `unwatched` `codex-no-patch` `codex-no-env` `codex-patch-rejected` `codex-no-review`。额度类（`*-quota`）撞第二次只补一条带新恢复时间的静默标记，不再推送。
 
 ### 修满轮数之后（2026-10-04）
 
@@ -84,9 +85,11 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
 
+**冲突**（2026-10-08）：PR 跟集成分支冲突时，GitHub 不触发 `pull_request` / `pull_request_review`，修复工作流根本醒不过来（PR #58 卡了几个小时就是这样）；`issue_comment` 照样触发。所以由合并环节的 `resolve-conflict` job 接：合并检查看到 dirty，或巡检留了 `conflict` 标记（不推手机），它就把集成分支合进 PR 分支 —— git 自己合得上的直接合；合不上的段落交给 Claude 改（只能改 `pr/` 下有冲突的那几个文件，没有 Bash、不能新建文件，根目录是受信任的 base），改完检查冲突标记清干净了（多出来的 `=======` 分隔线也算）、有冲突的文件里冲突段落以外一行没动、冲突以外的文件一个没动、`.git` 的配置和钩子没变，才提交一个普通的合并提交，用主人的 PAT 推（本仓库用 `SELF_WORKFLOWS_TOKEN`），不强推，再请 Codex 审。这个 job 跟代审一样**不运行 PR 里的代码**：测试交给推上去以后的 CI，CI 绿、Codex 过才照常合并；合错了只会让这个 PR 的 CI 变红。解不了（Claude 判断两边矛盾、超过 15 个文件、一边删了一边改了、二进制、冲突段落里本身就有一行 `=======` 分不清哪条是 git 的分隔线、推送被拒、标题带 `[no-claude]` 而 git 自己合不上）就告警 `conflict-stuck` 交给人；巡检留言后 2 小时还没动静，也由巡检告警 `conflict-stuck`。
+
 合并用主人的 PAT（`CODEX_TRIGGER_TOKEN`），不用 `github.token`：GitHub 不让 `github.token` 的 push 触发别的 workflow，那样调用方 `ci.yml` 的 `on: push` 不跑，合并出来的 commit 上没有 CI，`ff-main` 就永远不挪 main（2026-10-07 wechat-mimic-finetune 实测）。仓库没设这把 PAT、或它合不动（失效 / 权限不够），就退回 `github.token`：照样合，只是那个 commit 上没 CI。
 
-**巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused` `carried-open`、CI 红）等人处理。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
+**巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused` `carried-open`、CI 红）等人处理。有冲突的 head 先留一条 `conflict` 标记叫醒合并环节自动解（见上方「冲突」）。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
 
 - **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **漏接的仓库每轮都点名**（2026-10-06，MEL-308）：有开着的 PR 却没装共享调用桩的仓库，run 摘要和 warning 里每次都列出来，并给出 `./onboard.sh <仓库> <python|node>`。`unwatched` 告警是按 head 去重的，head 不变就只响一次 —— 但仓库漏接是仓库级的，换个 head 也不会自己好，所以这条不跟着 head 去重。MEL-308 查出来的就是这个：三个仓库漏接，5 个 PR 全停，最久的两周没人管。
@@ -95,7 +98,7 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 - **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
 - 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。
 
-故意不管的：草稿、从 fork 开的 PR、标题带 `[no-codex-merge]` / `[no-claude]` 的 PR。叫审 3 次没结果的 head 之后只每天叫一次、共 7 天，然后不再叫；有冲突、已停车的 head 只告警一次。用内联副本、没接共享调用桩的仓库（如 Weibo--automation-android）：每个 PR 的每个 head 空闲 60 分钟后告警一次 `unwatched`，不叫审；私有仓库要等巡检读得到调用桩才生效。
+故意不管的：草稿、从 fork 开的 PR、标题带 `[no-codex-merge]` / `[no-claude]` 的 PR。叫审 3 次没结果的 head 之后只每天叫一次、共 7 天，然后不再叫；有冲突的 head 只叫一次自动解冲突、只告警一次；已停车的 head 只告警一次。用内联副本、没接共享调用桩的仓库（如 Weibo--automation-android）：每个 PR 的每个 head 空闲 60 分钟后告警一次 `unwatched`，不叫审；私有仓库要等巡检读得到调用桩才生效。
 
 ## 开一个新项目（从零）
 

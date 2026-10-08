@@ -847,7 +847,8 @@ prepare_repo() {
   assert_equal "$n" 2
   assert_contains "$job" 'uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea'
   # 和代审钉同一个版本：旧版本认不得默认模型时两处一起坏，升级也一起升。
-  reviewer_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' "$REPO_ROOT/.github/workflows/codex-approved-merge.yml")"
+  # 合并工作流里代审和解冲突各一处，钉的是同一个（tests/resolve-conflict.bats 守着），去重后比。
+  reviewer_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' "$REPO_ROOT/.github/workflows/codex-approved-merge.yml" | sort -u)"
   judge_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' <<<"$job")"
   assert_equal "$judge_pin" "$reviewer_pin"
   # 主路径的触发者是 Codex bot：不放行它，Claude 一次都不跑。
