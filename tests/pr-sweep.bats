@@ -116,11 +116,11 @@ refute_writes() {
   assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "kicked $LABEL"
 }
 
-@test "an unreferenced head is kicked after 30 idle minutes, not before" {
-  one_pr clean 29
+@test "an unreferenced head is kicked after 10 idle minutes, not before" {
+  one_pr clean 9
   sweep
   refute_writes
-  one_pr clean 31
+  one_pr clean 11
   sweep
   assert_called "gh api POST repos/$R/issues/7/comments" 1
 }
@@ -516,12 +516,159 @@ m8_comment() { # m8_comment <id> <reviews> <分钟前> [login] [assoc]
   refute_writes
 }
 
-@test "a head with only an M7 fix-round marker is still unreferenced and gets kicked" {
-  one_pr clean 31
-  comments "$(gh_comment 1 'github-actions[bot]' NONE "🤖 自动修复第 2 轮已推送。"$'\n\n'"<!-- pr-guard: fix-round head=$H round=2 -->" "$(ago 31)")"
+# ── 规则 6：替合并工作流盯 Codex（runner 不再开着等） ──
+
+m7_comment() { gh_comment "$1" 'github-actions[bot]' NONE "🤖 自动修复第 $2 轮已推送。"$'\n\n'"<!-- pr-guard: fix-round head=$H round=$2 -->" "$(ago "$3")"; }
+# summoned <分钟前> [id]：主人令牌发的 M1，绑定 H
+summoned() { owner_comment "${2:-10}" "$(m1_body "$H" 2)" "$1"; }
+pr_reactions() { fake_route "repos/$R/issues/7/reactions?per_page=100" "$(json_array "$@")"; }
+summon_reactions() { fake_route "repos/$R/issues/comments/${2:-10}/reactions?per_page=100" "$(json_array ${1:+"$1"})"; }
+codex_reaction_at() { gh_reaction "$1" 'chatgpt-codex-connector[bot]' "$(ago "$2")"; }
+no_reactions() { pr_reactions; summon_reactions; }
+no_held_runs() { fake_route "repos/$R/actions/runs?head_sha=$H&per_page=100" '{"workflow_runs":[]}'; }
+
+@test "a fix round's head (M7) is summoned with its round once 6 minutes passed since the last review" {
+  no_held_runs
+  one_pr clean 3
+  comments "$(m7_comment 1 2 3)"
+  reviews "$(codex_findings 4863267293 "$OTHER" 5)"
+  sweep
+  refute_called "gh api POST repos/$R/issues/7/comments"
+  assert_contains "$output" "等召唤冷却"
+  reviews "$(codex_findings 4863267293 "$OTHER" 7)"
   sweep
   assert_called "gh api POST repos/$R/issues/7/comments" 1
-  assert_equal "$(fake_last_body "gh api POST")" "$KICK_BODY"
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$(m1_body "$H" 2)"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "summoned Codex for fix round 2 $LABEL"
+}
+
+@test "an M7 head that is already summoned is not summoned again" {
+  no_held_runs
+  one_pr clean 3
+  comments "$(m7_comment 1 2 9)" "$(summoned 3)"
+  no_reactions
+  sweep
+  refute_called "gh api POST repos/$R/issues/7/comments"
+}
+
+@test "held CI on an M7 head is approved; on any other head it is left alone" {
+  one_pr clean 3
+  comments "$(m7_comment 1 2 3)"
+  reviews "$(codex_findings 4863267293 "$OTHER" 5)"
+  fake_route "repos/$R/actions/runs?head_sha=$H&per_page=100" \
+    "{\"workflow_runs\":[{\"id\":55,\"head_sha\":\"$H\",\"conclusion\":\"action_required\"},{\"id\":56,\"head_sha\":\"$H\",\"conclusion\":\"success\"}]}"
+  sweep
+  assert_called "gh api POST repos/$R/actions/runs/55/approve" 1
+  refute_called "repos/$R/actions/runs/56/approve"
+  : >"$FAKE_LOG"
+  comments
+  sweep
+  refute_called "actions/runs?head_sha"
+}
+
+@test "a Codex 👍 after the latest summon wakes the merge check once" {
+  one_pr clean 3
+  comments "$(summoned 8)"
+  pr_reactions "$(codex_reaction_at +1 6)"
+  summon_reactions
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "<!-- pr-guard: codex-thumbs head=$H summon=10 -->"
+  refute_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "@codex review"
+  local woke; woke="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  : >"$FAKE_LOG"
+  comments "$(summoned 8)" "$(owner_comment 11 "$woke" 5)"
+  sweep
+  refute_called "gh api POST repos/$R/issues/7/comments"
+}
+
+@test "a 👍 on the summon comment counts too" {
+  one_pr clean 3
+  comments "$(summoned 8)"
+  pr_reactions
+  summon_reactions "$(codex_reaction_at +1 6)"
+  sweep
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "pr-guard: codex-thumbs head=$H"
+}
+
+@test "a 👍 from before the latest summon is not a sign-off; the silent Codex goes to Claude" {
+  one_pr clean 3
+  comments "$(summoned 8)"
+  pr_reactions "$(codex_reaction_at +1 10)"
+  summon_reactions
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "<!-- pr-guard: codex-silent head=$H reason=silent -->"
+}
+
+@test "silent: 5 minutes with no reaction, comment or review after the summon hands the head to Claude" {
+  one_pr clean 4
+  comments "$(summoned 4)"
+  no_reactions
+  sweep
+  refute_called "gh api POST repos/$R/issues/7/comments"
+  one_pr clean 6
+  comments "$(summoned 6)"
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=silent -->"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "handed $LABEL to Claude (silent)"
+}
+
+@test "timeout: Codex's 👀 holds the handoff until 20 minutes" {
+  one_pr clean 8
+  comments "$(summoned 8)"
+  pr_reactions
+  summon_reactions "$(codex_reaction_at eyes 7)"
+  sweep
+  refute_called "gh api POST repos/$R/issues/7/comments"
+  one_pr clean 21
+  comments "$(summoned 21)"
+  summon_reactions "$(codex_reaction_at eyes 20)"
+  sweep
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=timeout -->"
+}
+
+@test "quota: a Codex usage-limit comment after the summon hands the head to Claude at once" {
+  one_pr clean 1
+  comments "$(summoned 2)" "$(jq --arg at "$(ago 1)" '.created_at = $at' "$FIXTURES_DIR/codex/quota-comment.json")"
+  no_reactions
+  sweep
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=quota -->"
+}
+
+@test "a head already handed to Claude after this summon is not handed again" {
+  one_pr clean 3
+  comments "$(summoned 30)" \
+    "$(gh_comment 12 'github-actions[bot]' NONE "换 Claude 代审。"$'\n\n'"<!-- pr-guard: fallback head=$H reason=silent -->" "$(ago 24)")"
+  no_reactions
+  sweep
+  refute_called "gh api POST repos/$R/issues/7/comments"
+}
+
+@test "a Codex review after the summon is an answer, not silence" {
+  one_pr clean 3
+  comments "$(summoned 30)"
+  reviews "$(codex_findings 4863267293 "$OTHER" 20)"
+  no_reactions
+  sweep
+  refute_contains "$(fake_all_bodies)" "codex-silent"
+}
+
+@test "unreadable reactions skip the 👍 / silence rules instead of guessing" {
+  one_pr clean 30
+  comments "$(summoned 30)"
+  fake_route_fail "repos/$R/issues/7/reactions?per_page=100" 1
+  sweep
+  refute_contains "$(fake_all_bodies)" "codex-silent"
+  refute_contains "$(fake_all_bodies)" "codex-thumbs"
+}
+
+@test "a summon written by claude[bot] does not count as a summon" {
+  one_pr clean 3
+  comments "$(gh_comment 10 'claude[bot]' NONE "$(m1_body "$H" 2)" "$(ago 30)")"
+  sweep
+  refute_contains "$(fake_all_bodies)" "codex-silent"
 }
 
 # ── 信任：claude[bot] / 非 OWNER 写的标记一律不算 ──

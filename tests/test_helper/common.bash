@@ -627,6 +627,21 @@ gh_review() {
     }'
 }
 
+# path_f <owner/名> <head> [👍 时间] [召唤正文]：合并 watcher 的路径 F —— 巡检留的 codex-thumbs 标记
+# （评论 900，点名召唤 500）、那条召唤（主人写的 M1，08:00:00）、Codex 在 PR #7 正文点的 👍。
+path_f() {
+  local repo="$1" h="$2" at="${3:-2026-09-18T08:01:00Z}" summon="${4:-}"
+  [ -n "$summon" ] || summon="$(m1_body "$h" 1)"
+  export TARGET_ID=900
+  fake_route "repos/$repo/issues/comments/900" "$(gh_comment 900 Melodymaifafa OWNER \
+    "🤖 巡检：Codex 审过没意见（点了 👍），请合并检查跑一次。"$'\n\n'"<!-- pr-guard: codex-thumbs head=$h summon=500 -->" \
+    2026-09-18T08:05:00Z)"
+  fake_route "repos/$repo/issues/comments/500" "$(gh_comment 500 Melodymaifafa OWNER "$summon" 2026-09-18T08:00:00Z)"
+  fake_route "repos/$repo/issues/7/reactions?per_page=100" \
+    "$(json_array "$(gh_reaction +1 'chatgpt-codex-connector[bot]' "$at")")"
+  fake_route "repos/$repo/issues/comments/500/reactions?per_page=100" '[]'
+}
+
 # gh_reaction <content> <login> [created_at]，content 如 eyes、+1
 gh_reaction() {
   jq -n --arg c "$1" --arg login "$2" --arg at "${3:-2026-09-18T08:00:00Z}" '{

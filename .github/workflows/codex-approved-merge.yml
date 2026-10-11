@@ -1,14 +1,19 @@
 name: Merge after clean Codex review
 
 # Codex does not submit APPROVED reviews when it finds no issues. It either
-# posts a clean result with the reviewed commit or reacts 👍 to the PR body /
-# trusted "@codex review" comment. GitHub Actions has no reaction event, so
-# start a short-lived watcher from the request event as a fallback. The trusted
-# workflow runs from main and never checks out or executes PR code.
+# posts a clean result with the reviewed commit (path C, an event) or reacts 👍
+# to the PR body / the "@codex review" comment. GitHub Actions has no reaction
+# event, and a runner left waiting for one bills every minute it waits (in
+# October 2026 that waiting was a third of the private repos' Actions minutes).
+# So nothing here waits for Codex: the PR sweeper (scripts/pr-sweep.sh, every
+# 5 minutes on the owner's Mac, plus the backstop cron in this repo) watches for
+# the 👍 and for a Codex that never answered, and wakes this workflow with an
+# owner marker (paths F and G). The trusted workflow runs from main and never
+# checks out or executes PR code.
 #
-# Codex 审不了（额度用完 / 5 分钟没回应 / 20 分钟没结论）时，这一次请求改由
-# claude-review job 代审：有问题发 M3 review 交给 iterate 修，没问题发 M4 评论，
-# M4 触发本 workflow 的路径 D 走同一套 CI 闸门后合并。
+# Codex 审不了（额度用完 / 5 分钟没回应 / 20 分钟没结论，巡检判断后发路径 G 的标记）时，
+# 这一次请求改由 claude-review job 代审：有问题发 M3 review 交给 iterate 修，没问题发 M4
+# 评论，M4 触发本 workflow 的路径 D 走同一套 CI 闸门后合并。
 #
 # PR 跟 base 冲突时（合并检查看到 dirty，或巡检留了 conflict 标记），resolve-conflict job
 # 把 base 合进 PR 分支：git 合不上的段落交给 Claude 改，推一个普通的合并提交，再请 Codex 审。
@@ -43,25 +48,10 @@ permissions:
 
 jobs:
   watch-and-merge:
+    # 打开 PR、召唤 Codex 都不再起这个 job（以前路径 A / B 起一个 runner 开着等 Codex，
+    # 等的每一分钟都计费）：调用桩里的 pull_request_target 触发照样留着，这里不匹配就跳过，
+    # 跳过的 job 不占 runner、不计分钟。
     if: |
-      (
-        github.event_name == 'pull_request_target' &&
-        github.event.pull_request.state == 'open' &&
-        github.event.pull_request.draft == false &&
-        github.event.pull_request.base.ref == inputs.base_branch &&
-        github.event.pull_request.head.repo.full_name == github.repository &&
-        !contains(github.event.pull_request.title, '[no-codex-merge]')
-      ) ||
-      (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        contains(github.event.comment.body, '@codex review') &&
-        (
-          github.event.comment.author_association == 'OWNER' ||
-          github.event.comment.author_association == 'MEMBER' ||
-          github.event.comment.author_association == 'COLLABORATOR'
-        )
-      ) ||
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
@@ -82,6 +72,15 @@ jobs:
         github.event.issue.pull_request &&
         github.event.comment.author_association == 'OWNER' &&
         contains(github.event.comment.body, 'claude-judge-clean:')
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        github.event.comment.author_association == 'OWNER' &&
+        (
+          contains(github.event.comment.body, 'pr-guard: codex-thumbs head=') ||
+          contains(github.event.comment.body, 'pr-guard: codex-silent head=')
+        )
       )
     concurrency:
       group: codex-clean-review-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -100,9 +99,7 @@ jobs:
       REPO: ${{ github.repository }}
       BASE_BRANCH: ${{ inputs.base_branch }}
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
-      EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
-      TRIGGERED_AT: ${{ github.event.comment.created_at || github.event.pull_request.updated_at }}
-      TARGET_ID: ${{ github.event.comment.id || github.event.pull_request.number }}
+      TARGET_ID: ${{ github.event.comment.id }}
       ACTOR_TYPE: ${{ github.event.sender.type }}
       # job 层只传「有没有」；PAT 本身只交给下面那一步（gh pr merge 和补请修复的那条 review）。
       HAS_PAT: ${{ secrets.CODEX_TRIGGER_TOKEN != '' }}
@@ -165,11 +162,6 @@ jobs:
 
           codex_login='chatgpt-codex-connector[bot]'
           clean_phrase="Codex Review: Didn't find any major issues."
-          quota_phrase='reached your Codex usage limits'
-          # 只有测试会设这三个变量；线上用默认值。
-          watch_seconds="${WATCH_SECONDS:-1200}"
-          poll_seconds="${POLL_SECONDS:-30}"
-          silent_seconds="${SILENT_SECONDS:-300}"
           # Keep this synchronized with the job's timeout-minutes value.
           job_timeout_seconds=1800
           # The step clock starts when this step begins, so reserve a
@@ -267,122 +259,131 @@ jobs:
           fi
 
           reaction_route=
+          summon_id=
           signoff_id=
-          signoff_at=
           signoff_kind=
           judged_reviews=
+          silent_reason=
 
-          if [ -n "$EVENT_HEAD" ]; then
-            # For automatic reviews, bind the watcher to the event's head SHA.
-            if [ "$expected_head" != "$EVENT_HEAD" ]; then
-              echo "::notice::PR head changed before the watcher started"
+          # Every path is a comment: revalidate both the author and the text.
+          # Only markers bound to the exact current HEAD are eligible.
+          comment="$(gh api "repos/$REPO/issues/comments/$TARGET_ID")"
+          association="$(jq -r .author_association <<<"$comment")"
+          author="$(jq -r .user.login <<<"$comment")"
+          body="$(jq -r .body <<<"$comment")"
+
+          if [ "$author" = "$codex_login" ] &&
+            [[ "$body" == *"$clean_phrase"* ]]
+          then
+            reviewed_prefix="$(
+              # shellcheck disable=SC2016  # \1 是 sed 的反向引用，不是 shell 变量
+              sed -nE \
+                's/^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`.*/\1/p' \
+                <<<"$body" |
+                head -1
+            )"
+            if [ -z "$reviewed_prefix" ]; then
+              echo "::notice::Codex clean result has no reviewed commit"
               exit 0
             fi
-            reaction_route="repos/$REPO/issues/$PR_NUMBER/reactions"
+            reviewed_head="$(
+              gh api "repos/$REPO/commits/$reviewed_prefix" --jq .sha
+            )"
+            if [ "$expected_head" != "$reviewed_head" ]; then
+              echo "::notice::Codex clean result targets a stale PR head"
+              exit 0
+            fi
+
+            signoff_id="$TARGET_ID"
+            signoff_kind=comment
+          elif [ "$association" = OWNER ] &&
+            [[ "$body" == *'pr-guard: codex-thumbs head='* ]]
+          then
+            # 路径 F：巡检看到 Codex 在某次召唤之后点了 👍，用主人身份留这条标记叫醒合并检查，
+            # 标记里点名那次召唤。只认绑定当前 head 的标记；召唤和 👍 下面都再核一遍，标记只是叫醒。
+            thumbs_marker="$(
+              sed -nE \
+                's/.*<!--[[:space:]]*pr-guard: codex-thumbs head=([0-9a-f]{40}) summon=([0-9]+)[[:space:]]*-->.*/\1 \2/p' \
+                <<<"$body" |
+                head -1
+            )"
+            if [ -z "$thumbs_marker" ]; then
+              echo "::notice::Codex thumbs marker has no exact HEAD binding"
+              exit 0
+            fi
+            if [ "$expected_head" != "${thumbs_marker%% *}" ]; then
+              echo "::notice::Codex thumbs marker targets a stale PR head"
+              exit 0
+            fi
+            summon_id="${thumbs_marker#* }"
+            signoff_kind=reaction
+          elif [ "$association" = OWNER ] &&
+            [[ "$body" == *'pr-guard: codex-silent head='* ]]
+          then
+            # 路径 G：巡检看到 Codex 没接最近一次召唤（额度用完 / 5 分钟没回应 / 20 分钟没结论），
+            # 用主人身份留这条标记：head 上没有意见就换 Claude 代审。
+            silent_marker="$(
+              sed -nE \
+                's/.*<!--[[:space:]]*pr-guard: codex-silent head=([0-9a-f]{40}) reason=(quota|silent|timeout)[[:space:]]*-->.*/\1 \2/p' \
+                <<<"$body" |
+                head -1
+            )"
+            if [ -z "$silent_marker" ]; then
+              echo "::notice::Codex silent marker has no exact HEAD binding"
+              exit 0
+            fi
+            if [ "$expected_head" != "${silent_marker%% *}" ]; then
+              echo "::notice::Codex silent marker targets a stale PR head"
+              exit 0
+            fi
+            silent_reason="${silent_marker#* }"
+          elif [ "$association" = OWNER ] &&
+            [[ "$body" == *'claude-review-clean:'* ]]
+          then
+            # 路径 D：Claude 代审没问题（M4），只认主人写的、绑定当前 head 的标记。
+            clean_head="$(
+              sed -nE \
+                's/.*<!--[[:space:]]*claude-review-clean:[[:space:]]*([0-9a-f]{40})[[:space:]]*-->.*/\1/p' \
+                <<<"$body" |
+                head -1
+            )"
+            if [ -z "$clean_head" ]; then
+              echo "::notice::Claude clean result has no exact HEAD binding"
+              exit 0
+            fi
+            if [ "$expected_head" != "$clean_head" ]; then
+              echo "::notice::Claude clean result targets a stale PR head"
+              exit 0
+            fi
+            signoff_id="$TARGET_ID"
+            signoff_kind=claude
+          elif [ "$association" = OWNER ] &&
+            [[ "$body" == *'claude-judge-clean:'* ]]
+          then
+            # 路径 E：自动修满轮数后，Claude 逐条核过 Codex 在这个 head 上剩下的意见，
+            # 判定都不拦合并（M8，claude-codex-iterate 的 round-cap judge 发）。只认主人写的、
+            # 绑定当前 head 的标记，而且只放过标记里点名的那几条 review：Codex 之后在
+            # 这个 head 上再出的 review 照样拦。
+            judge_marker="$(
+              sed -nE \
+                's/.*<!--[[:space:]]*claude-judge-clean: head=([0-9a-f]{40}) reviews=([0-9]+(,[0-9]+)*)[[:space:]]*-->.*/\1 \2/p' \
+                <<<"$body" |
+                head -1
+            )"
+            if [ -z "$judge_marker" ]; then
+              echo "::notice::Claude judge result has no exact HEAD binding"
+              exit 0
+            fi
+            if [ "$expected_head" != "${judge_marker%% *}" ]; then
+              echo "::notice::Claude judge result targets a stale PR head"
+              exit 0
+            fi
+            judged_reviews="${judge_marker#* }"
+            signoff_id="$TARGET_ID"
+            signoff_kind=judge
           else
-            # For comment-triggered reviews, revalidate both the author and the
-            # request text. Only automation-created requests carrying the exact
-            # requested HEAD are eligible for unattended merge.
-            comment="$(gh api "repos/$REPO/issues/comments/$TARGET_ID")"
-            association="$(jq -r .author_association <<<"$comment")"
-            author="$(jq -r .user.login <<<"$comment")"
-            body="$(jq -r .body <<<"$comment")"
-            comment_created_at="$(jq -r .created_at <<<"$comment")"
-
-            if [ "$author" = "$codex_login" ] &&
-              [[ "$body" == *"$clean_phrase"* ]]
-            then
-              reviewed_prefix="$(
-                # shellcheck disable=SC2016  # \1 是 sed 的反向引用，不是 shell 变量
-                sed -nE \
-                  's/^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`.*/\1/p' \
-                  <<<"$body" |
-                  head -1
-              )"
-              if [ -z "$reviewed_prefix" ]; then
-                echo "::notice::Codex clean result has no reviewed commit"
-                exit 0
-              fi
-              reviewed_head="$(
-                gh api "repos/$REPO/commits/$reviewed_prefix" --jq .sha
-              )"
-              if [ "$expected_head" != "$reviewed_head" ]; then
-                echo "::notice::Codex clean result targets a stale PR head"
-                exit 0
-              fi
-
-              signoff_id="$TARGET_ID"
-              signoff_at="$comment_created_at"
-              signoff_kind=comment
-            elif [[ "$association" =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]] &&
-              grep -Eiq \
-                '@codex[[:space:]]+review([[:space:]]|$)' <<<"$body"
-            then
-              requested_head="$(
-                sed -nE \
-                  's/.*<!--[[:space:]]*codex-review-head:[[:space:]]*([0-9a-f]{40})[[:space:]]*-->.*/\1/p' \
-                  <<<"$body" |
-                  head -1
-              )"
-              if [ -z "$requested_head" ]; then
-                echo "::notice::Manual review request has no exact HEAD binding"
-                exit 0
-              fi
-              if [ "$expected_head" != "$requested_head" ]; then
-                echo "::notice::Review request targets a stale PR head"
-                exit 0
-              fi
-              reaction_route="repos/$REPO/issues/comments/$TARGET_ID/reactions"
-            elif [ "$association" = OWNER ] &&
-              [[ "$body" == *'claude-review-clean:'* ]]
-            then
-              # 路径 D：Claude 代审没问题（M4），只认主人写的、绑定当前 head 的标记。
-              clean_head="$(
-                sed -nE \
-                  's/.*<!--[[:space:]]*claude-review-clean:[[:space:]]*([0-9a-f]{40})[[:space:]]*-->.*/\1/p' \
-                  <<<"$body" |
-                  head -1
-              )"
-              if [ -z "$clean_head" ]; then
-                echo "::notice::Claude clean result has no exact HEAD binding"
-                exit 0
-              fi
-              if [ "$expected_head" != "$clean_head" ]; then
-                echo "::notice::Claude clean result targets a stale PR head"
-                exit 0
-              fi
-              signoff_id="$TARGET_ID"
-              signoff_at="$comment_created_at"
-              signoff_kind=claude
-            elif [ "$association" = OWNER ] &&
-              [[ "$body" == *'claude-judge-clean:'* ]]
-            then
-              # 路径 E：自动修满轮数后，Claude 逐条核过 Codex 在这个 head 上剩下的意见，
-              # 判定都不拦合并（M8，claude-codex-iterate 的 round-cap judge 发）。只认主人写的、
-              # 绑定当前 head 的标记，而且只放过标记里点名的那几条 review：Codex 之后在
-              # 这个 head 上再出的 review 照样拦。
-              judge_marker="$(
-                sed -nE \
-                  's/.*<!--[[:space:]]*claude-judge-clean: head=([0-9a-f]{40}) reviews=([0-9]+(,[0-9]+)*)[[:space:]]*-->.*/\1 \2/p' \
-                  <<<"$body" |
-                  head -1
-              )"
-              if [ -z "$judge_marker" ]; then
-                echo "::notice::Claude judge result has no exact HEAD binding"
-                exit 0
-              fi
-              if [ "$expected_head" != "${judge_marker%% *}" ]; then
-                echo "::notice::Claude judge result targets a stale PR head"
-                exit 0
-              fi
-              judged_reviews="${judge_marker#* }"
-              signoff_id="$TARGET_ID"
-              signoff_at="$comment_created_at"
-              signoff_kind=judge
-            else
-              echo "::notice::Review request is no longer eligible"
-              exit 0
-            fi
+            echo "::notice::Review request is no longer eligible"
+            exit 0
           fi
 
           if has_findings "$expected_head" "$judged_reviews"; then
@@ -390,27 +391,35 @@ jobs:
             exit 0
           fi
 
-          if [ -z "$signoff_kind" ]; then
-            watch_started="$(now)"
-            deadline="$((watch_started + watch_seconds))"
-            silent_deadline="$((watch_started + silent_seconds))"
-            silent_checked=false
+          if [ -n "$silent_reason" ]; then
+            fallback "$silent_reason"
+          fi
 
-            while [ "$(now)" -lt "$deadline" ]; do
-              current_head="$(
-                gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha
-              )"
-              if [ "$current_head" != "$expected_head" ]; then
-                echo "::notice::PR head changed while Codex was reviewing; skipping"
-                exit 0
-              fi
-
+          if [ "$signoff_kind" = reaction ]; then
+            # 路径 F 只看一眼，不等：点名的召唤必须是可信作者写的、绑定这个 head（带
+            # codex-review-head: H 的 M1 或巡检 kick）；👍 要晚于它，点在 PR 正文或那条召唤上都算。
+            # 没有就退出，巡检下一轮再看。
+            summon="$(gh api "repos/$REPO/issues/comments/$summon_id")" ||
+              { echo "::notice::The named review request is gone"; exit 0; }
+            if ! jq -e --arg h "$expected_head" '
+                (.user.login == "github-actions[bot]" or .author_association == "OWNER") and
+                ((.body // "") | contains("<!-- codex-review-head: " + $h + " -->"))
+              ' <<<"$summon" >/dev/null
+            then
+              echo "::notice::The named review request is not a trusted one for this head"
+              exit 0
+            fi
+            summon_at="$(jq -r .created_at <<<"$summon")"
+            for route in \
+              "repos/$REPO/issues/$PR_NUMBER/reactions" \
+              "repos/$REPO/issues/comments/$summon_id/reactions"
+            do
               signoff="$(
-                gh api --paginate --slurp "$reaction_route?per_page=100" |
+                gh api --paginate --slurp "$route?per_page=100" |
                   jq -c \
                     --arg bot "$codex_login" \
-                    --arg since "$TRIGGERED_AT" '
-                      add
+                    --arg since "$summon_at" '
+                      (add // [])
                       | [
                           .[]
                           | select(
@@ -421,102 +430,15 @@ jobs:
                         ]
                       | max_by(.created_at) // empty
                     '
-              )"
-              signoff_id="$(jq -r '.id // empty' <<<"$signoff")"
-              signoff_at="$(jq -r '.created_at // empty' <<<"$signoff")"
-
-              # A COMMENTED review means Codex found issues, so leave the
-              # existing Claude workflow to handle it. Findings on this head
-              # always win over a 👍, whenever they were posted.
-              if has_findings "$expected_head"; then
-                echo "::notice::Codex reported findings for PR #$PR_NUMBER"
-                exit 0
-              fi
-              if [ -n "$signoff_at" ]; then
-                signoff_kind=reaction
+              )" || { echo "::error::Cannot read reactions"; exit 1; }
+              if [ -n "$signoff" ]; then
+                reaction_route="$route"
+                signoff_id="$(jq -r .id <<<"$signoff")"
                 break
               fi
-
-              codex_comments="$(
-                gh api --paginate --slurp \
-                  "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" |
-                  jq -c \
-                    --arg bot "$codex_login" \
-                    --arg since "$TRIGGERED_AT" '
-                      (add // [])
-                      | [.[] | select(.user.login == $bot and .created_at >= $since)]
-                    '
-              )"
-              if jq -e --arg q "$quota_phrase" \
-                'any(.[]; (.body // "") | contains($q))' \
-                <<<"$codex_comments" >/dev/null
-              then
-                fallback quota
-              fi
-
-              # 路径 B（召唤评论）5 分钟内 Codex 没点 👀、没评论也没 review = 静默。
-              if [ -z "$EVENT_HEAD" ] &&
-                [ "$silent_checked" = false ] &&
-                [ "$(now)" -ge "$silent_deadline" ]
-              then
-                silent_checked=true
-                codex_eyes="$(
-                  gh api --paginate --slurp "$reaction_route?per_page=100" |
-                    jq -r --arg bot "$codex_login" '
-                      (add // [])
-                      | [.[] | select(.content == "eyes" and .user.login == $bot)]
-                      | length
-                    '
-                )"
-                codex_reviews="$(
-                  gh api --paginate --slurp \
-                    "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" |
-                    jq -r \
-                      --arg bot "$codex_login" \
-                      --arg since "$TRIGGERED_AT" '
-                        (add // [])
-                        | [.[] | select(.user.login == $bot and .submitted_at >= $since)]
-                        | length
-                      '
-                )"
-                if [ "$codex_eyes" -eq 0 ] &&
-                  [ "$codex_reviews" -eq 0 ] &&
-                  [ "$(jq length <<<"$codex_comments")" -eq 0 ]
-                then
-                  fallback silent
-                fi
-              fi
-
-              sleep "$poll_seconds"
             done
-
-            if [ -z "$signoff_kind" ]; then
-              echo "::notice::Codex produced no clean sign-off before timeout"
-              # 20 分钟没结论就换 Claude 代审。已合并，或 Codex 对这个 head
-              # 发了 clean 评论（它自己的路径 C run 会接手）时不换。
-              merged="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .merged 2>/dev/null || echo false)"
-              codex_clean="$(
-                gh api --paginate --slurp \
-                  "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null |
-                  jq -r \
-                    --arg bot "$codex_login" \
-                    --arg head "$expected_head" \
-                    --arg phrase "$clean_phrase" '
-                      (add // [])
-                      | [
-                          .[]
-                          | select(.user.login == $bot)
-                          | (.body // "")
-                          | select(contains($phrase))
-                          | capture("\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`").sha
-                          | select(. as $short | $head | startswith($short))
-                        ]
-                      | length
-                    ' || echo 0
-              )"
-              if [ "$merged" != true ] && [ "${codex_clean:-0}" -eq 0 ]; then
-                fallback timeout
-              fi
+            if [ -z "$signoff_id" ]; then
+              echo "::notice::No Codex 👍 after the named review request"
               exit 0
             fi
           fi
