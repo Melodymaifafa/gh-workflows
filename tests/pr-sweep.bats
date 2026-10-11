@@ -684,12 +684,17 @@ thumbs_comment() { owner_comment "$1" "🤖 巡检：…"$'\n\n'"<!-- pr-guard: 
   assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=timeout -->"
 }
 
-@test "timeout: a Codex clean comment after the summon is a conclusion" {
+@test "timeout: a Codex clean comment after the summon is a conclusion only when it reviewed this head" {
   one_pr clean 3
-  comments "$(summoned 30)" "$(gh_comment 13 'chatgpt-codex-connector[bot]' NONE "Codex Review: Didn't find any major issues." "$(ago 25)")"
+  clean_comment() { gh_comment 13 'chatgpt-codex-connector[bot]' NONE "Codex Review: Didn't find any major issues."$'\n\n'"**Reviewed commit:** \`${1:0:10}\`" "$(ago 25)"; }
+  comments "$(summoned 30)" "$(clean_comment "$H")"
   no_reactions
   sweep
   refute_contains "$(fake_all_bodies)" "codex-silent"
+  # 上一个 head 的 clean 评论晚于召唤才到：有动静，不算结论。
+  comments "$(summoned 30)" "$(clean_comment "$OTHER")"
+  sweep
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=timeout -->"
 }
 
 @test "quota: a Codex usage-limit comment after the summon hands the head to Claude at once" {
@@ -709,13 +714,17 @@ thumbs_comment() { owner_comment "$1" "🤖 巡检：…"$'\n\n'"<!-- pr-guard: 
   refute_called "gh api POST repos/$R/issues/7/comments"
 }
 
-@test "a Codex review after the summon is an answer, not silence" {
+@test "a Codex review of an older head after the summon is activity, not a conclusion" {
   one_pr clean 3
-  comments "$(summoned 30)"
-  reviews "$(codex_findings 4863267293 "$OTHER" 20)"
+  comments "$(summoned 8)"
+  reviews "$(codex_findings 4863267293 "$OTHER" 6)"
   no_reactions
   sweep
-  refute_contains "$(fake_all_bodies)" "codex-silent"
+  refute_called "gh api POST repos/$R/issues/7/comments"
+  comments "$(summoned 21)"
+  reviews "$(codex_findings 4863267293 "$OTHER" 20)"
+  sweep
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=timeout -->"
 }
 
 @test "unreadable reactions skip the 👍 / silence rules instead of guessing" {

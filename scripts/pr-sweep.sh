@@ -20,7 +20,7 @@
 #      b. 最近一次召唤之后 Codex 点了 👍    → 留 codex-thumbs 标记叫醒合并检查（路径 F），每次召唤一条；
 #                                             没合上（多半是当时 CI 还没绿）就空闲 ≥ 60 分钟再留一条，
 #                                             最多补 2 次，之后告警一次 stalled。
-#      c. Codex 没接这次召唤                → 额度用完马上、5 分钟没任何回应、或 20 分钟没结论（clean 评论 / review）时，
+#      c. Codex 没接这次召唤                → 额度用完马上、5 分钟没任何回应、或 20 分钟 head 上没结论（审它的 clean 评论 / review）时，
 #                                             留 codex-silent 标记让合并检查换 Claude 代审（路径 G），每次召唤一条。
 #      带 M7 的 head（本流水线自己推的）上被 GitHub 扣住等批准的 CI，顺手批掉。
 #   5. 其余              → 没人碰过且空闲 ≥ 10 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
@@ -72,6 +72,9 @@ facts_jq='
 def ts: if . == null then 0 else sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 end;
 def trusted: .user.login == "github-actions[bot]" or .author_association == "OWNER";
 def has($s): (.body // "") | contains($s);
+# Codex clean 评论审的是不是 H：同合并检查的路径 C，取第一行 **Reviewed commit:** `前缀`，H 以它开头才算。
+def reviewed_h: [(.body // "") | split("\n")[] | capture("^\\*\\*Reviewed commit:\\*\\* `(?<c>[0-9a-f]{7,40})`").c]
+    | (first // "") as $pre | $pre != "" and ($h | startswith($pre));
 $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 | ($c | map(select(trusted))) as $tc
 | ($r | map(select(trusted))) as $tr
@@ -133,7 +136,11 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     (if any($tc[]; (.created_at | ts) >= $summon.at
           and (has("<!-- pr-guard: fallback head=" + $h + " ") or has("<!-- pr-guard: codex-silent head=" + $h + " "))) then 1 else 0 end),
     ([$tc[] | select((.created_at | ts) >= $summon.at and has("<!-- pr-guard: codex-thumbs head=" + $h + " "))] | length),
-    ([$c[] | select(.user.login == $codex and (.created_at | ts) >= $summon.at and has("find any major issues"))] | length)
+    # 召唤之后 Codex 在 H 上的结论：审 H 的 review，或审的是 H 的 clean 评论。上一个 head 的审查晚于
+    # 这次召唤才到也常见，那只算有动静（召唤之后的评论数、review 数），不算结论（Codex 2026-10-11 的 P2）。
+    ([$r[] | select(.user.login == $codex and .commit_id == $h and (.submitted_at | ts) >= $summon.at)]
+      + [$c[] | select(.user.login == $codex and (.created_at | ts) >= $summon.at and has("find any major issues") and reviewed_h)]
+      | length)
   ] | @tsv
 '
 
@@ -314,12 +321,12 @@ sweep_pr() {
   if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
 
   local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
-  local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_clean thumbs eyes
+  local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded thumbs eyes
   facts="$(jq -rn --slurpfile pr "$tmp/pr.json" --slurpfile cs "$tmp/comments.json" --slurpfile rs "$tmp/reviews.json" \
     --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq")"
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
     until_active until_passed fix_reason state merged total_retries judged judged_reviews \
-    summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_clean <<<"$facts"
+    summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded <<<"$facts"
   echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
   # 0. 没人管：不叫审、不重修，告警一次。空闲 60 分钟再告，给人留时间改 base 或关掉。
@@ -423,14 +430,15 @@ sweep_pr() {
       fi
       return 0
     fi
-    if [ "$handed" = 0 ] && [ "$codex_reviews" = 0 ]; then
+    if [ "$handed" = 0 ] && [ "$codex_concluded" = 0 ]; then
       local waited=$((now - summon_at))
       if [ "$codex_quota" = 1 ]; then
         hand_to_claude quota; return 0
-      elif [ "$codex_comments" = 0 ] && [ "$eyes" = 0 ] && [ "$waited" -ge 300 ]; then
+      elif [ "$codex_comments" = 0 ] && [ "$codex_reviews" = 0 ] && [ "$eyes" = 0 ] && [ "$waited" -ge 300 ]; then
         hand_to_claude silent; return 0
-      # Codex 审的过程中会先发（再改）一条状态评论，那不是结论：20 分钟只看 clean 评论和 review。
-      elif [ "$codex_clean" = 0 ] && [ "$waited" -ge 1200 ]; then
+      # Codex 审的过程中会先发（再改）一条状态评论，上一个 head 的 review / clean 评论也可能晚于召唤才到，
+      # 这些都不是结论：20 分钟只看 H 上的 clean 评论和 review。
+      elif [ "$waited" -ge 1200 ]; then
         hand_to_claude timeout; return 0
       fi
     fi

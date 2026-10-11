@@ -31,7 +31,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 - Codex 回复「reached your Codex usage limits」；
 - 喊了 `@codex review` 5 分钟没有 👀 也没有结论；
-- 20 分钟还没有结论。
+- 20 分钟这个 head 还没有结论（晚到的、审上一个 head 的 review / clean 评论不算）。
 
 **不在 runner 上等 Codex**（2026-10-11）：以前 PR 一开、一召唤，合并环节就起一个 runner 开着等 Codex 的 👍（GitHub 没有 reaction 事件），iterate 修完也开着 runner 等满 6 分钟召唤冷却。私有仓库按分钟计费，2026-10 的 1–9 号这两段等待占了约一半分钟，10 号就用完了每月 2,000 分钟的免费额度。现在 Codex 的 clean 评论照旧是事件；👍、沉默和冷却由巡检（每 5 分钟）来盯，看到了再用主人身份留标记叫醒合并环节：`codex-thumbs`（路径 F，再核一遍 👍 才合；没合上 —— 多半是当时 CI 还没绿，同一个 head 上重跑绿了也没有事件 —— 就空闲 60 分钟后再留一条，补 2 次还没合上告警 `stalled`）、`codex-silent`（路径 G，换 Claude 代审）。上面三条的「几分钟」因此按巡检的节奏算，最多晚 5 分钟。主人的 Mac 关着时由 `pr-sweeper.yml` 兜底，合并会晚几个小时。
 
