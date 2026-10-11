@@ -17,7 +17,9 @@
 #                          每个 head 最多补 2 次，之后告警一次 stalled，停。
 #   6. 替合并工作流盯 Codex（它不再开着 runner 等，等的每一分钟都计费）：
 #      a. 修复那轮推了 head（有 M7）还没召唤 → 离上一条 review 满 6 分钟就召唤（M1，带 fix-round）。
-#      b. 最近一次召唤之后 Codex 点了 👍    → 留 codex-thumbs 标记叫醒合并检查（路径 F），每次召唤一条。
+#      b. 最近一次召唤之后 Codex 点了 👍    → 留 codex-thumbs 标记叫醒合并检查（路径 F），每次召唤一条；
+#                                             没合上（多半是当时 CI 还没绿）就空闲 ≥ 60 分钟再留一条，
+#                                             最多补 2 次，之后告警一次 stalled。
 #      c. Codex 没接这次召唤                → 额度用完马上、5 分钟没任何回应、或 20 分钟没结论（clean 评论 / review）时，
 #                                             留 codex-silent 标记让合并检查换 Claude 代审（路径 G），每次召唤一条。
 #      带 M7 的 head（本流水线自己推的）上被 GitHub 扣住等批准的 CI，顺手批掉。
@@ -56,7 +58,7 @@ trap 'rm -rf "$tmp"' EXIT
 max_kicks=3
 max_daily_kicks=7
 max_retries=2
-# M8 之后合并检查最多补跑 2 次（加上 judge 自己发的那条，一共 3 条 M8）。
+# M8 之后合并检查最多补跑 2 次（加上 judge 自己发的那条，一共 3 条 M8）；👍 叫醒的也一样（一共 3 条 codex-thumbs）。
 max_merge_rekicks=2
 # 撞额度的重试不计数，但总次数也要封顶，免得额度一直不够时无限重试。
 max_total_retries=6
@@ -130,7 +132,7 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     ([$r[] | select(.user.login == $codex and (.submitted_at | ts) >= $summon.at)] | length),
     (if any($tc[]; (.created_at | ts) >= $summon.at
           and (has("<!-- pr-guard: fallback head=" + $h + " ") or has("<!-- pr-guard: codex-silent head=" + $h + " "))) then 1 else 0 end),
-    (if any($tc[]; (.created_at | ts) >= $summon.at and has("<!-- pr-guard: codex-thumbs head=" + $h + " ")) then 1 else 0 end),
+    ([$tc[] | select((.created_at | ts) >= $summon.at and has("<!-- pr-guard: codex-thumbs head=" + $h + " "))] | length),
     ([$c[] | select(.user.login == $codex and (.created_at | ts) >= $summon.at and has("find any major issues"))] | length)
   ] | @tsv
 '
@@ -242,11 +244,14 @@ summon_fix_round() {
   summary "- summoned Codex for fix round $1 $who$hs"
 }
 
-# wake_merge：Codex 点了 👍（GitHub 没有 reaction 事件），留路径 F 的标记叫醒合并检查；👍 由它再核。
+# wake_merge [again]：Codex 点了 👍（GitHub 没有 reaction 事件），留路径 F 的标记叫醒合并检查；👍 由它再核。
+# again：上次叫醒了没合上，同一个标记再发一次（只换开头那句话）。
 wake_merge() {
+  local msg="🤖 巡检：Codex 审过没意见（点了 👍），请合并检查跑一次。"
+  [ "${1:-}" != again ] || msg="🤖 巡检：Codex 审过没意见（点了 👍），但还没合上（多半是当时 CI 还没绿），再请合并检查跑一次。"
   if [ "$MODE" = dry ]; then summary "- would wake the merge check $who$hs"; return 0; fi
   head_unchanged || return 0
-  post_comment "🤖 巡检：Codex 审过没意见（点了 👍），请合并检查跑一次。"$'\n\n'"<!-- pr-guard: codex-thumbs head=$H summon=$summon_id -->"
+  post_comment "$msg"$'\n\n'"<!-- pr-guard: codex-thumbs head=$H summon=$summon_id -->"
   summary "- woke the merge check $who$hs"
 }
 
@@ -404,7 +409,18 @@ sweep_pr() {
     thumbs="$(codex_reaction +1 "$summon_at")"
     eyes="$(codex_reaction eyes "$summon_at")"
     if [ "$thumbs" = 1 ]; then
-      if [ "$woken" = 0 ]; then wake_merge; else echo "  已叫过合并检查"; fi
+      # 叫醒的那次没合上（CI 红了又在同一个 head 上重跑绿了、当时还没跑完、一时合不了）：调用桩
+      # 不接 CI 跑完的事件，同一个 head 上再没有什么会叫醒合并检查。所以同 4b，空闲 60 分钟再叫。
+      # CI 还红着的那种在规则 2 就停车了，到不了这里。
+      if [ "$woken" = 0 ]; then
+        wake_merge
+      elif [ "$idle" -lt 3600 ]; then
+        echo "  等合并检查"
+      elif [ "$woken" -le "$max_merge_rekicks" ]; then
+        wake_merge again
+      else
+        alert_once stalled - "🤖 巡检：Codex 审过没意见（点了 👍），但合并检查跑了 $woken 次都没合上，请打开 PR 看看卡在哪。"
+      fi
       return 0
     fi
     if [ "$handed" = 0 ] && [ "$codex_reviews" = 0 ]; then

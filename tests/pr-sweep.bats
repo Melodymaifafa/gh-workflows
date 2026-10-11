@@ -566,7 +566,7 @@ no_held_runs() { fake_route "repos/$R/actions/runs?head_sha=$H&per_page=100" '{"
   refute_called "actions/runs?head_sha"
 }
 
-@test "a Codex 👍 after the latest summon wakes the merge check once" {
+@test "a Codex 👍 after the latest summon wakes the merge check once, then leaves it 60 idle minutes" {
   one_pr clean 3
   comments "$(summoned 8)"
   pr_reactions "$(codex_reaction_at +1 6)"
@@ -580,6 +580,48 @@ no_held_runs() { fake_route "repos/$R/actions/runs?head_sha=$H&per_page=100" '{"
   comments "$(summoned 8)" "$(owner_comment 11 "$woke" 5)"
   sweep
   refute_called "gh api POST repos/$R/issues/7/comments"
+}
+
+# thumbs_comment <id> <分钟前>：巡检留的路径 F 标记，点名 id 10 那次召唤。
+thumbs_comment() { owner_comment "$1" "🤖 巡检：…"$'\n\n'"<!-- pr-guard: codex-thumbs head=$H summon=10 -->" "$2"; }
+
+@test "a woken merge check that did not merge is woken again after 60 idle minutes" {
+  one_pr clean 61
+  comments "$(summoned 70)" "$(thumbs_comment 11 65)"
+  pr_reactions "$(codex_reaction_at +1 68)"
+  summon_reactions
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  assert_contains "$body" '再请合并检查跑一次'
+  assert_equal "${body##*$'\n'}" "<!-- pr-guard: codex-thumbs head=$H summon=10 -->"
+  refute_contains "$body" '@codex'
+}
+
+@test "a 👍 head parked on red CI is woken again once a rerun turns the same head green" {
+  comments "$(summoned 90)" "$(thumbs_comment 11 85)" "$(alert_comment 12 ci - 70)"
+  pr_reactions "$(codex_reaction_at +1 88)"
+  summon_reactions
+  one_pr unstable 65
+  sweep
+  refute_writes
+  one_pr clean 65
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "<!-- pr-guard: codex-thumbs head=$H summon=10 -->"
+}
+
+@test "two re-woken merge checks later: one stalled alert, no fourth codex-thumbs" {
+  one_pr clean 61
+  comments "$(summoned 300)" "$(thumbs_comment 11 280)" "$(thumbs_comment 12 200)" "$(thumbs_comment 13 100)"
+  pr_reactions "$(codex_reaction_at +1 290)"
+  summon_reactions
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  assert_contains "$body" '合并检查跑了 3 次都没合上'
+  assert_contains "$body" "<!-- pr-guard: alert head=$H reason=stalled until=- -->"
+  refute_contains "$body" 'codex-thumbs'
 }
 
 @test "a 👍 on the summon comment counts too" {
