@@ -58,8 +58,8 @@ __VERIFY_CMD__
       # 工作区归属时才填 off。
       # verify_isolation: auto
       #
-      # 修几轮：修满 max_fix_rounds（默认 5）还有意见，Claude 判剩下的拦不拦合并；
-      # 确认还有真 bug 就只修那几条，最多修到 max_confirmed_fix_rounds（默认 10）轮，之后停下推通知。
-      # max_fix_rounds: 5
-      # max_confirmed_fix_rounds: 10
+      # 修几轮：修满 max_fix_rounds（默认 3）还有意见，Claude 判剩下的拦不拦合并；
+      # 确认还有真 bug 就只修那几条，最多修到 max_confirmed_fix_rounds（默认 6）轮，之后停下推通知。
+      # max_fix_rounds: 3
+      # max_confirmed_fix_rounds: 6
     secrets: inherit

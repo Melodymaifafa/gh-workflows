@@ -19,7 +19,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 | 文件 | 什么时候跑 | 干什么 |
 |---|---|---|
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
-| `claude-codex-iterate.yml` | Codex 或 Claude 代审提交意见后 | 选一个 fixer 读意见、只改代码；验证、push、发中文总结由不带凭据/带凭据的独立步骤接手，然后召唤复审；最多连修 5 轮，修满还有意见就让 Claude 逐条判断剩下的意见拦不拦合并（见下方「修满轮数之后」）。默认 Claude 先上，撞额度/限流/认证失效才换 Codex 接手 |
+| `claude-codex-iterate.yml` | Codex 或 Claude 代审提交意见后 | 选一个 fixer 读意见、只改代码；验证、push、发中文总结由不带凭据/带凭据的独立步骤接手，然后召唤复审；最多连修 3 轮，修满还有意见就让 Claude 逐条判断剩下的意见拦不拦合并（见下方「修满轮数之后」）。默认 Claude 先上，撞额度/限流/认证失效才换 Codex 接手 |
 | `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 / 巡检发现冲突 | 先等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop）。跟集成分支冲突就先把它合进 PR 分支（见下方「冲突」） |
 | `pr-sweeper.yml` | 定时（cron 写每 15 分钟，实测 2–7 小时一次；只在本仓库跑） | 扫 owner 名下所有仓库，集成分支取各仓库调用桩的 `base_branch`；给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
 | `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
@@ -59,10 +59,10 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 ### 修满轮数之后（2026-10-04）
 
-自动修满 `max_fix_rounds`（默认 5）轮、head 上还有意见时，不再直接停下告警，而是交给 iterate 里的 `round-cap-judge` job：Claude 只读这个 head 上剩下的全部意见（每条编号 F1、F2…，判决必须每个编号恰好一条，漏一条就算没判成）、PR 改动和代码，逐条重新定级——P0 安全 / 数据 / 线上故障，P1 确实存在的 bug，P2 可选的小改进、纯风格、文档措辞或误报，拿不准按 P1。
+自动修满 `max_fix_rounds`（默认 3）轮、head 上还有意见时，不再直接停下告警，而是交给 iterate 里的 `round-cap-judge` job：Claude 只读这个 head 上剩下的全部意见（每条编号 F1、F2…，判决必须每个编号恰好一条，漏一条就算没判成）、PR 改动和代码，逐条重新定级——P0 安全 / 数据 / 线上故障，P1 确实存在的 bug，P2 可选的小改进、纯风格、文档措辞或误报，拿不准按 P1。
 
 - 全是 P2：用主人的 PAT 发一条评论，逐条写明放过了哪几条、为什么，末尾带 `claude-judge-clean` 标记，并推一次手机通知。`codex-approved-merge` 的路径 E 只放过标记里点名的那几条 review，之后在这个 head 上新出的意见照样拦；CI 全绿才合。
-- 有 Claude 确认的 P0 / P1（第二阶段，2026-10-04）：不停车，用主人的 PAT 发一条 review，只列确认的那几条（带 `claude-review-findings`、`claude-judge-fix-reviews` 和 `claude-judge-fix` 标记），iterate 收到后接着修，修完照旧请 Codex 复审、再判。一直修到 `max_confirmed_fix_rounds`（默认 10）轮；第 10 轮之后还有确认的 bug，才告警 `round-cap` 停下、推一次手机通知，告警里写明还剩哪几条。到第 10 轮剩下的全是 P2，照样合并。
+- 有 Claude 确认的 P0 / P1（第二阶段，2026-10-04）：不停车，用主人的 PAT 发一条 review，只列确认的那几条（带 `claude-review-findings`、`claude-judge-fix-reviews` 和 `claude-judge-fix` 标记），iterate 收到后接着修，修完照旧请 Codex 复审、再判。一直修到 `max_confirmed_fix_rounds`（默认 6）轮；第 6 轮之后还有确认的 bug，才告警 `round-cap` 停下、推一次手机通知，告警里写明还剩哪几条。到第 6 轮剩下的全是 P2，照样合并。
 - 审查方标了 P0 而 Claude 一条都不认、或者 Claude 没判成（额度、输出不合法）：不替人拿主意，直接告警 `round-cap` 停下。
 - 同一个 head 只认第一个判决：已有 `round-cap` 告警，或者已有的放行标记点过它全部意见的名，就不再判；同一个 PR 的判决排队执行，发之前再查一遍。放行之后同一个 head 上又来了新意见，它没被点过名，下一轮会重判。
 - 每个修满轮数的 head 一定留下一个判决：主人的 PAT 缺失或失效、judge 半路挂了，`round-cap-park` 用 job 自己的令牌照旧告警 `round-cap`；没配 PAT 时 Gate 干脆不叫 judge，直接告警。

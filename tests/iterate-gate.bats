@@ -1566,7 +1566,7 @@ runs_seq() { # runs_seq <seq> [run-json ...]
   refute_contains "$prompt" "github.event.review.body"
   refute_contains "$wf" "三次召唤"
   run awk '/max_fix_rounds:/{f=1} f&&/default:/{print $2; exit}' "$REPO_ROOT/$WF"
-  assert_equal "$output" 5
+  assert_equal "$output" 3
 }
 
 @test "workflow: prompt names the reviewer first and points at the prefetched file" {

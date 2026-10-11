@@ -80,11 +80,11 @@ on:
       max_fix_rounds:
         description: Stage one. Past this many automatic fix rounds, the round-cap judge decides whether the leftover findings block the merge.
         type: number
-        default: 5
+        default: 3
       max_confirmed_fix_rounds:
         description: Stage two. While the judge confirms real bugs, keep fixing exactly those until this many rounds in total; past it, park and push one alert.
         type: number
-        default: 10
+        default: 6
       linear_team:
         description: >-
           Key of the Linear team that gets the judge's "worth doing later" findings as Backlog
