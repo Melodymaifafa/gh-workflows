@@ -19,7 +19,7 @@ notify() {
     --form-string "title=$1" --form-string "message=$2" >/dev/null || echo "Pushover 发送失败" >&2
 }
 
-# 每轮在子 shell 里跑，密钥和环境不留到下一轮。退出码 3 = 令牌读不了总开关（已推过一次手机）。
+# 每轮在子 shell 里跑，密钥和环境不留到下一轮。退出码 3 = 本机 gh 读不了总开关（已推过一次手机）。
 sweep_once() (
   [ -r "$secrets" ] || { echo "读不到 $secrets" >&2; exit 1; }
   # shellcheck source=/dev/null
@@ -32,14 +32,15 @@ sweep_once() (
   export OWNER="${OWNER:-Melodymaifafa}"
   unset CODEX_TRIGGER_TOKEN CLAUDE_CODE_OAUTH_TOKEN LINEAR_API_KEY
 
-  # 令牌要有 gh-workflows 的 Variables 读权限，没有会 403。
-  if ! remote="$(gh api "repos/$OWNER/gh-workflows/actions/variables/SWEEP_MODE" --jq .value 2>&1)"; then
+  # 总开关用本机 gh 的登录读（主人的账号，gh auth login 那个）：fine-grained PAT 没有 Variables 权限，
+  # 读不了 Actions 变量。登录失效会 401。
+  if ! remote="$(env -u GH_TOKEN -u GITHUB_TOKEN gh api "repos/$OWNER/gh-workflows/actions/variables/SWEEP_MODE" --jq .value 2>&1)"; then
     case "$remote" in
       *"HTTP 404"*) remote=off ;;  # 没设 = off，跟 pr-sweeper.yml 一样
       *"HTTP 401"*|*"HTTP 403"*)
-        echo "令牌读不了总开关 SWEEP_MODE，这一轮不扫：$remote" >&2
+        echo "本机 gh 读不了总开关 SWEEP_MODE，这一轮不扫：$remote" >&2
         [ -n "$switch_alerted" ] ||
-          notify "🤖 本机 PR 巡检停了" "CODEX_TRIGGER_TOKEN 读不了 gh-workflows 的 Actions 变量 SWEEP_MODE（巡检总开关），本机巡检不敢动手；给这把 PAT 加上 Variables 读权限就会自己恢复。"
+          notify "🤖 本机 PR 巡检停了" "本机 gh 读不了 gh-workflows 的 Actions 变量 SWEEP_MODE（巡检总开关），本机巡检不敢动手；在 Mac 上 gh auth login 重新登录就会自己恢复。"
         exit 3 ;;
       *) echo "读不到总开关 SWEEP_MODE，这一轮不扫：$remote" >&2; exit 1 ;;
     esac
