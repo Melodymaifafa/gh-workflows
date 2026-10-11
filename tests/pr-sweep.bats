@@ -105,6 +105,15 @@ refute_writes() {
 
 # ── 规则 5：重新请求审查 ──
 
+@test "the Mac-run sweeper scripts brace every variable that touches non-ASCII text" {
+  # macOS /bin/bash 3.2 under a UTF-8 locale reads the first byte of （ as part of the name:
+  # "$MODE）" became "MODE\xef: unbound variable" and every round failed (2026-10-11).
+  run perl -ne 'print "$ARGV:$.: $_" if !/^\s*#/ && /\$[A-Za-z_][A-Za-z0-9_]*[\x80-\xff]/; close ARGV if eof' \
+    "$REPO_ROOT/scripts/pr-sweep.sh" "$REPO_ROOT/scripts/pr-sweep-local.sh"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 @test "backlog: a PR with only a Codex quota comment gets kicked with the exact M1 body" {
   one_pr clean 900
   comments "$(cat "$FIXTURES_DIR/codex/quota-comment.json")"
