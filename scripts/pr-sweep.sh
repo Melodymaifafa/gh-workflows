@@ -229,7 +229,7 @@ retry_fix() {
   if [ "$MODE" = dry ]; then summary "- would retry fix $who$hs review=$1"; return 0; fi
   head_unchanged || return 0
   gh api -X POST "repos/$repo/pulls/$n/reviews" -f event=COMMENT -f "commit_id=$H" \
-    -f "body=🤖 巡检：上次自动修复没完成（$why），再修一次。"$'\n'"<!-- fix-retry: head=$H review=$1 -->" --silent
+    -f "body=🤖 巡检：上次自动修复没完成（${why}），再修一次。"$'\n'"<!-- fix-retry: head=$H review=$1 -->" --silent
   summary "- retried fix $who$hs review=$1"
 }
 
@@ -272,7 +272,7 @@ hand_to_claude() {
   esac
   if [ "$MODE" = dry ]; then summary "- would hand $who$hs to Claude ($1)"; return 0; fi
   head_unchanged || return 0
-  post_comment "🤖 巡检：Codex 没接这次审查（$why），请合并检查换 Claude 代审。"$'\n\n'"<!-- pr-guard: codex-silent head=$H reason=$1 -->"
+  post_comment "🤖 巡检：Codex 没接这次审查（${why}），请合并检查换 Claude 代审。"$'\n\n'"<!-- pr-guard: codex-silent head=$H reason=$1 -->"
   summary "- handed $who$hs to Claude ($1)"
 }
 
@@ -335,7 +335,7 @@ sweep_pr() {
     if [ "$base" = - ]; then
       alert_once unwatched - "🤖 巡检：这个仓库没接共享的审查自动化，这个 PR 不会有人自动审或合。在 gh-workflows 里跑 ./onboard.sh ${repo#*/} <python|node> 接上，或手动处理。"
     else
-      alert_once unwatched - "🤖 巡检：自动审查和合并只管打向 $base 的 PR，这个 PR 不会有人管。请把 base 改成 $base，或关掉。"
+      alert_once unwatched - "🤖 巡检：自动审查和合并只管打向 $base 的 PR，这个 PR 不会有人管。请把 base 改成 ${base}，或关掉。"
     fi
     return 0
   fi
@@ -471,7 +471,7 @@ repos="$(gh api --paginate --slurp "user/repos?affiliation=owner&per_page=100" |
     | select(($only | length) == 0 or (.name as $n | .full_name as $f | any($only[]; . == $n or . == $f)))
     | "\(.full_name):\(.private == true):\(.default_branch)"')"
 
-summary "### PR 巡检（$MODE）"
+summary "### PR 巡检（${MODE}）"
 failed=0 unreadable=0 unreadable_labels="" unonboarded=0 unonboarded_labels=""
 for entry in $repos; do
   # 仓库名和分支名都不含 : 和空白。
@@ -525,7 +525,7 @@ for entry in $repos; do
     rc=$?
     set -e
     if [ "$private" = true ]; then pr_label="$label"; else pr_label="$repo#$n"; fi
-    [ "$rc" = 0 ] || { echo "::warning::$pr_label 巡检出错（exit $rc）"; failed=1; }
+    [ "$rc" = 0 ] || { echo "::warning::$pr_label 巡检出错（exit ${rc}）"; failed=1; }
   done
 done
 if [ "$unreadable" -gt 0 ]; then

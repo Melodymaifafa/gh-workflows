@@ -63,7 +63,7 @@ while :; do
   case "$rc" in
     0) switch_alerted= ;;
     3) switch_alerted=1 ;;
-    *) echo "这一轮失败（退出码 $rc），5 分钟后再试" >&2 ;;
+    *) echo "这一轮失败（退出码 ${rc}），5 分钟后再试" >&2 ;;
   esac
   sleep 300
 done
