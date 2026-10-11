@@ -629,6 +629,27 @@ no_held_runs() { fake_route "repos/$R/actions/runs?head_sha=$H&per_page=100" '{"
   assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=timeout -->"
 }
 
+@test "timeout: a Codex status comment is activity, not a conclusion" {
+  one_pr clean 3
+  status_comment() { gh_comment 13 'chatgpt-codex-connector[bot]' NONE '<!-- codex-pull-request-review-summary -->
+## Codex Review Summary' "$(ago "$1")"; }
+  comments "$(summoned 8)" "$(status_comment 7)"
+  no_reactions
+  sweep
+  refute_called "gh api POST repos/$R/issues/7/comments"
+  comments "$(summoned 21)" "$(status_comment 20)"
+  sweep
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=timeout -->"
+}
+
+@test "timeout: a Codex clean comment after the summon is a conclusion" {
+  one_pr clean 3
+  comments "$(summoned 30)" "$(gh_comment 13 'chatgpt-codex-connector[bot]' NONE "Codex Review: Didn't find any major issues." "$(ago 25)")"
+  no_reactions
+  sweep
+  refute_contains "$(fake_all_bodies)" "codex-silent"
+}
+
 @test "quota: a Codex usage-limit comment after the summon hands the head to Claude at once" {
   one_pr clean 1
   comments "$(summoned 2)" "$(jq --arg at "$(ago 1)" '.created_at = $at' "$FIXTURES_DIR/codex/quota-comment.json")"

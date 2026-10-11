@@ -18,7 +18,7 @@
 #   6. 替合并工作流盯 Codex（它不再开着 runner 等，等的每一分钟都计费）：
 #      a. 修复那轮推了 head（有 M7）还没召唤 → 离上一条 review 满 6 分钟就召唤（M1，带 fix-round）。
 #      b. 最近一次召唤之后 Codex 点了 👍    → 留 codex-thumbs 标记叫醒合并检查（路径 F），每次召唤一条。
-#      c. Codex 没接这次召唤                → 额度用完马上、5 分钟没任何回应、或 20 分钟只有 👀 没结论时，
+#      c. Codex 没接这次召唤                → 额度用完马上、5 分钟没任何回应、或 20 分钟没结论（clean 评论 / review）时，
 #                                             留 codex-silent 标记让合并检查换 Claude 代审（路径 G），每次召唤一条。
 #      带 M7 的 head（本流水线自己推的）上被 GitHub 扣住等批准的 CI，顺手批掉。
 #   5. 其余              → 没人碰过且空闲 ≥ 10 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
@@ -130,7 +130,8 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     ([$r[] | select(.user.login == $codex and (.submitted_at | ts) >= $summon.at)] | length),
     (if any($tc[]; (.created_at | ts) >= $summon.at
           and (has("<!-- pr-guard: fallback head=" + $h + " ") or has("<!-- pr-guard: codex-silent head=" + $h + " "))) then 1 else 0 end),
-    (if any($tc[]; (.created_at | ts) >= $summon.at and has("<!-- pr-guard: codex-thumbs head=" + $h + " ")) then 1 else 0 end)
+    (if any($tc[]; (.created_at | ts) >= $summon.at and has("<!-- pr-guard: codex-thumbs head=" + $h + " ")) then 1 else 0 end),
+    ([$c[] | select(.user.login == $codex and (.created_at | ts) >= $summon.at and has("find any major issues"))] | length)
   ] | @tsv
 '
 
@@ -308,12 +309,12 @@ sweep_pr() {
   if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
 
   local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
-  local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken thumbs eyes
+  local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_clean thumbs eyes
   facts="$(jq -rn --slurpfile pr "$tmp/pr.json" --slurpfile cs "$tmp/comments.json" --slurpfile rs "$tmp/reviews.json" \
     --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq")"
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
     until_active until_passed fix_reason state merged total_retries judged judged_reviews \
-    summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken <<<"$facts"
+    summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_clean <<<"$facts"
   echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
   # 0. 没人管：不叫审、不重修，告警一次。空闲 60 分钟再告，给人留时间改 base 或关掉。
@@ -412,7 +413,8 @@ sweep_pr() {
         hand_to_claude quota; return 0
       elif [ "$codex_comments" = 0 ] && [ "$eyes" = 0 ] && [ "$waited" -ge 300 ]; then
         hand_to_claude silent; return 0
-      elif [ "$codex_comments" = 0 ] && [ "$waited" -ge 1200 ]; then
+      # Codex 审的过程中会先发（再改）一条状态评论，那不是结论：20 分钟只看 clean 评论和 review。
+      elif [ "$codex_clean" = 0 ] && [ "$waited" -ge 1200 ]; then
         hand_to_claude timeout; return 0
       fi
     fi
