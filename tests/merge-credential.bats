@@ -18,15 +18,14 @@ MERGE_STEP='Wait for Codex and merge a clean exact head'
 CODEX='chatgpt-codex-connector[bot]'
 H=1a7e81f6b5f27f0a1dbc33c6fafda1bb86f1483d
 
-# 路径 A（PR 打开事件 + Codex 👍）+ CI 全绿，走到合并那一条。
+# 路径 F（巡检看到 Codex 👍 后留的标记）+ CI 全绿，走到合并那一条。
 setup() {
   setup_fake_env
   export REPO=o/r PR_NUMBER=7 BASE_BRANCH=develop GH_TOKEN=actions-token
   export GITHUB_RUN_ID=111 ACTOR_TYPE=User HAS_PAT=true
   export GITHUB_WORKFLOW='Merge after clean Codex review'
-  export FAKE_NOW=2026-09-18T08:00:10Z TRIGGERED_AT=2026-09-18T08:00:00Z
-  export EVENT_HEAD="$H" TARGET_ID=7 SELF_WORKFLOWS_TOKEN='' CODEX_TRIGGER_TOKEN=owner-pat
-  unset WATCH_SECONDS POLL_SECONDS SILENT_SECONDS PUSHOVER_TOKEN PUSHOVER_USER
+  export FAKE_NOW=2026-09-18T08:06:00Z SELF_WORKFLOWS_TOKEN='' CODEX_TRIGGER_TOKEN=owner-pat
+  unset PUSHOVER_TOKEN PUSHOVER_USER
   fake_route repos/o/r/pulls/7 "$(
     jq -n --arg h "$H" '{
       state: "open", draft: false, title: "feat: x", merged: false,
@@ -37,8 +36,7 @@ setup() {
   fake_route "repos/o/r/pulls/7/reviews?per_page=100" '[]'
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
   no_running_fix o/r
-  fake_route "repos/o/r/issues/7/reactions?per_page=100" \
-    "$(json_array "$(gh_reaction +1 "$CODEX" 2026-09-18T08:01:00Z)")"
+  path_f o/r "$H"
   fake_cli pr_checks \
     '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"https://x","workflow":"CI"}]'
 }
@@ -77,8 +75,7 @@ setup() {
   fake_route "repos/Melodymaifafa/gh-workflows/pulls/7/reviews?per_page=100" '[]'
   fake_route "repos/Melodymaifafa/gh-workflows/issues/7/comments?per_page=100" '[]'
   no_running_fix Melodymaifafa/gh-workflows
-  fake_route "repos/Melodymaifafa/gh-workflows/issues/7/reactions?per_page=100" \
-    "$(json_array "$(gh_reaction +1 "$CODEX" 2026-09-18T08:01:00Z)")"
+  path_f Melodymaifafa/gh-workflows "$H"
 
   run run_block "$MERGE" "$MERGE_STEP"
 

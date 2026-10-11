@@ -1351,14 +1351,16 @@ summon_env() {
   refute_called "curl "
 }
 
-@test "summon: waits out the 6-minute spacing, then skips if the head moved meanwhile" {
+# 2026-10-11：runner 不再干等 6 分钟冷却（等的每一分钟都计费），冷却没过就交给巡检召唤。
+@test "summon: inside the 6-minute spacing it does not wait; the sweeper summons later" {
   summon_env
-  export FAKE_NOW=2026-09-18T08:02:00Z
-  fake_cli pr_view "{\"headRefOid\":\"$H2\"}" 1
-  fake_cli pr_view '{"headRefOid":"3c9fa3b8d7f4e5c6b7a8998a1f2e3d4c5b6a7988"}' 2
+  export FAKE_NOW=2026-09-18T08:02:00Z PUSHED_HEAD="$H2"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
-  assert_called "sleep 240" 1
+  assert_contains "$output" "Summon window opens in 240s; the PR sweeper requests the re-review then"
+  refute_called "sleep"
+  refute_called "actions/runs"
   refute_called "gh pr comment"
 }
 
@@ -1394,37 +1396,21 @@ runs_seq() { # runs_seq <seq> [run-json ...]
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 
-# Codex 2026-10-04 的 P2（第一条）：Claude 修得久、冷却早过了，两次批准就挨在一起跑；
-# run 晚几秒才建出来的话两次都扑空。所以召唤前连看 60 秒，不挂在冷却上。
-@test "summon: watches for a minute before summoning, even past the cooldown" {
+# Codex 2026-10-04 的两条 P2（run 晚几秒才建出来、被扣的那个不是第一个建出来的）以前靠
+# 召唤前连看 60 秒兜；2026-10-11 起只看一眼，晚到的由巡检批（它批带 M7 的 head 上被扣的 run，
+# tests/pr-sweep.bats 有一条）。
+@test "summon: past the cooldown it looks once, without sleeping, and summons" {
   summon_env
   export PUSHED_HEAD="$H2"
   fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
-  # 召唤前后各只看一眼的话，两眼都扑空，第三眼才有 —— 永远批不到。
   runs_seq 1
-  runs_seq 2
-  runs_seq 3 "$(held 11)"
-  runs_seq 4 "$(queued 11)"
+  runs_seq 2 "$(held 11)"
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
-  assert_called "sleep 10" 6
-  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
+  refute_called "sleep"
+  assert_called "gh api GET repos/o/r/actions/runs" 1
+  refute_called "/approve"
   assert_called "gh pr comment 7 --repo o/r" 1
-}
-
-# Codex 2026-10-04 的 P2（第二条）：一次推送触发好几个 workflow，先建出来的那个不一定是
-# 被扣的。看到第一个 run 就停，晚到的那个被扣的就漏了。
-@test "summon: a held run that shows up after another run is still approved" {
-  summon_env
-  export PUSHED_HEAD="$H2"
-  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
-  runs_seq 1 "$(queued 13)"
-  runs_seq 2 "$(queued 13)"
-  runs_seq 3 "$(queued 13)" "$(held 11)"
-  runs_seq 4 "$(queued 13)" "$(queued 11)"
-  run run_block "$WF" "Request Codex re-review after a new commit"
-  assert_equal "$status" 0
-  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
 }
 
 @test "summon: no run ever shows up -> gives up after a minute and still summons" {
@@ -1469,8 +1455,7 @@ runs_seq() { # runs_seq <seq> [run-json ...]
   run run_block "$WF" "Request Codex re-review after a new commit"
   assert_equal "$status" 0
   assert_contains "$output" "CODEX_TRIGGER_TOKEN needs Actions: Read and write"
-  # 批不了就不在这一分钟里反复试：召唤前一次，冷却后再一次。
-  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 2
+  assert_called "gh api POST repos/o/r/actions/runs/11/approve" 1
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 
@@ -1485,8 +1470,7 @@ runs_seq() { # runs_seq <seq> [run-json ...]
   assert_equal "$status" 0
   assert_contains "$output" "CODEX_TRIGGER_TOKEN needs Actions: Read and write"
   refute_called "/approve"
-  # 列不出来就不在这一分钟里反复试：召唤前一次，冷却后再一次。
-  assert_called "gh api GET repos/o/r/actions/runs" 2
+  assert_called "gh api GET repos/o/r/actions/runs" 1
   assert_called "gh pr comment 7 --repo o/r" 1
 }
 

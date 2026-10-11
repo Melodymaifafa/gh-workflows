@@ -3199,8 +3199,8 @@ jobs:
           # 那个提交」上被扣住的 run，别人推的提交一概不碰。被扣住的 run 长这样：
           # status=completed、conclusion=action_required（Codex 2026-10-04 的 P1）。
           # 一次推送会触发好几个 workflow，GitHub 不一定同时、也不一定马上把它们建出来，
-          # 所以召唤前连看 60 秒、每 10 秒一眼，看到被扣的就批；冷却过后再看一眼。等待不挂
-          # 在召唤冷却上：Claude 修得久、冷却早过了，也照样看满 60 秒。令牌没有 Actions 写
+          # 所以召唤前只看一眼（不在 runner 上干等），漏掉的由巡检接着批（它只批带 M7 的 head，
+          # 也就是本流水线自己推的提交）。令牌没有 Actions 写
           # 权限时只 warning 一次就不再试：CI 照旧等人点，召唤照发。权限不够时 403 先落在
           # 「列 run」这一步、还没走到批准（2026-10-04 wf-smoke-test 20 号 PR 实测），所以
           # 两条告警都点名缺的那一项，别让人看着「列不出来」猜不到要去加什么。
@@ -3223,22 +3223,16 @@ jobs:
               done
             done
           }
-          approve_held_runs 7
-
           reviewed_epoch="$(date -d "$REVIEWED_AT" +%s)"
 
           # 召唤距上轮 review 至少 6 分钟：实测（2026-07-15 PR #54/#62）连发数次后
-          # Codex 会限流静默。每轮只召唤一次：Codex 没回应由 merge watcher 的
-          # 5 分钟静默检测接手（换 Claude 代审），这里不再重试、不再告警。
+          # Codex 会限流静默。不够 6 分钟就不在 runner 上干等（等的每一分钟都计费，2026-10
+          # 这段等待占了私有仓库约 18% 的分钟）：这一轮推上去的 head 带着 M7，巡检（每 5 分钟）
+          # 看到「有 M7、还没召唤、冷却过了」就用主人身份召唤，顺手批掉被扣住的 CI。
+          # 每轮只召唤一次：Codex 没回应由巡检的静默检测接手（换 Claude 代审），这里不再重试。
           delay="$((reviewed_epoch + 360 - $(date +%s)))"
           if [ "$delay" -gt 0 ]; then
-            echo "waiting ${delay}s for the summon window"
-            sleep "$delay"
-          fi
-
-          current_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
-          if [ "$current_sha" != "$head_sha" ]; then
-            echo "PR HEAD changed while waiting; skipping stale Codex re-review"
+            echo "::notice::Summon window opens in ${delay}s; the PR sweeper requests the re-review then"
             exit 0
           fi
 

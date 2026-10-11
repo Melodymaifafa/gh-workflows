@@ -231,20 +231,14 @@ ask_codex() {
 @test "patch: the fix request is not a re-review request for codex-approved-merge" {
   merge_wf="$REPO_ROOT/.github/workflows/codex-approved-merge.yml"
 
-  # 一、job 层的触发条件是「正文里含 @codex review」这个子串
-  assert_contains "$(cat "$merge_wf")" "contains(github.event.comment.body, '@codex review')"
+  # 一、合并 job 不再因为召唤评论启动（2026-10-11 起不在 runner 上等 Codex），所以正文里的
+  #     @codex 叫不醒它。
+  refute_contains "$(awk '/^  watch-and-merge:/{f=1} f&&/^    concurrency:/{exit} f&&!/^ *#/' "$merge_wf")" "@codex"
   refute_contains "$REQUEST" '@codex review'
 
-  # 二、watch step 里那条正则
-  pattern="$(sed -n "s/^[[:space:]]*'\(@codex.*\)' <<<.*/\1/p" "$merge_wf" | head -n 1)"
-  [ -n "$pattern" ] || { echo 'the re-review pattern moved; update this test' >&2; return 1; }
-  if printf '%s' "$REQUEST" | grep -Eiq "$pattern"; then
-    echo "the fix request matches the re-review pattern: $pattern" >&2
-    return 1
-  fi
-  # 对照：真正的召唤正文确实匹配 —— 少了这一半，上面那条可能只是正则没取对
-  printf '@codex review' | grep -Eiq "$pattern" ||
-    { echo "control: $pattern does not even match a real summon" >&2; return 1; }
+  # 二、巡检和路径 F 认召唤只认 codex-review-head: H 标记；修复请求不带它。
+  assert_contains "$(cat "$merge_wf")" '"<!-- codex-review-head: " + $h + " -->"'
+  refute_contains "$REQUEST" 'codex-review-head:'
 }
 
 @test "patch: the diff from Codex's reply lands in the workspace" {

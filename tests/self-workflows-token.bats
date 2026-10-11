@@ -135,14 +135,13 @@ push_workspace() {
 
 # ---------- 合并：真跑一遍那一步 ----------
 
-# merge_setup <repo>：路径 A（PR 打开事件 + Codex 👍）+ CI 全绿，走到合并那一条。
+# merge_setup <repo>：路径 F（巡检看到 Codex 👍 后留的标记）+ CI 全绿，走到合并那一条。
 merge_setup() {
   export REPO="$1" PR_NUMBER=7 BASE_BRANCH=develop GH_TOKEN=actions-token
   export GITHUB_RUN_ID=111 ACTOR_TYPE=User HAS_PAT=true
   export GITHUB_WORKFLOW='Merge after clean Codex review'
-  export FAKE_NOW=2026-09-18T08:00:10Z TRIGGERED_AT=2026-09-18T08:00:00Z
-  export EVENT_HEAD="$H" TARGET_ID=7
-  unset WATCH_SECONDS POLL_SECONDS SILENT_SECONDS PUSHOVER_TOKEN PUSHOVER_USER
+  export FAKE_NOW=2026-09-18T08:06:00Z
+  unset PUSHOVER_TOKEN PUSHOVER_USER
   fake_route "repos/$1/pulls/7" "$(
     jq -n --arg h "$H" --arg r "$1" '{
       state: "open", draft: false, title: "feat: x", merged: false,
@@ -153,8 +152,7 @@ merge_setup() {
   fake_route "repos/$1/pulls/7/reviews?per_page=100" '[]'
   fake_route "repos/$1/issues/7/comments?per_page=100" '[]'
   no_running_fix "$1"
-  fake_route "repos/$1/issues/7/reactions?per_page=100" \
-    "$(json_array "$(gh_reaction +1 "$CODEX" 2026-09-18T08:01:00Z)")"
+  path_f "$1" "$H"
   fake_cli pr_checks \
     '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"https://x","workflow":"CI"}]'
 }

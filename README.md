@@ -20,8 +20,8 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 |---|---|---|
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
 | `claude-codex-iterate.yml` | Codex 或 Claude 代审提交意见后 | 选一个 fixer 读意见、只改代码；验证、push、发中文总结由不带凭据/带凭据的独立步骤接手，然后召唤复审；最多连修 3 轮，修满还有意见就让 Claude 逐条判断剩下的意见拦不拦合并（见下方「修满轮数之后」）。默认 Claude 先上，撞额度/限流/认证失效才换 Codex 接手 |
-| `codex-approved-merge.yml` | PR 开启 / 有人喊 `@codex review` / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 / 巡检发现冲突 | 先等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop）。跟集成分支冲突就先把它合进 PR 分支（见下方「冲突」） |
-| `pr-sweeper.yml` | 定时（cron 写每 15 分钟，实测 2–7 小时一次；只在本仓库跑） | 扫 owner 名下所有仓库，集成分支取各仓库调用桩的 `base_branch`；给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
+| `codex-approved-merge.yml` | Codex 的 clean 评论 / 巡检看到 Codex 👍 或没回应 / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 / 巡检发现冲突 | 只看一眼、不在 runner 上等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop）。跟集成分支冲突就先把它合进 PR 分支（见下方「冲突」） |
+| `pr-sweeper.yml` | 定时（cron 写每 15 分钟，实测 2–7 小时一次；只在本仓库跑）。主力是主人 Mac 上每 5 分钟的 `scripts/pr-sweep-local.sh` | 扫 owner 名下所有仓库，集成分支取各仓库调用桩的 `base_branch`；替合并环节盯 Codex 的 👍 和沉默，修复那轮冷却过了再叫审；给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
 | `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
 | `move-v1.yml` | 每天 09:47（北京时间），也可手动点（只在本仓库跑） | 把 `v1` 标签移到 develop 上 CI 全绿的最新提交 —— 各仓库钉的是 `@v1`，这一步就是发布。移了推一条手机通知（带了哪些 PR、怎么回滚）；只往前挪 |
 
@@ -29,9 +29,11 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 每一次审核请求都先问 Codex。出现下面任一情况，**这一次**改由 Claude 只读代审，结果由 owner 的 PAT 发出（这样下一环才会被触发）：
 
-- Codex 回复「reached your Codex usage limits」（30 秒内发现）；
+- Codex 回复「reached your Codex usage limits」；
 - 喊了 `@codex review` 5 分钟没有 👀 也没有结论；
-- 20 分钟还没有结论。
+- 20 分钟这个 head 还没有结论（晚到的、审上一个 head 的 review / clean 评论不算）。
+
+**不在 runner 上等 Codex**（2026-10-11）：以前 PR 一开、一召唤，合并环节就起一个 runner 开着等 Codex 的 👍（GitHub 没有 reaction 事件），iterate 修完也开着 runner 等满 6 分钟召唤冷却。私有仓库按分钟计费，2026-10 的 1–9 号这两段等待占了约一半分钟，10 号就用完了每月 2,000 分钟的免费额度。现在 Codex 的 clean 评论照旧是事件；👍、沉默和冷却由巡检（每 5 分钟）来盯，看到了再用主人身份留标记叫醒合并环节：`codex-thumbs`（路径 F，再核一遍 👍 才合；没合上 —— 多半是当时 CI 还没绿，同一个 head 上重跑绿了也没有事件 —— 就空闲 60 分钟后再留一条，补 2 次还没合上告警 `stalled`）、`codex-silent`（路径 G，换 Claude 代审）。上面三条的「几分钟」因此按巡检的节奏算，最多晚 5 分钟。主人的 Mac 关着时由 `pr-sweeper.yml` 兜底，合并会晚几个小时。
 
 没有「Codex 已坏」的全局开关：下一轮照样先问 Codex，它额度恢复就自动接回。Claude 代审只读（Read/Glob/Grep），看不到任何密钥，结论必须是合法 JSON 才算数；空结果一律当「没审过」，绝不当「通过」。**有意见的 head 不会被合并**，唯一的例外是下面「修满轮数之后」那条路：Claude 逐条核过、点名放过的那几条意见。
 
@@ -89,12 +91,12 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 合并用主人的 PAT（`CODEX_TRIGGER_TOKEN`），不用 `github.token`：GitHub 不让 `github.token` 的 push 触发别的 workflow，那样调用方 `ci.yml` 的 `on: push` 不跑，合并出来的 commit 上没有 CI，`ff-main` 就永远不挪 main（2026-10-07 wechat-mimic-finetune 实测）。仓库没设这把 PAT、或它合不动（失效 / 权限不够），就退回 `github.token`：照样合，只是那个 commit 上没 CI。
 
-**巡检**（`pr-sweeper.yml` + `scripts/pr-sweep.sh`）是兜底：没人碰过的 head 空闲 30 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused` `carried-open`、CI 红）等人处理。有冲突的 head 先留一条 `conflict` 标记叫醒合并环节自动解（见上方「冲突」）。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
+**巡检**（`scripts/pr-sweep.sh`）：替合并环节盯 Codex（见上方「不在 runner 上等 Codex」），修复那轮推上去的 head 离上一条 review 满 6 分钟就召唤，并批掉 GitHub 扣住等批准的 CI（只批带 M7 的 head，也就是流水线自己推的）；没人碰过的 head 空闲 10 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused` `carried-open`、CI 红）等人处理。有冲突的 head 先留一条 `conflict` 标记叫醒合并环节自动解（见上方「冲突」）。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
 
 - **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **漏接的仓库每轮都点名**（2026-10-06，MEL-308）：有开着的 PR 却没装共享调用桩的仓库，run 摘要和 warning 里每次都列出来，并给出 `./onboard.sh <仓库> <python|node>`。`unwatched` 告警是按 head 去重的，head 不变就只响一次 —— 但仓库漏接是仓库级的，换个 head 也不会自己好，所以这条不跟着 head 去重。MEL-308 查出来的就是这个：三个仓库漏接，5 个 PR 全停，最久的两周没人管。
-- **节奏**：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次，所以上面的 30 / 60 分钟只是下限。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。
-- **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`。
+- **节奏**：主力是主人 Mac 上的 `scripts/pr-sweep-local.sh`，它自己常驻、每轮跑完歇 5 分钟，pm2 只管让它活着（密钥读 onboard.sh 用的同一份本机密钥文件，每轮重读）：`pm2 start scripts/pr-sweep-local.sh --name pr-sweeper --interpreter bash && pm2 save`。以前按 `--cron-restart '*/5 * * * *' --no-autorestart` 装过的，先 `pm2 delete pr-sweeper` 再按这条重装：pm2 的定时重启只管还活着的进程，跑一轮就退出的脚本不会再被拉起来。`pr-sweeper.yml` 兜底：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。
+- **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`：Mac 上那个也每轮读这个变量，下一轮起两边都停，不用去 Mac 上关。Mac 上用本机 `gh` 的登录读它（fine-grained PAT 没有 Variables 权限）；读不了就不敢动手、推一次手机通知。
 - **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
 - 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。
 
@@ -239,7 +241,7 @@ jobs:
 - **`git clean -fd` 清不掉被忽略的残留**：Claude 撞额度前跑一半的 `uv sync` 留下的 `.venv`、`node_modules`、build 产物都躲在 `.gitignore` 后面，没有 `-x` 就原地留着跟进 Codex 那一轮，验证于是跑在一个被污染的工作区上。换人前的清理一律 `git clean -fdx`；本轮要留的东西（预取的 review 正文）在 clean 之前挪出工作区、clean 之后再放回来（MEL-252）。
 - **`.git/info/exclude` 挡不住 `git reset --hard`**：exclude 只管 `git add` 和 `git clean` 不去碰**未跟踪**的文件；调用方仓库自己跟踪了同名文件时，`reset --hard` 照样把它恢复回来，把写在那儿的预取内容盖掉。工作区里放「只给这一轮用」的文件，要么放到工作区外，要么带上 run id（同「取脚本的落点必须带 run id」那条），别指望 exclude（MEL-252）。
 - **关键那一步要排在前面，别排在发评论后面**：同上一条的门禁语义，`gh pr comment` 偶发失败一次，排在它后面的步骤就整个被跳过。`claude-codex-iterate` 里「召唤复审」一度排在「发总结评论」之后 —— 总结那步一抖，Codex 刚推的提交就没人复看，链条静默停住。链条上必须发生的事排前面，给人看的排后面（MEL-252）。
-- **`@codex review` 会被限流静默**：连发几次后连 👀 都不回，约 10 分钟恢复。现在 iterate 只召唤一次，沉默由 watcher 的 5 分钟兜底接手。
+- **`@codex review` 会被限流静默**：连发几次后连 👀 都不回，约 10 分钟恢复。现在 iterate 只召唤一次，沉默由巡检的 5 分钟兜底接手。
 - **Codex 额度用完时它照样回一条评论**：旧版超时告警把它当成「Codex 有反应」，于是既不告警也不合并，PR 就这么卡住（2026-09-17，3 个 PR）。现在认出这句话就当场换 Claude。
 - **秒合并的 PR** 会让 Codex 迟到的 review 落在已关闭的 PR 上，job 被跳过是正常现象。
 - **密钥只写不读，个人账号也没有账号级密钥**：存进仓库后连 API 都取不回值（`gh api repos/X/actions/secrets/NAME` 只返回名字和日期），共享密钥是 organization 才有的功能。所以 `secrets.env` 是唯一母本 —— 在网页上手填过的值必须补回母本，否则接新仓库时无处可取（2026-07-30 为此翻了半天 `~/.claude/history.jsonl`）。

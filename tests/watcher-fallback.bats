@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
-# 合并 watcher（codex-approved-merge.yml 的 watch step）：Codex 审不了时换 Claude、
-# 有问题的 head 绝不合并、路径 D（Claude clean）、CI / 可合并性告警只发一次。
+# 合并 watcher（codex-approved-merge.yml 的 watch step）：不在 runner 上等 Codex（路径 F 只看一眼）、
+# Codex 审不了时换 Claude（路径 G）、有问题的 head 绝不合并、路径 D（Claude clean）、
+# CI / 可合并性告警只发一次。
 # 跑的是 workflow 里的真 run 块，gh / curl / date / sleep 都是假的。
 
 # bats 每个 @test 本来就跑在子 shell 里，export 只给本测试用；字面量 ${{ }} / ` / ~ 是要比对的文本；
@@ -23,8 +24,7 @@ setup() {
   export REPO=o/r PR_NUMBER=7 BASE_BRANCH=develop GH_TOKEN=actions-token
   export GITHUB_RUN_ID=111 GITHUB_WORKFLOW='Merge after clean Codex review'
   export ACTOR_TYPE=User HAS_PAT=true PUSHOVER_TOKEN=pt PUSHOVER_USER=pu
-  export FAKE_NOW=2026-09-18T08:00:10Z TRIGGERED_AT=2026-09-18T08:00:00Z
-  unset WATCH_SECONDS POLL_SECONDS SILENT_SECONDS
+  export FAKE_NOW=2026-09-18T08:06:00Z
   fake_route repos/o/r/pulls/7 "$(pr_json)"
   fake_route "repos/o/r/pulls/7/reviews?per_page=100" '[]'
   fake_route "repos/o/r/issues/7/comments?per_page=100" '[]'
@@ -40,23 +40,16 @@ pr_json() {
   }'
 }
 
-# 路径 A：PR 打开事件，看 PR 正文上的 reaction。
-path_a() {
-  export EVENT_HEAD="$H" TARGET_ID=7
-  fake_route "repos/o/r/issues/7/reactions?per_page=100" "${1:-[]}"
-}
-
-# 路径 B：主人令牌发的 M1 召唤评论。path_b [reactions] [m1_body 的第二个参数]
-path_b() {
-  export EVENT_HEAD='' TARGET_ID=500
-  fake_route repos/o/r/issues/comments/500 \
-    "$(gh_comment 500 Melodymaifafa OWNER "$(m1_body "$H" "${2:-1}")" 2026-09-18T08:00:00Z)"
-  fake_route "repos/o/r/issues/comments/500/reactions?per_page=100" "${1:-[]}"
+# 路径 G：巡检看到 Codex 没接召唤后留的标记。path_g <reason> [head] [作者] [身份]
+path_g() {
+  export TARGET_ID=800
+  fake_route repos/o/r/issues/comments/800 "$(gh_comment 800 "${3:-Melodymaifafa}" "${4:-OWNER}" \
+    "🤖 巡检：Codex 没接这次审查。"$'\n\n'"<!-- pr-guard: codex-silent head=${2:-$H} reason=$1 -->")"
 }
 
 # 路径 D：<comment-json> [id]
 path_d() {
-  export EVENT_HEAD='' TARGET_ID="${2:-600}" TRIGGERED_AT=2026-09-18T08:00:00Z
+  export TARGET_ID="${2:-600}"
   fake_route "repos/o/r/issues/comments/$TARGET_ID" "$1"
 }
 
@@ -65,10 +58,6 @@ green_checks() {
     {"name":"lint-and-test","state":"SUCCESS","bucket":"pass","link":"https://github.com/o/r/actions/runs/222/job/1","workflow":"CI"},
     {"name":"iterate","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/333/job/1","workflow":"Claude iterates on Codex review"}
   ]'
-}
-
-thumbs_up() {
-  json_array "$(gh_reaction +1 "$CODEX" 2026-09-18T08:01:00Z)"
 }
 
 # 本地加速：假 sleep 每次按 N 倍拨假时钟，长等待（CI 闸门、可合并性）几轮就到头。
@@ -97,43 +86,153 @@ refute_fallback() {
   refute_called 'pr-guard: fallback'
 }
 
-# ---------- 默认值 ----------
+# ---------- 不在 runner 上等 Codex ----------
 
-@test "production timers default to the spec: poll 30 s, silent 300 s, timeout 1200 s" {
+@test "the job never starts on a PR event or a review request: nothing waits for Codex" {
+  local job_if
+  job_if="$(awk '/^  watch-and-merge:/{f=1} f&&/^    concurrency:/{exit} f&&!/^ *#/' "$REPO_ROOT/$WF")"
+  refute_contains "$job_if" "pull_request_target"
+  refute_contains "$job_if" "'@codex review'"
+  assert_contains "$job_if" "pr-guard: codex-thumbs head="
+  assert_contains "$job_if" "pr-guard: codex-silent head="
   block="$(extract_run_block "$REPO_ROOT/$WF" "$STEP")"
-  assert_contains "$block" 'watch_seconds="${WATCH_SECONDS:-1200}"'
-  assert_contains "$block" 'poll_seconds="${POLL_SECONDS:-30}"'
-  assert_contains "$block" 'silent_seconds="${SILENT_SECONDS:-300}"'
-  refute_contains "$block" 'Codex 复审超时无产出'
+  refute_contains "$block" 'WATCH_SECONDS'
+  refute_contains "$block" 'POLL_SECONDS'
+  refute_contains "$block" 'SILENT_SECONDS'
 }
 
-# ---------- 三种 fallback 触发 ----------
+# ---------- 路径 F：巡检看到 👍 ----------
 
-@test "quota: the real Codex quota comment falls back on the first poll" {
-  path_a
-  export TRIGGERED_AT=2026-09-17T08:02:54Z FAKE_NOW=2026-09-17T08:03:10Z
-  fake_route "repos/o/r/issues/7/comments?per_page=100" \
-    "$(json_array "$(cat "$FIXTURES_DIR/codex/quota-comment.json")")"
-
+@test "path F: a Codex 👍 on the PR body after the named summon merges after CI" {
+  path_f o/r "$H"
+  green_checks
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
-  assert_equal "$(step_output fallback)" true
-  assert_equal "$(step_output head)" "$H"
-  assert_equal "$(step_output reason)" quota
-  assert_called 'gh api POST repos/o/r/issues/7/comments' 1
-  assert_equal "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" "$M2_QUOTA"
-  assert_called '[token=actions-token]'
-  refute_called 'sleep'
-  refute_called 'gh pr merge'
-  assert_bodies_inert
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+  refute_called 'curl'
 }
 
-@test "quota with a bot actor posts nothing and hands nothing to Claude" {
-  path_a
-  export ACTOR_TYPE=Bot TRIGGERED_AT=2026-09-17T08:02:54Z FAKE_NOW=2026-09-17T08:03:10Z
-  fake_route "repos/o/r/issues/7/comments?per_page=100" \
-    "$(json_array "$(cat "$FIXTURES_DIR/codex/quota-comment.json")")"
+@test "path F: a 👍 on the summon comment counts too" {
+  path_f o/r "$H"
+  fake_route "repos/o/r/issues/7/reactions?per_page=100" '[]'
+  fake_route "repos/o/r/issues/comments/500/reactions?per_page=100" \
+    "$(json_array "$(gh_reaction +1 "$CODEX" 2026-09-18T08:01:00Z)")"
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
 
+@test "path F: no 👍 yet exits at once — no sleep, no fallback, no merge" {
+  path_f o/r "$H"
+  fake_route "repos/o/r/issues/7/reactions?per_page=100" '[]'
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'No Codex 👍 after the named review request'
+  refute_called 'sleep'
+  refute_fallback
+  refute_called 'gh pr merge'
+}
+
+@test "path F: a 👍 from before the named summon is not a sign-off" {
+  path_f o/r "$H" 2026-09-18T07:59:00Z
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  refute_called 'gh pr merge'
+}
+
+@test "path F accepts a named summon that also carries a fix-round marker, or is a sweeper kick" {
+  for kind in 3 kick; do
+    : >"$FAKE_LOG"
+    path_f o/r "$H" 2026-09-18T08:01:00Z "$(m1_body "$H" "$kind")"
+    green_checks
+    run run_block "$WF" "$STEP"
+    assert_equal "$status" 0
+    assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+  done
+}
+
+@test "path F refuses a marker for a stale head, or without the summon binding" {
+  path_f o/r "$OTHER"
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'targets a stale PR head'
+  refute_called 'gh pr merge'
+  fake_route repos/o/r/issues/comments/900 "$(gh_comment 900 Melodymaifafa OWNER "<!-- pr-guard: codex-thumbs head=$H -->")"
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'has no exact HEAD binding'
+  refute_called 'gh pr merge'
+}
+
+@test "path F refuses a named summon bound to another head, or written by claude[bot]" {
+  path_f o/r "$H" 2026-09-18T08:01:00Z "$(m1_body "$OTHER" 1)"
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'not a trusted one for this head'
+  refute_called 'gh pr merge'
+  fake_route repos/o/r/issues/comments/500 "$(gh_comment 500 'claude[bot]' NONE "$(m1_body "$H" 1)" 2026-09-18T08:00:00Z)"
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'not a trusted one for this head'
+  refute_called 'gh pr merge'
+}
+
+@test "path F refuses a marker that is not written by the owner" {
+  path_f o/r "$H"
+  fake_route repos/o/r/issues/comments/900 "$(gh_comment 900 'claude[bot]' NONE "<!-- pr-guard: codex-thumbs head=$H summon=500 -->")"
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'no longer eligible'
+  refute_called 'gh pr merge'
+}
+
+@test "path F: an old Codex review on H blocks the merge" {
+  path_f o/r "$H"
+  green_checks
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
+    "$(json_array "$(gh_review 9 "$CODEX" NONE "$H" 'findings' 2026-09-01T00:00:00Z)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'has review findings'
+  refute_called 'gh pr merge'
+  refute_fallback
+}
+
+@test "path F: an OWNER M3 on H blocks the merge; a forged claude[bot] M3 does not" {
+  path_f o/r "$H"
+  green_checks
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
+    "$(json_array "$(gh_review 9 Melodymaifafa OWNER "$H" "$(m3_body "$H")")")"
+  run run_block "$WF" "$STEP"
+  refute_called 'gh pr merge'
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
+    "$(json_array "$(cat "$FIXTURES_DIR/forged/claude-bot-findings-review.json")")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+# ---------- 路径 G：Codex 没接，换 Claude ----------
+
+@test "path G: an owner codex-silent marker for the live head falls back with its reason" {
+  for reason in quota silent timeout; do
+    : >"$FAKE_LOG"; : >"$GITHUB_OUTPUT"
+    path_g "$reason"
+    run run_block "$WF" "$STEP"
+    assert_equal "$status" 0
+    assert_equal "$(step_output fallback)" true
+    assert_equal "$(step_output head)" "$H"
+    assert_equal "$(step_output reason)" "$reason"
+    assert_called 'gh api POST repos/o/r/issues/7/comments' 1
+    assert_equal "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" \
+      "🤖 Codex 这次审不了（额度用完/没回应），换 Claude 代审。
+
+<!-- pr-guard: fallback head=$H reason=$reason -->"
+    refute_called 'sleep'
+    refute_called 'gh pr merge'
+    assert_bodies_inert
+  done
+}
+
+@test "path G with a bot actor posts nothing and hands nothing to Claude" {
+  path_g silent
+  export ACTOR_TYPE=Bot
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   refute_fallback
@@ -141,68 +240,50 @@ refute_fallback() {
   assert_contains "$output" 'the sweeper re-requests review'
 }
 
-@test "a quota comment from before this request does not trigger a fallback" {
-  path_b "$(json_array "$(gh_reaction eyes "$CODEX" 2026-09-18T08:00:20Z)")"
-  export WATCH_SECONDS=90
-  old_quota="$(json_array "$(gh_comment 1 "$CODEX" NONE 'You have reached your Codex usage limits for code reviews.' 2026-09-18T07:00:00Z)")"
-  for n in 1 2 3; do fake_route "repos/o/r/issues/7/comments?per_page=100" "$old_quota" "$n"; done
-  # 超时时 Codex 已给出针对 H 的 clean 评论：路径 C 接手，本 run 也不换 Claude。
-  fake_route "repos/o/r/issues/7/comments?per_page=100" \
-    "$(json_array \
-      "$(gh_comment 1 "$CODEX" NONE 'You have reached your Codex usage limits for code reviews.' 2026-09-18T07:00:00Z)" \
-      "$(gh_comment 2 "$CODEX" NONE "Codex Review: Didn't find any major issues. 🎉
+@test "path G refuses a stale head, an unknown reason, and a marker not written by the owner" {
+  path_g silent "$OTHER"
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'targets a stale PR head'
+  refute_fallback
+  path_g sleepy
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'has no exact HEAD binding'
+  refute_fallback
+  path_g silent "$H" 'claude[bot]' NONE
+  run run_block "$WF" "$STEP"
+  refute_fallback
+}
 
-**Reviewed commit:** \`${H:0:10}\`" 2026-09-18T08:01:00Z)")" 4
-
+@test "path G: a head with findings is iterate's, not Claude's review" {
+  path_g silent
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
+    "$(json_array "$(gh_review 9 "$CODEX" NONE "$H" 'findings')")"
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   refute_fallback
-  assert_contains "$output" 'no clean sign-off before timeout'
 }
 
-@test "silent (path B): 300 s with no eyes, comment or review falls back" {
-  path_b
+@test "path G on a merged PR does not fall back" {
+  path_g timeout
+  fake_route repos/o/r/pulls/7 "$(pr_json "$H" clean true | jq '.state = "closed"')"
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
-  assert_equal "$(step_output fallback)" true
-  assert_equal "$(step_output reason)" silent
-  assert_called 'sleep 30' 10
-  assert_equal "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" \
-    "🤖 Codex 这次审不了（额度用完/没回应），换 Claude 代审。
-
-<!-- pr-guard: fallback head=$H reason=silent -->"
-  assert_bodies_inert
+  refute_fallback
 }
 
-@test "silent never fires on path A; the timeout does and replaces the old alert" {
-  path_a
-  export WATCH_SECONDS=330
+@test "a head that moved before the fallback posts nothing" {
+  path_g quota
+  # 第 1 次读 PR：开始时还是 H；第 2 次：fallback 前已换 head。
+  fake_route repos/o/r/pulls/7 "$(pr_json)" 1
+  fake_route repos/o/r/pulls/7 "$(pr_json "$OTHER")" 2
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
-  assert_equal "$(step_output fallback)" true
-  assert_equal "$(step_output reason)" timeout
-  assert_called 'sleep 30' 11
-  assert_called 'reason=timeout' 1
-  refute_called 'reason=silent'
-  # 旧的「Codex 复审超时无产出」Pushover 没了。
-  refute_called 'curl'
-  assert_bodies_inert
-}
-
-@test "path B with a Codex eyes reaction is not silent and waits for the timeout" {
-  path_b "$(json_array "$(gh_reaction eyes "$CODEX" 2026-09-18T08:00:20Z)")"
-  export SILENT_SECONDS=60 WATCH_SECONDS=150
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  assert_equal "$(step_output reason)" timeout
-  assert_called 'sleep 30' 5
+  refute_fallback
 }
 
 @test "missing CODEX_TRIGGER_TOKEN: one pat-missing alert with GITHUB_TOKEN, no M2, no Claude review" {
-  path_a
-  export HAS_PAT=false TRIGGERED_AT=2026-09-17T08:02:54Z FAKE_NOW=2026-09-17T08:03:10Z
-  fake_route "repos/o/r/issues/7/comments?per_page=100" \
-    "$(json_array "$(cat "$FIXTURES_DIR/codex/quota-comment.json")")"
+  path_g quota
+  export HAS_PAT=false
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   assert_equal "$(step_output fallback)" false
@@ -218,7 +299,7 @@ refute_fallback() {
 }
 
 @test "missing CODEX_TRIGGER_TOKEN with an (H, pat-missing) marker already: no Pushover, no post" {
-  path_b
+  path_g silent
   export HAS_PAT=false
   fake_route "repos/o/r/issues/7/comments?per_page=100" \
     "$(json_array "$(gh_comment 1 'github-actions[bot]' NONE "缺密钥。
@@ -231,88 +312,10 @@ $(m6_marker "$H" pat-missing)")")"
   refute_called 'gh api POST'
 }
 
-@test "timeout on a PR that already merged does not fall back" {
-  path_a
-  export WATCH_SECONDS=60
-  fake_route repos/o/r/pulls/7 "$(pr_json "$H" clean true)"
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  refute_fallback
-}
-
-@test "a head that moved before the fallback posts nothing" {
-  path_a
-  export TRIGGERED_AT=2026-09-17T08:02:54Z FAKE_NOW=2026-09-17T08:03:10Z
-  fake_route "repos/o/r/issues/7/comments?per_page=100" \
-    "$(json_array "$(cat "$FIXTURES_DIR/codex/quota-comment.json")")"
-  # 第 1 次读 PR：开始；第 2 次：轮询时还是 H；第 3 次：fallback 前已换 head。
-  fake_route repos/o/r/pulls/7 "$(pr_json)" 1
-  fake_route repos/o/r/pulls/7 "$(pr_json)" 2
-  fake_route repos/o/r/pulls/7 "$(pr_json "$OTHER")" 3
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  refute_fallback
-}
-
-# ---------- 有问题的 head 绝不合并 ----------
-
-@test "path A: an old Codex review on H (before this request) blocks the merge" {
-  path_a "$(thumbs_up)"
-  green_checks
-  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
-    "$(json_array "$(gh_review 9 "$CODEX" NONE "$H" 'findings' 2026-09-01T00:00:00Z)")"
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  assert_contains "$output" 'has review findings'
-  refute_called 'gh pr merge'
-  refute_fallback
-}
-
-@test "path B accepts an M1 that also carries a fix-round marker" {
-  path_b "$(thumbs_up)" 3
-  green_checks
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
-}
-
-@test "path B accepts a sweeper kick M1" {
-  path_b "$(thumbs_up)" kick
-  green_checks
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
-}
-
-@test "path B: a sweeper kick M1 still falls back when Codex stays silent" {
-  path_b '[]' kick
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  assert_equal "$(step_output reason)" silent
-}
-
-@test "path B: an OWNER M3 on H blocks the merge" {
-  path_b "$(thumbs_up)"
-  green_checks
-  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
-    "$(json_array "$(gh_review 9 Melodymaifafa OWNER "$H" "$(m3_body "$H")")")"
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  refute_called 'gh pr merge'
-}
-
-@test "path B: a forged claude[bot] M3 is ignored and the Codex 👍 merges" {
-  path_b "$(thumbs_up)"
-  green_checks
-  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
-    "$(json_array "$(cat "$FIXTURES_DIR/forged/claude-bot-findings-review.json")")"
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
-}
+# ---------- 路径 C ----------
 
 @test "path C: a Codex clean comment still refuses a head with findings" {
-  export EVENT_HEAD='' TARGET_ID=700
+  export TARGET_ID=700
   fake_route repos/o/r/issues/comments/700 "$(gh_comment 700 "$CODEX" NONE "Codex Review: Didn't find any major issues.
 
 **Reviewed commit:** \`${H:0:10}\`")"
@@ -323,15 +326,6 @@ $(m6_marker "$H" pat-missing)")")"
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   refute_called 'gh pr merge'
-}
-
-@test "path A: the CI gate ignores the iterate workflow and merges on 👍" {
-  path_a "$(thumbs_up)"
-  green_checks
-  run run_block "$WF" "$STEP"
-  assert_equal "$status" 0
-  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
-  refute_called 'curl'
 }
 
 # ---------- 路径 D ----------
@@ -404,7 +398,7 @@ $(m6_marker "$H" pat-missing)")")"
 }
 
 @test "path D refuses when the M4 changed before the merge" {
-  export EVENT_HEAD='' TARGET_ID=600
+  export TARGET_ID=600
   fake_route repos/o/r/issues/comments/600 "$(gh_comment 600 Melodymaifafa OWNER "$(m4_body "$H")")" 1
   fake_route repos/o/r/issues/comments/600 "$(gh_comment 600 Melodymaifafa OWNER 'edited')" 2
   green_checks
@@ -481,7 +475,7 @@ codex_findings_on_h() { # codex_findings_on_h <id> ...
 }
 
 @test "path E refuses when the M8 changed before the merge" {
-  export EVENT_HEAD='' TARGET_ID=600
+  export TARGET_ID=600
   fake_route repos/o/r/issues/comments/600 "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 901)")" 1
   fake_route repos/o/r/issues/comments/600 "$(gh_comment 600 Melodymaifafa OWNER "$(m8_body "$H" 901,902)")" 2
   codex_findings_on_h 901

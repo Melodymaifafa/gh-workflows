@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PR 巡检：扫 owner 名下所有没归档的仓库，给卡住的 PR 补一脚。
-# 由 .github/workflows/pr-sweeper.yml 定时跑（cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次）；
-# 本地也能跑（GH_TOKEN 用 owner 的 PAT）。
+# 主人的 Mac 上每 5 分钟跑一次（scripts/pr-sweep-local.sh，pm2 管）；.github/workflows/pr-sweeper.yml
+# 的定时任务兜底（cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次）。
 #
 # 集成分支 = 仓库默认分支上合并调用桩的 base_branch（见 integration_base）。
 # 每个 open、非草稿、同仓库、标题不带 [no-codex-merge]/[no-claude] 的 PR，按顺序只走第一条命中的规则：
@@ -15,7 +15,15 @@
 #                          retry-exhausted，停。修满轮数后 Claude 判过可合（M8）点名的 review 不算意见。
 #   4b. 有 M8 还没合     → 多半是当时 CI 还没绿：空闲 ≥ 60 分钟就把同一个 M8 再发一次，让合并检查重跑；
 #                          每个 head 最多补 2 次，之后告警一次 stalled，停。
-#   5. 其余              → 没人碰过且空闲 ≥ 30 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
+#   6. 替合并工作流盯 Codex（它不再开着 runner 等，等的每一分钟都计费）：
+#      a. 修复那轮推了 head（有 M7）还没召唤 → 离上一条 review 满 6 分钟就召唤（M1，带 fix-round）。
+#      b. 最近一次召唤之后 Codex 点了 👍    → 留 codex-thumbs 标记叫醒合并检查（路径 F），每次召唤一条；
+#                                             没合上（多半是当时 CI 还没绿）就空闲 ≥ 60 分钟再留一条，
+#                                             最多补 2 次，之后告警一次 stalled。
+#      c. Codex 没接这次召唤                → 额度用完马上、5 分钟没任何回应、或 20 分钟 head 上没结论（审它的 clean 评论 / review）时，
+#                                             留 codex-silent 标记让合并检查换 Claude 代审（路径 G），每次召唤一条。
+#      带 M7 的 head（本流水线自己推的）上被 GitHub 扣住等批准的 CI，顺手批掉。
+#   5. 其余              → 没人碰过且空闲 ≥ 10 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
 #                          每个 head 最多 3 次、间隔 ≥ 60 分钟；然后告警一次 stalled；然后 7 天内每天一次。
 #
 # 环境变量：
@@ -50,7 +58,7 @@ trap 'rm -rf "$tmp"' EXIT
 max_kicks=3
 max_daily_kicks=7
 max_retries=2
-# M8 之后合并检查最多补跑 2 次（加上 judge 自己发的那条，一共 3 条 M8）。
+# M8 之后合并检查最多补跑 2 次（加上 judge 自己发的那条，一共 3 条 M8）；👍 叫醒的也一样（一共 3 条 codex-thumbs）。
 max_merge_rekicks=2
 # 撞额度的重试不计数，但总次数也要封顶，免得额度一直不够时无限重试。
 max_total_retries=6
@@ -64,6 +72,9 @@ facts_jq='
 def ts: if . == null then 0 else sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 end;
 def trusted: .user.login == "github-actions[bot]" or .author_association == "OWNER";
 def has($s): (.body // "") | contains($s);
+# Codex clean 评论审的是不是 H：同合并检查的路径 C，取第一行 **Reviewed commit:** `前缀`，H 以它开头才算。
+def reviewed_h: [(.body // "") | split("\n")[] | capture("^\\*\\*Reviewed commit:\\*\\* `(?<c>[0-9a-f]{7,40})`").c]
+    | (first // "") as $pre | $pre != "" and ($h | startswith($pre));
 $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 | ($c | map(select(trusted))) as $tc
 | ($r | map(select(trusted))) as $tr
@@ -72,6 +83,9 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     | . + {at: ($at | ts)}] as $alerts
 | [$tc[] | select(has("<!-- codex-review-head: " + $h + " -->") and has("<!-- pr-sweeper: kick -->"))
     | .created_at | ts] | sort as $kicks
+# 这个 head 上最近一次可信召唤（iterate 或巡检发的 M1、巡检 kick；都带 codex-review-head: H）。
+| ([$tc[] | select(has("<!-- codex-review-head: " + $h + " -->")) | {id, at: (.created_at | ts)}]
+    | max_by(.at) // {id: 0, at: 0}) as $summon
 | [$r[] | select(.author_association == "OWNER" and has("<!-- fix-retry: head=" + $h + " review="))
     | .submitted_at | ts] | sort as $retries
 | [$alerts[] | select(.r == "fix-quota") | .at] as $quota_at
@@ -111,7 +125,22 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     (if $p.merged then 1 else 0 end),
     ($retries | length),
     ($m8 | length),
-    ($m8 | last | .ids // "-")
+    ($m8 | last | .ids // "-"),
+    $summon.id,
+    $summon.at,
+    ([$tc[] | (.body // "") | capture("<!-- pr-guard: fix-round head=" + $h + " round=(?<n>[0-9]+) -->").n | tonumber] | max // 0),
+    ([$r[] | .submitted_at | ts] | max // 0),
+    ([$c[] | select(.user.login == $codex and (.created_at | ts) >= $summon.at)] | length),
+    (if any($c[]; .user.login == $codex and (.created_at | ts) >= $summon.at and has("reached your Codex usage limits")) then 1 else 0 end),
+    ([$r[] | select(.user.login == $codex and (.submitted_at | ts) >= $summon.at)] | length),
+    (if any($tc[]; (.created_at | ts) >= $summon.at
+          and (has("<!-- pr-guard: fallback head=" + $h + " ") or has("<!-- pr-guard: codex-silent head=" + $h + " "))) then 1 else 0 end),
+    ([$tc[] | select((.created_at | ts) >= $summon.at and has("<!-- pr-guard: codex-thumbs head=" + $h + " "))] | length),
+    # 召唤之后 Codex 在 H 上的结论：审 H 的 review，或审的是 H 的 clean 评论。上一个 head 的审查晚于
+    # 这次召唤才到也常见，那只算有动静（召唤之后的评论数、review 数），不算结论（Codex 2026-10-11 的 P2）。
+    ([$r[] | select(.user.login == $codex and .commit_id == $h and (.submitted_at | ts) >= $summon.at)]
+      + [$c[] | select(.user.login == $codex and (.created_at | ts) >= $summon.at and has("find any major issues") and reviewed_h)]
+      | length)
   ] | @tsv
 '
 
@@ -213,6 +242,74 @@ rekick_merge() {
   summary "- re-requested the merge check $who$hs"
 }
 
+# summon_fix_round <round>：修复那一轮推上去的 head，冷却过了再召唤 Codex。正文跟 iterate 自己发的 M1
+# 一字不差（fix-round 是轮数计数器），不带 pr-sweeper: kick，不算巡检的 kick 次数。
+summon_fix_round() {
+  if [ "$MODE" = dry ]; then summary "- would summon Codex for fix round $1 $who$hs"; return 0; fi
+  head_unchanged || return 0
+  post_comment "@codex review"$'\n\n'"<!-- codex-review-head: $H -->"$'\n'"<!-- fix-round: $1 -->"
+  summary "- summoned Codex for fix round $1 $who$hs"
+}
+
+# wake_merge [again]：Codex 点了 👍（GitHub 没有 reaction 事件），留路径 F 的标记叫醒合并检查；👍 由它再核。
+# again：上次叫醒了没合上，同一个标记再发一次（只换开头那句话）。
+wake_merge() {
+  local msg="🤖 巡检：Codex 审过没意见（点了 👍），请合并检查跑一次。"
+  [ "${1:-}" != again ] || msg="🤖 巡检：Codex 审过没意见（点了 👍），但还没合上（多半是当时 CI 还没绿），再请合并检查跑一次。"
+  if [ "$MODE" = dry ]; then summary "- would wake the merge check $who$hs"; return 0; fi
+  head_unchanged || return 0
+  post_comment "$msg"$'\n\n'"<!-- pr-guard: codex-thumbs head=$H summon=$summon_id -->"
+  summary "- woke the merge check $who$hs"
+}
+
+# hand_to_claude <quota|silent|timeout>：Codex 没接这次召唤，留路径 G 的标记，合并检查换 Claude 代审。
+hand_to_claude() {
+  local why
+  case "$1" in
+    quota) why="Codex 额度用完" ;;
+    silent) why="5 分钟没任何回应" ;;
+    *) why="20 分钟没出结论" ;;
+  esac
+  if [ "$MODE" = dry ]; then summary "- would hand $who$hs to Claude ($1)"; return 0; fi
+  head_unchanged || return 0
+  post_comment "🤖 巡检：Codex 没接这次审查（$why），请合并检查换 Claude 代审。"$'\n\n'"<!-- pr-guard: codex-silent head=$H reason=$1 -->"
+  summary "- handed $who$hs to Claude ($1)"
+}
+
+# approve_held_runs：GitHub 把本流水线推的提交上的 CI 扣成 action_required、等人点批准时（MEL-292），
+# 用主人的令牌批掉。只对带 M7 的 head 调用：别人推的提交一概不批。
+approve_held_runs() {
+  local ids id
+  ids="$(gh api "repos/$repo/actions/runs?head_sha=$H&per_page=100" \
+    --jq ".workflow_runs[] | select(.head_sha == \"$H\" and .conclusion == \"action_required\") | .id")" ||
+    { echo "  列不出这个 head 上的 run（令牌要有 Actions: Read and write）"; return 0; }
+  for id in $ids; do
+    if [ "$MODE" = dry ]; then summary "- would approve a held run $who$hs"; continue; fi
+    if gh api -X POST "repos/$repo/actions/runs/$id/approve" --silent; then
+      summary "- approved a held run $who$hs"
+    else
+      echo "::warning::$who 批不了被扣住的 CI（令牌要有 Actions: Read and write）"
+    fi
+  done
+}
+
+# fetch_reactions：PR 正文和最近那条召唤上的 reaction 存进 $tmp；读不到返回 1。
+fetch_reactions() {
+  gh api --paginate --slurp "repos/$repo/issues/$n/reactions?per_page=100" >"$tmp/pr-reactions.raw" || return 1
+  gh api --paginate --slurp "repos/$repo/issues/comments/$summon_id/reactions?per_page=100" >"$tmp/summon-reactions.raw" || return 1
+  jq 'add // []' "$tmp/pr-reactions.raw" >"$tmp/pr-reactions.json" || return 1
+  jq 'add // []' "$tmp/summon-reactions.raw" >"$tmp/summon-reactions.json" || return 1
+}
+
+# codex_reaction <content> <since epoch>：Codex 在 PR 正文或最近那条召唤上、since 之后有没有这个 reaction（1/0）。
+codex_reaction() {
+  jq -n --slurpfile a "$tmp/pr-reactions.json" --slurpfile b "$tmp/summon-reactions.json" \
+    --arg content "$1" --arg since "$2" --arg codex 'chatgpt-codex-connector[bot]' '
+    def ts: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    if any(($a[0] + $b[0])[]; .content == $content and .user.login == $codex and (.created_at | ts) >= ($since | tonumber))
+    then 1 else 0 end'
+}
+
 # sweep_pr <owner/名> <N> <private> <集成分支，没接共享自动化是 -> <watched 1/0>
 sweep_pr() {
   repo="$1" n="$2" private="$3" base="$4" watched="$5"
@@ -224,10 +321,12 @@ sweep_pr() {
   if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
 
   local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
+  local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded thumbs eyes
   facts="$(jq -rn --slurpfile pr "$tmp/pr.json" --slurpfile cs "$tmp/comments.json" --slurpfile rs "$tmp/reviews.json" \
     --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq")"
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
-    until_active until_passed fix_reason state merged total_retries judged judged_reviews <<<"$facts"
+    until_active until_passed fix_reason state merged total_retries judged judged_reviews \
+    summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded <<<"$facts"
   echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
   # 0. 没人管：不叫审、不重修，告警一次。空闲 60 分钟再告，给人留时间改 base 或关掉。
@@ -269,6 +368,9 @@ sweep_pr() {
   # 3. 额度还没恢复（取这个 head 上最晚的 until）。
   [ "$until_active" = 0 ] || { echo "  等额度恢复"; return 0; }
 
+  # 本流水线推的 head 上被扣住的 CI：不批就一直不跑，合并检查等不到 CI。
+  if [ "$m7_round" -gt 0 ] && [ "$merged" = 0 ]; then approve_held_runs; fi
+
   # 4. 有意见：重修，不重审。
   if [ "$findings" -gt 0 ]; then
     [ "$idle" -ge 3600 ] || [ "$until_passed" = 1 ] || { echo "  修复可能还在跑"; return 0; }
@@ -298,8 +400,52 @@ sweep_pr() {
     return 0
   fi
 
-  # 5. 没意见也没合：重新请求审查。
-  if ! { [ "$referenced" = 0 ] && [ "$idle" -ge 1800 ]; } && [ "$idle" -lt 3600 ]; then
+  # 6a. 修复那一轮推了 head、还没召唤：iterate 不再在 runner 上等 6 分钟冷却，冷却过了由这里召唤。
+  if [ "$summon_at" = 0 ] && [ "$m7_round" -gt 0 ]; then
+    if [ $((now - last_review_at)) -ge 360 ]; then
+      summon_fix_round "$m7_round"
+    else
+      echo "  等召唤冷却"
+    fi
+    return 0
+  fi
+
+  # 6b / 6c. 最近一次召唤之后 Codex 的回应里，GitHub 不发事件的两种：👍，和什么都没有。
+  #       读不到 reaction 就分不清「点了 👍」和「没回应」，这两条都不走，交给下面的规则 5。
+  if [ "$summon_at" -gt 0 ] && fetch_reactions; then
+    thumbs="$(codex_reaction +1 "$summon_at")"
+    eyes="$(codex_reaction eyes "$summon_at")"
+    if [ "$thumbs" = 1 ]; then
+      # 叫醒的那次没合上（CI 红了又在同一个 head 上重跑绿了、当时还没跑完、一时合不了）：调用桩
+      # 不接 CI 跑完的事件，同一个 head 上再没有什么会叫醒合并检查。所以同 4b，空闲 60 分钟再叫。
+      # CI 还红着的那种在规则 2 就停车了，到不了这里。
+      if [ "$woken" = 0 ]; then
+        wake_merge
+      elif [ "$idle" -lt 3600 ]; then
+        echo "  等合并检查"
+      elif [ "$woken" -le "$max_merge_rekicks" ]; then
+        wake_merge again
+      else
+        alert_once stalled - "🤖 巡检：Codex 审过没意见（点了 👍），但合并检查跑了 $woken 次都没合上，请打开 PR 看看卡在哪。"
+      fi
+      return 0
+    fi
+    if [ "$handed" = 0 ] && [ "$codex_concluded" = 0 ]; then
+      local waited=$((now - summon_at))
+      if [ "$codex_quota" = 1 ]; then
+        hand_to_claude quota; return 0
+      elif [ "$codex_comments" = 0 ] && [ "$codex_reviews" = 0 ] && [ "$eyes" = 0 ] && [ "$waited" -ge 300 ]; then
+        hand_to_claude silent; return 0
+      # Codex 审的过程中会先发（再改）一条状态评论，上一个 head 的 review / clean 评论也可能晚于召唤才到，
+      # 这些都不是结论：20 分钟只看 H 上的 clean 评论和 review。
+      elif [ "$waited" -ge 1200 ]; then
+        hand_to_claude timeout; return 0
+      fi
+    fi
+  fi
+
+  # 5. 没意见也没合：重新请求审查。没人碰过的 head 10 分钟就叫（打开 PR 时不再有 runner 等 Codex 的 👍）。
+  if ! { [ "$referenced" = 0 ] && [ "$idle" -ge 600 ]; } && [ "$idle" -lt 3600 ]; then
     echo "  还不够空闲"; return 0
   fi
   local since_kick=$((now - last_kick))
