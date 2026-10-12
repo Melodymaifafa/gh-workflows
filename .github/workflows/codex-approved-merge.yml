@@ -87,7 +87,7 @@ jobs:
       # Only an eligible newer request can supersede the old watcher. A skipped
       # issue_comment job never enters this job-level concurrency group.
       cancel-in-progress: true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     outputs:
       conflict: ${{ steps.watch.outputs.conflict }}
@@ -838,7 +838,7 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       REPO: ${{ github.repository }}
@@ -1209,7 +1209,7 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
       REPO: ${{ github.repository }}

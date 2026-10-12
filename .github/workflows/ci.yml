@@ -33,7 +33,7 @@ on:
 
 jobs:
   lint-and-test:
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on == 'ubuntu-latest' && vars.GHWF_RUNNER || inputs.runs_on }}
     steps:
       - uses: actions/checkout@v5
 
@@ -72,7 +72,9 @@ jobs:
             shell)
               # 给「只有 bash 脚本 + workflow YAML」的仓库用（本仓库自己就是）。
               # 版本写死:上游的下载脚本某天悄悄变了会在这里炸,而这一处炸 = 所有仓库炸。
-              default_install='curl -sSfL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz | tar xz actionlint'
+              # 架构按 runner 取：本机 runner（README「本机 runner」）是 arm64。
+              arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+              default_install="curl -sSfL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_${arch}.tar.gz | tar xz actionlint"
               # bats 同理钉死版本。解压到 /tmp 再安装,免得解压出来的目录落进被测仓库的工作区。
               default_install="$default_install && curl -sSfL https://github.com/bats-core/bats-core/archive/refs/tags/v1.14.0.tar.gz | tar xz -C /tmp && sudo /tmp/bats-core-1.14.0/install.sh /usr/local"
               # actionlint 查 workflow YAML,并对里面的 run: 块自动跑 shellcheck；

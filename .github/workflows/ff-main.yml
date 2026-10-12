@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   fast-forward:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Move ${{ inputs.target }} to ${{ inputs.source }}
         env:

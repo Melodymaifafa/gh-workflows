@@ -193,6 +193,24 @@ jobs:
 
 **自动合入是安全的，因为各仓库钉的是 `@v1`。** 合进 develop / main 不改变任何仓库的行为，`v1` 动了才生效。`v1` 每天自动移到 develop 上 CI 全绿的最新提交（`move-v1.yml`，2026-10-08 起；以前每个 PR 合完都要问人一次，问多了就有人忘，MEL-290 那次 19 个仓库照旧踩着修好的 bug）。合并前的闸门是 CI + Codex 审查；坏了一条命令回滚，见下面「版本」。
 
+## 本机 runner（2026-10-12）
+
+私有仓库的 Actions 免费分钟（每月 2,000）2026-10-10 用完，job 被 GitHub 拒跑。自托管 runner 不计分钟，所以给仓库设变量 **`GHWF_RUNNER=ghwf-local`**，这个仓库的 ci / iterate / 合并 / ff-main 全部改派到主人 Mac 上跑；删掉变量就回 GitHub 的 runner。变量读的是**调用方仓库**的（2026-10-12 在 wf-smoke-test 实测），所以只影响设了变量的那个仓库。
+
+- **跑在哪**：pm2 常驻 `scripts/runner-pool.sh`（名字 `ghwf-runner-pool`），job 跑在 colima 虚拟机的容器里（`runner/Dockerfile`，照 ubuntu-latest 摆：用户 `runner`、免密 sudo、工作区 `/home/runner/work`）。每个容器是 JIT runner，只接一个 job，跑完就删。
+- **每个仓库常备一个空闲的**：合并环节会占着 runner 等 CI（最多 30 分钟），一个仓库只有一个 runner 就会互相等死。空闲的约 40 MB。容器总数到「仓库数 + `MAX_EXTRA_RUNNERS`（默认 4）」就不再补，排队等；空闲的随时会接 job，所以这也是同时跑的 job 上限。满了时，有 job 在跑的仓库可以收掉一个「没 job 在跑的仓库」的空闲 runner 给自己用（runner 只服务注册它的仓库）。虚拟机自己限 4 GB 内存，挤不到 Mac。
+- **只给私有仓库开**：公开仓库谁都能提 PR，陌生人的代码不能在主人的 Mac 上跑 —— 公开仓库设了变量也不理。注册 runner 用主人本机 `gh` 的登录，容器只拿到一次性的 JIT 配置。
+- **手机通知**：colima 起不来、注册不上 runner（多半是本机 `gh` 登录失效）、磁盘剩不到 5 GB，各推一次，恢复了再推一次。
+- **代价**：Mac 关机或睡眠时 job 排队，GitHub 排满 24 小时就取消；虚拟机是 arm64，不是 x86。调用方仓库自己写死 `runs-on: ubuntu-latest` 的 job（比如 wechat-mimic-finetune 的 `training-cpu`）不受变量管，要改成 `${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}`。
+
+装法（`env -i` 是因为 UTF-8 locale 会弄坏 macOS 自带的 bash 3.2，见巡检那条）：
+
+```sh
+env -i HOME="$HOME" USER="$USER" SHELL=/bin/zsh \
+  PATH="$HOME/.npm-global/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  pm2 start "$PWD/scripts/runner-pool.sh" --name ghwf-runner-pool --interpreter bash && pm2 save
+```
+
 ## 有新 Opus 了提醒一声（2026-10-04）
 
 `opus-model-probe.yml` 每周一 09:17 跑一次（也可手动点）：查一次模型列表，挑出最新的 `claude-opus-*`，跟上面那两个 workflow 的 `claude_model` 默认值比。不一样推一条 Pushover，一样什么都不发。**只提醒，不自动改默认值** —— 换哪个模型由人定：改一行 + 合 PR，第二天 `v1` 自动跟上。
