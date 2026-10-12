@@ -25,7 +25,7 @@ notify() {
   (
     # shellcheck source=/dev/null
     [ -r "$secrets" ] && . "$secrets"
-    [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ] || exit 0
+    if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then exit 0; fi
     curl -sf -X POST https://api.pushover.net/1/messages.json \
       --form-string "token=${PUSHOVER_TOKEN}" --form-string "user=${PUSHOVER_USER}" \
       --form-string "title=$1" --form-string "message=$2" >/dev/null
@@ -119,7 +119,8 @@ decide() {
   rows="$(cat)"
   busy="$(printf '%s\n' "$rows" | awk '$3 == "busy"' | wc -l | tr -d ' ')"
   while read -r name repo st; do
-    [ -n "$name" ] && [ "$st" = idle ] || continue
+    [ -n "$name" ] || continue
+    [ "$st" = idle ] || continue
     grep -qxF "$repo" "$repos_file" || echo "remove $name"
   done <<<"$rows"
   while read -r repo; do
