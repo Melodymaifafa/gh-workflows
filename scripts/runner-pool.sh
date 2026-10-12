@@ -56,10 +56,17 @@ ensure_docker() {
 
 # 镜像按 Dockerfile 的内容打标签，改了 Dockerfile 就自动重建。
 image="ghwf-runner:$(shasum -a 256 "$context_dir/Dockerfile" | cut -c1-12)"
+# 用本池专用的 builder 建：建完（成不成都）清掉它的缓存、停掉它，主人别的构建缓存不碰。
 ensure_image() {
+  local builder=ghwf-runner rc=0
   docker image inspect "$image" >/dev/null 2>&1 && return 0
   echo "构建镜像 $image"
-  docker build -q -t "$image" "$context_dir" >/dev/null
+  docker buildx inspect "$builder" >/dev/null 2>&1 ||
+    docker buildx create --name "$builder" --driver docker-container >/dev/null
+  docker buildx build --builder "$builder" --load -q -t "$image" "$context_dir" >/dev/null || rc=$?
+  docker buildx prune --builder "$builder" -af >/dev/null 2>&1 || true
+  docker buildx stop "$builder" >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 # 主人的 Mac 磁盘不大，每个 job 都要下依赖：空间不够就先不补 runner，已经空闲着的照样接 job。
@@ -105,14 +112,17 @@ refresh_repos() {
 # 日志长了 docker logs 吃 SIGPIPE，pipefail 下整条判成「没接到」，会把在跑的 job 当空闲的收掉。
 took_job() { docker logs "$1" 2>&1 | grep -c 'Running job' >/dev/null; }
 
-# 池里每个容器一行「容器名 仓库 idle|busy」。
+# 池里每个容器一行「容器名 仓库 idle|busy|stale」。stale = 空闲、但用的不是现在的镜像：
+# 不收掉的话，改了 Dockerfile 要等它们哪天接到 job 才换新（2026-10-12 补 yaml 时旧的空闲 runner 会接着红）。
 list_runners() {
-  local name repo
-  docker ps --filter label=ghwf.pool=1 --format '{{.Names}} {{.Label "ghwf.repo"}}' |
-    while read -r name repo; do
+  local name repo img
+  docker ps --filter label=ghwf.pool=1 --format '{{.Names}} {{.Label "ghwf.repo"}} {{.Image}}' |
+    while read -r name repo img; do
       [ -n "$name" ] || continue
       if took_job "$name"; then
         echo "$name $repo busy"
+      elif [ "$img" != "$image" ]; then
+        echo "$name $repo stale"
       else
         echo "$name $repo idle"
       fi
@@ -120,7 +130,7 @@ list_runners() {
 }
 
 # decide <名单文件> <容器总数上限>，stdin 是 list_runners 的输出。输出：
-#   remove <容器名>   仓库撤了变量，收掉它空闲的
+#   remove <容器名>   收掉空闲的：仓库撤了变量，或镜像旧了（stale，它的仓库照常补一个新的）
 #   spawn <仓库>      给没空闲 runner 的仓库补一个
 #   reclaim <容器名> <仓库>  满了：收掉一个「没 job 在跑的仓库」的空闲 runner，腾给有 job 在跑的这个仓库 ——
 #                     runner 只服务注册它的那个仓库，那边的 job 可能正占着 runner 等同仓库的 CI
@@ -131,8 +141,11 @@ decide() {
   total="$(printf '%s\n' "$rows" | awk 'NF' | wc -l | tr -d ' ')"
   while read -r name repo st; do
     [ -n "$name" ] || continue
-    [ "$st" = idle ] || continue
-    grep -qxF "$repo" "$repos_file" && continue
+    case "$st" in
+      stale) ;;
+      idle) grep -qxF "$repo" "$repos_file" && continue ;;
+      *) continue ;;
+    esac
     # 不在这一轮把它的位置让出去：它也许正好接到 job，收不成（下一轮它要么没了，要么算忙的）
     echo "remove $name"
     used="$used$name "
@@ -175,13 +188,15 @@ spawn() {
 }
 
 tick() {
-  local action target for_repo spawn_failed=
+  local action target for_repo rows spawn_failed=
+  # docker ps 偶尔失败时 rows 是空的，decide 会当成一个 runner 都没有、给每个仓库重开一套
+  rows="$(list_runners)" || { echo "列不出池里的容器，这一轮不补" >&2; return 0; }
   while read -r action target for_repo; do
     case "$action" in
       # 刚才那一眼之后它也许接到了 job：接到了就不收；reclaim 收不成就不补，下一轮重看
       remove)
         took_job "$target" ||
-          { docker rm -f "$target" >/dev/null && echo "收掉 $target（仓库撤了 GHWF_RUNNER）"; } ;;
+          { docker rm -f "$target" >/dev/null && echo "收掉空闲的 $target（仓库撤了 GHWF_RUNNER，或镜像旧了）"; } ;;
       reclaim)
         took_job "$target" && continue
         docker rm -f "$target" >/dev/null || continue
@@ -191,7 +206,7 @@ tick() {
         if spawn "$target"; then echo "给 $target 补了一个空闲 runner"; else spawn_failed="$target"; fi ;;
       full) ;;  # 满了就等，不刷屏
     esac
-  done < <(list_runners | decide "$state/repos" "$(($(awk 'NF' "$state/repos" | wc -l) + MAX_EXTRA_RUNNERS))")
+  done < <(decide "$state/repos" "$(($(awk 'NF' "$state/repos" | wc -l) + MAX_EXTRA_RUNNERS))" <<<"$rows")
   if [ -n "$spawn_failed" ]; then
     alert register "🤖 本机 runner 注册不上" "给 ${spawn_failed} 注册 runner 失败，私有仓库的 job 会一直排队。多半是本机 gh 登录失效：在 Mac 上 gh auth login。"
   else

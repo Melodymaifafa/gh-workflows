@@ -85,3 +85,34 @@ full r4"
   assert_equal "$out" "spawn content-grabbers
 spawn wf-smoke-test"
 }
+
+@test "a failed docker ps skips the tick instead of starting a runner for every repo" {
+  state="$BATS_TEST_TMPDIR"  # $repos 已经在这里，名字正好是 tick 要读的 repos
+  docker() { [ "$1" = ps ] && return 1; return 0; }
+  spawn() { echo "spawned $1"; }
+  run tick
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "spawned"
+  assert_contains "$output" "列不出池里的容器"
+}
+
+@test "an idle runner on an old image is removed and its repo gets a new one" {
+  printf '%s\n' r1 >"$repos"
+  out="$(printf '%s\n' 'old1 r1 stale' | decide "$repos" 4)"
+  assert_equal "$out" "remove old1
+spawn r1"
+}
+
+@test "list_runners marks idle runners on an old image stale, and leaves busy ones busy" {
+  docker() {
+    case "$1" in
+      ps) printf '%s\n' 'a r1 ghwf-runner:old' "b r1 $image" 'c r2 ghwf-runner:old' ;;
+      logs) [ "$2" = c ] && echo "Running job: ci" ;;
+    esac
+    return 0
+  }
+  out="$(list_runners)"
+  assert_equal "$out" "a r1 stale
+b r1 idle
+c r2 busy"
+}
