@@ -257,6 +257,11 @@ jobs:
             echo "::notice::PR #$PR_NUMBER is outside the auto-merge policy"
             exit 0
           fi
+          # agent/* 是 momo 的分支：momo 在 Mac 上自己判 Codex、自己合并。
+          if [[ "$head_ref" == agent/* ]]; then
+            echo "::notice::PR #$PR_NUMBER is on $head_ref; momo merges its own branches"
+            exit 0
+          fi
 
           reaction_route=
           summon_id=
@@ -1243,7 +1248,9 @@ jobs:
             pr="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
             if [ "$(jq -r '[.state, .draft, .base.ref, .head.repo.full_name, .head.sha] | join(" ")' <<<"$pr")" != \
               "open false $BASE_BRANCH $REPO $want" ] ||
-              [[ "$(jq -r .title <<<"$pr")" == *'[no-codex-merge]'* ]]
+              [[ "$(jq -r .title <<<"$pr")" == *'[no-codex-merge]'* ]] ||
+              # agent/* 是 momo 的分支：冲突也由 momo 自己合（标记可能是旧的、或手动重放的）。
+              [[ "$(jq -r .head.ref <<<"$pr")" == agent/* ]]
             then
               echo "::notice::PR #$PR_NUMBER moved on or is out of scope; nothing to resolve"
               exit 0

@@ -858,7 +858,7 @@ thumbs_comment() { owner_comment "$1" "🤖 巡检：…"$'\n\n'"<!-- pr-guard: 
 
 # ── 仓库、PR 筛选 ──
 
-@test "discovery: owned, unarchived repos of any default branch; drafts, forks and opt-outs are skipped" {
+@test "discovery: owned, unarchived repos of any default branch; drafts, forks, opt-outs and momo's agent/* PRs are skipped" {
   export ONLY_REPOS=""
   fake_route "repos/Melodymaifafa/gh-workflows/pulls?state=open&per_page=100" '[]'
   fake_route "repos/Melodymaifafa/main-default/pulls?state=open&per_page=100" '[]'
@@ -866,7 +866,8 @@ thumbs_comment() { owner_comment "$1" "🤖 巡检：…"$'\n\n'"<!-- pr-guard: 
     "$(pr_json 3 clean 900 "$H" develop true)" \
     "$(pr_json 4 clean 900 "$H" develop false '[no-claude] wip')" \
     "$(pr_json 5 clean 900 "$H" develop false '[no-codex-merge] x')" \
-    "$(pr_json 6 clean 900 "$H" develop false 'x' someone/fork)")"
+    "$(pr_json 6 clean 900 "$H" develop false 'x' someone/fork)" \
+    "$(pr_json 8 clean 900 | jq '.head.ref = "agent/mel-9"')")"
   sweep
   assert_equal "$status" 0
   assert_called "gh api GET repos/Melodymaifafa/gh-workflows/pulls"
