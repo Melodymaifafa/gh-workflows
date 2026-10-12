@@ -29,8 +29,7 @@ full wf-smoke-test"
 @test "at the cap a repo with a job running takes the idle runner of a repo with none" {
   printf '%s\n' hot cold >"$repos"
   out="$(printf '%s\n' 'h1 hot busy' 'c1 cold idle' | decide "$repos" 2)"
-  assert_equal "$out" "reclaim c1
-spawn hot"
+  assert_equal "$out" "reclaim c1 hot"
 }
 
 @test "at the cap a repo with no job running does not take anyone's runner" {
@@ -42,8 +41,7 @@ spawn hot"
 @test "one idle runner is reclaimed once, not for two repos" {
   printf '%s\n' hotA hotB cold >"$repos"
   out="$(printf '%s\n' 'a hotA busy' 'b hotB busy' 'c cold idle' | decide "$repos" 3)"
-  assert_equal "$out" "reclaim c
-spawn hotA
+  assert_equal "$out" "reclaim c hotA
 full hotB"
 }
 

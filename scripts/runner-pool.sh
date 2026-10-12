@@ -118,7 +118,7 @@ list_runners() {
 # decide <名单文件> <容器总数上限>，stdin 是 list_runners 的输出。输出：
 #   remove <容器名>   仓库撤了变量，收掉它空闲的
 #   spawn <仓库>      给没空闲 runner 的仓库补一个
-#   reclaim <容器名>  满了：收掉一个「没 job 在跑的仓库」的空闲 runner，腾给有 job 在跑的仓库 ——
+#   reclaim <容器名> <仓库>  满了：收掉一个「没 job 在跑的仓库」的空闲 runner，腾给有 job 在跑的这个仓库 ——
 #                     runner 只服务注册它的那个仓库，那边的 job 可能正占着 runner 等同仓库的 CI
 #   full <仓库>       满了，又没得腾，排队等
 decide() {
@@ -152,8 +152,7 @@ decide() {
         }')"
     fi
     if [ -n "$victim" ]; then
-      echo "reclaim $victim"
-      echo "spawn $repo"
+      echo "reclaim $victim $repo"
       used="$used$victim "
     else
       echo "full $repo"
@@ -172,16 +171,18 @@ spawn() {
 }
 
 tick() {
-  local action target spawn_failed=
-  while read -r action target; do
+  local action target for_repo spawn_failed=
+  while read -r action target for_repo; do
     case "$action" in
-      # 刚才那一眼之后它也许接到了 job：接到了就不收（reclaim 后面那个 spawn 多出一个也只是这一回）
+      # 刚才那一眼之后它也许接到了 job：接到了就不收；reclaim 收不成就不补，下一轮重看
       remove)
         docker logs "$target" 2>&1 | grep -q 'Running job' ||
           { docker rm -f "$target" >/dev/null && echo "收掉 $target（仓库撤了 GHWF_RUNNER）"; } ;;
       reclaim)
-        docker logs "$target" 2>&1 | grep -q 'Running job' ||
-          { docker rm -f "$target" >/dev/null && echo "满了，收掉闲着的 $target 腾地方"; } ;;
+        docker logs "$target" 2>&1 | grep -q 'Running job' && continue
+        docker rm -f "$target" >/dev/null || continue
+        echo "满了，收掉闲着的 $target 腾给 $for_repo"
+        if spawn "$for_repo"; then echo "给 $for_repo 补了一个空闲 runner"; else spawn_failed="$for_repo"; fi ;;
       spawn)
         if spawn "$target"; then echo "给 $target 补了一个空闲 runner"; else spawn_failed="$target"; fi ;;
       full) ;;  # 满了就等，不刷屏
