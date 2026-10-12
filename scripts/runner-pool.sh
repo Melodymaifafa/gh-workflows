@@ -129,8 +129,8 @@ decide() {
     [ -n "$name" ] || continue
     [ "$st" = idle ] || continue
     grep -qxF "$repo" "$repos_file" && continue
+    # 不在这一轮把它的位置让出去：它也许正好接到 job，收不成（下一轮它要么没了，要么算忙的）
     echo "remove $name"
-    total=$((total - 1))
     used="$used$name "
   done <<<"$rows"
   while read -r repo; do

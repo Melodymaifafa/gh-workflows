@@ -49,15 +49,15 @@ full hotB"
   printf '%s\n' new hot >"$repos"
   out="$(printf '%s\n' 'o old idle' 'h hot busy' | decide "$repos" 2)"
   assert_equal "$out" "remove o
-spawn new
+full new
 full hot"
 }
 
-@test "an idle runner removed for a dropped repo frees its room" {
+@test "an idle runner removed for a dropped repo frees its room only on the next tick" {
   printf '%s\n' r1 >"$repos"
   out="$(printf '%s\n' 'x old idle' | decide "$repos" 1)"
   assert_equal "$out" "remove x
-spawn r1"
+full r1"
 }
 
 @test "spawns in one tick stop at the remaining room" {
