@@ -9,7 +9,7 @@ set -euo pipefail
 
 LABEL="${GHWF_LABEL:-ghwf-local}"
 OWNER="${OWNER:-Melodymaifafa}"
-MAX_BUSY="${MAX_BUSY:-4}"            # 同时跑的 job 到这个数就不再补空闲的，排队的等前面的跑完
+MAX_RUNNERS="${MAX_RUNNERS:-12}"     # 容器总数上限（含空闲的）。空闲的随时会接 job，所以这也是同时跑的 job 上限
 JOB_MEMORY="${JOB_MEMORY:-3g}"       # 单个 job 的内存上限，免得一个 job 撑爆整个虚拟机
 REFRESH_SECONDS="${REFRESH_SECONDS:-600}"
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -112,12 +112,12 @@ list_runners() {
     done
 }
 
-# decide <名单文件> <MAX_BUSY>，stdin 是 list_runners 的输出。
+# decide <名单文件> <MAX_RUNNERS>，stdin 是 list_runners 的输出。
 # 输出 remove <容器名>（仓库撤了变量，收掉它空闲的）/ spawn <仓库> / full <仓库>（没空闲的，但已满）。
 decide() {
-  local repos_file=$1 max_busy=$2 rows busy name repo st
+  local repos_file=$1 max_runners=$2 rows total name repo st
   rows="$(cat)"
-  busy="$(printf '%s\n' "$rows" | awk '$3 == "busy"' | wc -l | tr -d ' ')"
+  total="$(printf '%s\n' "$rows" | awk 'NF' | wc -l | tr -d ' ')"
   while read -r name repo st; do
     [ -n "$name" ] || continue
     [ "$st" = idle ] || continue
@@ -126,7 +126,12 @@ decide() {
   while read -r repo; do
     [ -n "$repo" ] || continue
     printf '%s\n' "$rows" | awk -v r="$repo" '$2 == r && $3 == "idle" { f = 1 } END { exit !f }' && continue
-    if [ "$busy" -ge "$max_busy" ]; then echo "full $repo"; else echo "spawn $repo"; fi
+    if [ "$total" -ge "$max_runners" ]; then
+      echo "full $repo"
+    else
+      echo "spawn $repo"
+      total=$((total + 1))
+    fi
   done <"$repos_file"
 }
 
@@ -149,7 +154,7 @@ tick() {
         if spawn "$target"; then echo "给 $target 补了一个空闲 runner"; else spawn_failed="$target"; fi ;;
       full) ;;  # 满了就等，不刷屏
     esac
-  done < <(list_runners | decide "$state/repos" "$MAX_BUSY")
+  done < <(list_runners | decide "$state/repos" "$MAX_RUNNERS")
   if [ -n "$spawn_failed" ]; then
     alert register "🤖 本机 runner 注册不上" "给 ${spawn_failed} 注册 runner 失败，私有仓库的 job 会一直排队。多半是本机 gh 登录失效：在 Mac 上 gh auth login。"
   else

@@ -20,10 +20,20 @@ setup() {
   assert_equal "$out" "spawn content-grabbers"
 }
 
-@test "at MAX_BUSY busy jobs nothing new starts" {
-  out="$(printf '%s\n' 'a content-grabbers busy' 'b content-grabbers busy' | decide "$repos" 2)"
-  assert_equal "$out" "full content-grabbers
-full wf-smoke-test"
+@test "at MAX_RUNNERS containers, idle ones included, nothing new starts" {
+  out="$(printf '%s\n' 'a content-grabbers busy' 'b other idle' | decide "$repos" 2)"
+  assert_contains "$out" "full content-grabbers"
+  assert_contains "$out" "full wf-smoke-test"
+  refute_contains "$out" "spawn"
+}
+
+@test "spawns in one tick stop at the remaining room" {
+  printf '%s\n' r1 r2 r3 r4 >"$repos"
+  out="$(printf '%s\n' 'a r0 busy' 'b r0 busy' | decide "$repos" 4)"
+  assert_equal "$out" "spawn r1
+spawn r2
+full r3
+full r4"
 }
 
 @test "an idle runner of a repo that dropped GHWF_RUNNER is removed, a busy one is left to finish" {
