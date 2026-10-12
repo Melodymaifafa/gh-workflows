@@ -101,13 +101,17 @@ refresh_repos() {
   mv "$state/repos.new" "$state/repos"
 }
 
-# 池里每个容器一行「容器名 仓库 idle|busy」。runner 接到 job 会打出 Running job。
+# runner 接到 job 会打出 Running job。用 grep -c 把日志读完：grep -q 一匹配就走，
+# 日志长了 docker logs 吃 SIGPIPE，pipefail 下整条判成「没接到」，会把在跑的 job 当空闲的收掉。
+took_job() { docker logs "$1" 2>&1 | grep -c 'Running job' >/dev/null; }
+
+# 池里每个容器一行「容器名 仓库 idle|busy」。
 list_runners() {
   local name repo
   docker ps --filter label=ghwf.pool=1 --format '{{.Names}} {{.Label "ghwf.repo"}}' |
     while read -r name repo; do
       [ -n "$name" ] || continue
-      if docker logs "$name" 2>&1 | grep -q 'Running job'; then
+      if took_job "$name"; then
         echo "$name $repo busy"
       else
         echo "$name $repo idle"
@@ -176,10 +180,10 @@ tick() {
     case "$action" in
       # 刚才那一眼之后它也许接到了 job：接到了就不收；reclaim 收不成就不补，下一轮重看
       remove)
-        docker logs "$target" 2>&1 | grep -q 'Running job' ||
+        took_job "$target" ||
           { docker rm -f "$target" >/dev/null && echo "收掉 $target（仓库撤了 GHWF_RUNNER）"; } ;;
       reclaim)
-        docker logs "$target" 2>&1 | grep -q 'Running job' && continue
+        took_job "$target" && continue
         docker rm -f "$target" >/dev/null || continue
         echo "满了，收掉闲着的 $target 腾给 $for_repo"
         if spawn "$for_repo"; then echo "给 $for_repo 补了一个空闲 runner"; else spawn_failed="$for_repo"; fi ;;
