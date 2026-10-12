@@ -14,7 +14,7 @@ OWNER="${OWNER:-Melodymaifafa}"
 MAX_EXTRA_RUNNERS="${MAX_EXTRA_RUNNERS:-4}"
 JOB_MEMORY="${JOB_MEMORY:-3g}"       # 单个 job 的内存上限，免得一个 job 撑爆整个虚拟机
 REFRESH_SECONDS="${REFRESH_SECONDS:-600}"
-here="$(cd "$(dirname "$0")" && pwd)"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 context_dir="$here/../runner"
 state="${RUNNER_POOL_STATE:-$HOME/.local/state/ghwf-runner-pool}"
 secrets="${GH_WORKFLOWS_SECRETS:-$HOME/.config/gh-workflows/secrets.env}"
@@ -55,8 +55,8 @@ ensure_docker() {
 }
 
 # 镜像按 Dockerfile 的内容打标签，改了 Dockerfile 就自动重建。
+image="ghwf-runner:$(shasum -a 256 "$context_dir/Dockerfile" | cut -c1-12)"
 ensure_image() {
-  image="ghwf-runner:$(shasum -a 256 "$context_dir/Dockerfile" | cut -c1-12)"
   docker image inspect "$image" >/dev/null 2>&1 && return 0
   echo "构建镜像 $image"
   docker build -q -t "$image" "$context_dir" >/dev/null
@@ -203,17 +203,26 @@ main() {
   mkdir -p "$state"
   local last_refresh=0 now
   while :; do
-    if ensure_docker && ensure_image; then
-      recover docker "colima 里的 docker 又连上了。"
-      now="$(date +%s)"
-      if [ $((now - last_refresh)) -ge "$REFRESH_SECONDS" ]; then
-        last_refresh="$now"
-        refresh_repos || echo "读不到仓库名单，沿用上一份" >&2
-        prune
-      fi
-      [ -f "$state/repos" ] && check_disk && tick
-    else
+    if ! ensure_docker; then
       alert docker "🤖 本机 runner 停了" "colima 里的 docker 起不来，私有仓库的 job 会一直排队（最多 24 小时后 GitHub 取消）。在 Mac 上跑 colima start 看报错。"
+      sleep 15
+      continue
+    fi
+    recover docker "colima 里的 docker 又连上了。"
+    now="$(date +%s)"
+    if [ $((now - last_refresh)) -ge "$REFRESH_SECONDS" ]; then
+      last_refresh="$now"
+      refresh_repos || echo "读不到仓库名单，沿用上一份" >&2
+      prune
+    fi
+    # 先看磁盘再构建：构建要下 Ubuntu 的包，正是磁盘守的那点空间
+    if [ -f "$state/repos" ] && check_disk; then
+      if ensure_image; then
+        recover image "runner 镜像又建好了。"
+        tick
+      else
+        alert image "🤖 本机 runner 镜像建不出来" "docker build ${image} 失败，私有仓库的 job 会一直排队。在 Mac 上到 gh-workflows 跑 docker build runner/ 看报错。"
+      fi
     fi
     sleep 15
   done
