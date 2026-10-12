@@ -197,7 +197,7 @@ jobs:
 
 私有仓库的 Actions 免费分钟（每月 2,000）2026-10-10 用完，job 被 GitHub 拒跑。自托管 runner 不计分钟，所以给仓库设变量 **`GHWF_RUNNER=ghwf-local`**，这个仓库的 ci / iterate / 合并 / ff-main 全部改派到主人 Mac 上跑；删掉变量就回 GitHub 的 runner。变量读的是**调用方仓库**的（2026-10-12 在 wf-smoke-test 实测），所以只影响设了变量的那个仓库。
 
-- **跑在哪**：pm2 常驻 `scripts/runner-pool.sh`（名字 `ghwf-runner-pool`），job 跑在 colima 虚拟机的容器里（`runner/Dockerfile`，照 ubuntu-latest 摆：用户 `runner`、免密 sudo、工作区 `/home/runner/work`）。每个容器是 JIT runner，只接一个 job，跑完就删。
+- **跑在哪**：pm2 常驻 `scripts/runner-pool.sh`（名字 `ghwf-runner-pool`），job 跑在 colima 虚拟机的容器里（`runner/Dockerfile`，照 ubuntu-latest 摆：用户 `runner`、免密 sudo、工作区 `/home/runner/work`）。每个容器是 JIT runner，只接一个 job，跑完就删。镜像用专用的 buildx builder `ghwf-runner` 建，建完清掉它的缓存，不碰主人别的构建缓存（代价是多一个约 360 MB 的 `moby/buildkit` 镜像）。
 - **每个仓库常备一个空闲的**：合并环节会占着 runner 等 CI（最多 30 分钟），一个仓库只有一个 runner 就会互相等死。空闲的约 40 MB。容器总数到「仓库数 + `MAX_EXTRA_RUNNERS`（默认 4）」就不再补，排队等；空闲的随时会接 job，所以这也是同时跑的 job 上限。满了时，有 job 在跑的仓库可以收掉一个「没 job 在跑的仓库」的空闲 runner 给自己用（runner 只服务注册它的仓库）。虚拟机自己限 4 GB 内存，挤不到 Mac。
 - **只给私有仓库开**：公开仓库谁都能提 PR，陌生人的代码不能在主人的 Mac 上跑 —— 公开仓库设了变量也不理。注册 runner 用主人本机 `gh` 的登录，容器只拿到一次性的 JIT 配置。
 - **手机通知**：colima 起不来、注册不上 runner（多半是本机 `gh` 登录失效）、磁盘剩不到 5 GB，各推一次，恢复了再推一次。

@@ -56,10 +56,17 @@ ensure_docker() {
 
 # 镜像按 Dockerfile 的内容打标签，改了 Dockerfile 就自动重建。
 image="ghwf-runner:$(shasum -a 256 "$context_dir/Dockerfile" | cut -c1-12)"
+# 用本池专用的 builder 建：建完（成不成都）清掉它的缓存、停掉它，主人别的构建缓存不碰。
 ensure_image() {
+  local builder=ghwf-runner rc=0
   docker image inspect "$image" >/dev/null 2>&1 && return 0
   echo "构建镜像 $image"
-  docker build -q -t "$image" "$context_dir" >/dev/null
+  docker buildx inspect "$builder" >/dev/null 2>&1 ||
+    docker buildx create --name "$builder" --driver docker-container >/dev/null
+  docker buildx build --builder "$builder" --load -q -t "$image" "$context_dir" >/dev/null || rc=$?
+  docker buildx prune --builder "$builder" -af >/dev/null 2>&1 || true
+  docker buildx stop "$builder" >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 # 主人的 Mac 磁盘不大，每个 job 都要下依赖：空间不够就先不补 runner，已经空闲着的照样接 job。
@@ -175,7 +182,9 @@ spawn() {
 }
 
 tick() {
-  local action target for_repo spawn_failed=
+  local action target for_repo rows spawn_failed=
+  # docker ps 偶尔失败时 rows 是空的，decide 会当成一个 runner 都没有、给每个仓库重开一套
+  rows="$(list_runners)" || { echo "列不出池里的容器，这一轮不补" >&2; return 0; }
   while read -r action target for_repo; do
     case "$action" in
       # 刚才那一眼之后它也许接到了 job：接到了就不收；reclaim 收不成就不补，下一轮重看
@@ -191,7 +200,7 @@ tick() {
         if spawn "$target"; then echo "给 $target 补了一个空闲 runner"; else spawn_failed="$target"; fi ;;
       full) ;;  # 满了就等，不刷屏
     esac
-  done < <(list_runners | decide "$state/repos" "$(($(awk 'NF' "$state/repos" | wc -l) + MAX_EXTRA_RUNNERS))")
+  done < <(decide "$state/repos" "$(($(awk 'NF' "$state/repos" | wc -l) + MAX_EXTRA_RUNNERS))" <<<"$rows")
   if [ -n "$spawn_failed" ]; then
     alert register "🤖 本机 runner 注册不上" "给 ${spawn_failed} 注册 runner 失败，私有仓库的 job 会一直排队。多半是本机 gh 登录失效：在 Mac 上 gh auth login。"
   else

@@ -85,3 +85,13 @@ full r4"
   assert_equal "$out" "spawn content-grabbers
 spawn wf-smoke-test"
 }
+
+@test "a failed docker ps skips the tick instead of starting a runner for every repo" {
+  state="$BATS_TEST_TMPDIR"  # $repos 已经在这里，名字正好是 tick 要读的 repos
+  docker() { [ "$1" = ps ] && return 1; return 0; }
+  spawn() { echo "spawned $1"; }
+  run tick
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "spawned"
+  assert_contains "$output" "列不出池里的容器"
+}
