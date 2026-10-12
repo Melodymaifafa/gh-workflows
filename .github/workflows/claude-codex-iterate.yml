@@ -111,8 +111,10 @@ jobs:
       cancel-in-progress: false
     # 响应 Codex 的 review，或主人令牌（OWNER）发的 Claude 代审意见 / 巡检重修请求；
     # 仅在 PR 还开着时（合并后分支已删，checkout 会扑空）。真正的校验在 Gate 步骤。
+    # agent/* 是 momo 的分支：momo 在 Mac 上自己追 Codex、自己修、自己合并，这里再推修复会跟它撞。
     if: |
       github.event.pull_request.state == 'open' &&
+      !startsWith(github.event.pull_request.head.ref, 'agent/') &&
       !contains(github.event.pull_request.title, '[no-claude]') &&
       (
         github.event.review.user.login == 'chatgpt-codex-connector[bot]' ||

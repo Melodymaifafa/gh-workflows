@@ -257,6 +257,11 @@ jobs:
             echo "::notice::PR #$PR_NUMBER is outside the auto-merge policy"
             exit 0
           fi
+          # agent/* 是 momo 的分支：momo 在 Mac 上自己判 Codex、自己合并。
+          if [[ "$head_ref" == agent/* ]]; then
+            echo "::notice::PR #$PR_NUMBER is on $head_ref; momo merges its own branches"
+            exit 0
+          fi
 
           reaction_route=
           summon_id=

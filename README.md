@@ -100,7 +100,7 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 - **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
 - 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。
 
-故意不管的：草稿、从 fork 开的 PR、标题带 `[no-codex-merge]` / `[no-claude]` 的 PR。叫审 3 次没结果的 head 之后只每天叫一次、共 7 天，然后不再叫；有冲突的 head 只叫一次自动解冲突、只告警一次；已停车的 head 只告警一次。用内联副本、没接共享调用桩的仓库（如 Weibo--automation-android）：每个 PR 的每个 head 空闲 60 分钟后告警一次 `unwatched`，不叫审；私有仓库要等巡检读得到调用桩才生效。
+故意不管的：草稿、从 fork 开的 PR、标题带 `[no-codex-merge]` / `[no-claude]` 的 PR、`agent/*` 分支的 PR（momo 的，它在 Mac 上自己追 Codex、自己合并；iterate 和合并工作流也跳过它们，两边一起动会撞推送）。叫审 3 次没结果的 head 之后只每天叫一次、共 7 天，然后不再叫；有冲突的 head 只叫一次自动解冲突、只告警一次；已停车的 head 只告警一次。用内联副本、没接共享调用桩的仓库（如 Weibo--automation-android）：每个 PR 的每个 head 空闲 60 分钟后告警一次 `unwatched`，不叫审；私有仓库要等巡检读得到调用桩才生效。
 
 ## 开一个新项目（从零）
 

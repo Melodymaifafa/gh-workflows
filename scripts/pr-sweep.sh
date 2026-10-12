@@ -4,7 +4,8 @@
 # 的定时任务兜底（cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次）。
 #
 # 集成分支 = 仓库默认分支上合并调用桩的 base_branch（见 integration_base）。
-# 每个 open、非草稿、同仓库、标题不带 [no-codex-merge]/[no-claude] 的 PR，按顺序只走第一条命中的规则：
+# 每个 open、非草稿、同仓库、标题不带 [no-codex-merge]/[no-claude]、分支不是 agent/* 的 PR，按顺序只走第一条命中的规则：
+# （agent/* 是 momo 的分支：momo 在 Mac 上自己追 Codex、自己合并，两边一起动会互相撞推送。）
 #   0. 没人管            → 仓库没接共享自动化、或 PR 没打向集成分支：空闲 ≥ 60 分钟时告警一次（unwatched），停。
 #   1. 有冲突            → 留一条不推手机的 conflict 标记叫醒合并工作流，由它把集成分支合进来、停；
 #                          它解不了会自己告警（conflict-stuck）；留言后空闲 ≥ 2 小时还没动静就由巡检告警。
@@ -485,6 +486,7 @@ for entry in $repos; do
       .[] | select(.draft | not)
       | select(.head.repo.full_name == .base.repo.full_name)
       | select((.title | contains("[no-codex-merge]") or contains("[no-claude]")) | not)
+      | select((.head.ref // "") | startswith("agent/") | not)
       | "\(.number):\(.base.ref)"' 2>"$err")"; then
     echo "::warning::$label 列 PR 失败"; failed=1; continue
   fi
