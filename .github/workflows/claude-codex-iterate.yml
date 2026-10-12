@@ -124,7 +124,7 @@ jobs:
           )
         )
       )
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}
     # 默认 360 分钟太长。Claude 最多 80 轮；换人那条路还要等 Codex 云端回补丁
     # （最多 15 分钟）和召唤复审的冷却（最多 6 分钟），所以留 60 分钟。
     timeout-minutes: 60
@@ -3499,7 +3499,7 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     # posted=true：这个 head 留下了判决（或者判决已经不需要了）。没有它，round-cap-park 兜底停车。
     outputs:
@@ -4064,7 +4064,7 @@ jobs:
     permissions:
       issues: write
       pull-requests: write
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     defaults:
       run:

@@ -33,7 +33,7 @@ on:
 
 jobs:
   lint-and-test:
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on == 'ubuntu-latest' && vars.GHWF_RUNNER || inputs.runs_on }}
     steps:
       - uses: actions/checkout@v5
 
