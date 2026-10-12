@@ -88,6 +88,9 @@ prune() {
     [ "$old" = "$image" ] || docker rmi "$old" >/dev/null 2>&1 || true
   done
   docker image prune -f --filter label=ghwf.pool=1 >/dev/null 2>&1 || true
+  # job 删掉的数据只在虚拟机里腾出地方，Mac 上的磁盘文件不会自己缩：不 trim 就只涨不缩
+  # （2026-10-12 实测 19 GB，里面只用了 9 GB；trim 一次回到 4 GB）
+  colima ssh -- sudo fstrim -a >/dev/null 2>&1 || true
 }
 
 # 重读名单：私有仓库里 GHWF_RUNNER 等于本池标签的。单个仓库读失败（不是 404）就照旧留着它。
