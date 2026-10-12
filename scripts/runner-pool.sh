@@ -9,7 +9,9 @@ set -euo pipefail
 
 LABEL="${GHWF_LABEL:-ghwf-local}"
 OWNER="${OWNER:-Melodymaifafa}"
-MAX_RUNNERS="${MAX_RUNNERS:-12}"     # 容器总数上限（含空闲的）。空闲的随时会接 job，所以这也是同时跑的 job 上限
+# 容器总数上限 = 名单上的仓库数（每个一个空闲的）+ MAX_EXTRA_RUNNERS。空闲的随时会接 job，所以这也是同时跑的 job 上限；
+# 跟着仓库数走，开的仓库再多也人人有一个。
+MAX_EXTRA_RUNNERS="${MAX_EXTRA_RUNNERS:-4}"
 JOB_MEMORY="${JOB_MEMORY:-3g}"       # 单个 job 的内存上限，免得一个 job 撑爆整个虚拟机
 REFRESH_SECONDS="${REFRESH_SECONDS:-600}"
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -113,7 +115,7 @@ list_runners() {
     done
 }
 
-# decide <名单文件> <MAX_RUNNERS>，stdin 是 list_runners 的输出。输出：
+# decide <名单文件> <容器总数上限>，stdin 是 list_runners 的输出。输出：
 #   remove <容器名>   仓库撤了变量，收掉它空闲的
 #   spawn <仓库>      给没空闲 runner 的仓库补一个
 #   reclaim <容器名>  满了：收掉一个「没 job 在跑的仓库」的空闲 runner，腾给有 job 在跑的仓库 ——
@@ -184,7 +186,7 @@ tick() {
         if spawn "$target"; then echo "给 $target 补了一个空闲 runner"; else spawn_failed="$target"; fi ;;
       full) ;;  # 满了就等，不刷屏
     esac
-  done < <(list_runners | decide "$state/repos" "$MAX_RUNNERS")
+  done < <(list_runners | decide "$state/repos" "$(($(awk 'NF' "$state/repos" | wc -l) + MAX_EXTRA_RUNNERS))")
   if [ -n "$spawn_failed" ]; then
     alert register "🤖 本机 runner 注册不上" "给 ${spawn_failed} 注册 runner 失败，私有仓库的 job 会一直排队。多半是本机 gh 登录失效：在 Mac 上 gh auth login。"
   else

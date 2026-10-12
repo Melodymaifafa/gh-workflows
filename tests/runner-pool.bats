@@ -20,20 +20,20 @@ setup() {
   assert_equal "$out" "spawn content-grabbers"
 }
 
-@test "at MAX_RUNNERS with nothing idle to take, repos wait" {
+@test "at the cap with nothing idle to take, repos wait" {
   out="$(printf '%s\n' 'a content-grabbers busy' 'b wf-smoke-test busy' | decide "$repos" 2)"
   assert_equal "$out" "full content-grabbers
 full wf-smoke-test"
 }
 
-@test "at MAX_RUNNERS a repo with a job running takes the idle runner of a repo with none" {
+@test "at the cap a repo with a job running takes the idle runner of a repo with none" {
   printf '%s\n' hot cold >"$repos"
   out="$(printf '%s\n' 'h1 hot busy' 'c1 cold idle' | decide "$repos" 2)"
   assert_equal "$out" "reclaim c1
 spawn hot"
 }
 
-@test "at MAX_RUNNERS a repo with no job running does not take anyone's runner" {
+@test "at the cap a repo with no job running does not take anyone's runner" {
   printf '%s\n' hot cold cold2 >"$repos"
   out="$(printf '%s\n' 'h1 hot busy' 'h2 hot idle' 'c1 cold idle' | decide "$repos" 3)"
   assert_equal "$out" "full cold2"
