@@ -129,6 +129,7 @@ decide() {
     grep -qxF "$repo" "$repos_file" && continue
     echo "remove $name"
     total=$((total - 1))
+    used="$used$name "
   done <<<"$rows"
   while read -r repo; do
     [ -n "$repo" ] || continue
@@ -172,9 +173,11 @@ tick() {
   local action target spawn_failed=
   while read -r action target; do
     case "$action" in
-      remove) docker rm -f "$target" >/dev/null && echo "收掉 $target（仓库撤了 GHWF_RUNNER）" ;;
+      # 刚才那一眼之后它也许接到了 job：接到了就不收（reclaim 后面那个 spawn 多出一个也只是这一回）
+      remove)
+        docker logs "$target" 2>&1 | grep -q 'Running job' ||
+          { docker rm -f "$target" >/dev/null && echo "收掉 $target（仓库撤了 GHWF_RUNNER）"; } ;;
       reclaim)
-        # 刚才那一眼之后它也许接到了 job：接到了就不收，下一个 spawn 多出一个也只是这一回
         docker logs "$target" 2>&1 | grep -q 'Running job' ||
           { docker rm -f "$target" >/dev/null && echo "满了，收掉闲着的 $target 腾地方"; } ;;
       spawn)

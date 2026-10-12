@@ -47,6 +47,14 @@ spawn hotA
 full hotB"
 }
 
+@test "a runner already being removed is not reclaimed again" {
+  printf '%s\n' new hot >"$repos"
+  out="$(printf '%s\n' 'o old idle' 'h hot busy' | decide "$repos" 2)"
+  assert_equal "$out" "remove o
+spawn new
+full hot"
+}
+
 @test "an idle runner removed for a dropped repo frees its room" {
   printf '%s\n' r1 >"$repos"
   out="$(printf '%s\n' 'x old idle' | decide "$repos" 1)"
