@@ -112,14 +112,17 @@ refresh_repos() {
 # 日志长了 docker logs 吃 SIGPIPE，pipefail 下整条判成「没接到」，会把在跑的 job 当空闲的收掉。
 took_job() { docker logs "$1" 2>&1 | grep -c 'Running job' >/dev/null; }
 
-# 池里每个容器一行「容器名 仓库 idle|busy」。
+# 池里每个容器一行「容器名 仓库 idle|busy|stale」。stale = 空闲、但用的不是现在的镜像：
+# 不收掉的话，改了 Dockerfile 要等它们哪天接到 job 才换新（2026-10-12 补 yaml 时旧的空闲 runner 会接着红）。
 list_runners() {
-  local name repo
-  docker ps --filter label=ghwf.pool=1 --format '{{.Names}} {{.Label "ghwf.repo"}}' |
-    while read -r name repo; do
+  local name repo img
+  docker ps --filter label=ghwf.pool=1 --format '{{.Names}} {{.Label "ghwf.repo"}} {{.Image}}' |
+    while read -r name repo img; do
       [ -n "$name" ] || continue
       if took_job "$name"; then
         echo "$name $repo busy"
+      elif [ "$img" != "$image" ]; then
+        echo "$name $repo stale"
       else
         echo "$name $repo idle"
       fi
@@ -127,7 +130,7 @@ list_runners() {
 }
 
 # decide <名单文件> <容器总数上限>，stdin 是 list_runners 的输出。输出：
-#   remove <容器名>   仓库撤了变量，收掉它空闲的
+#   remove <容器名>   收掉空闲的：仓库撤了变量，或镜像旧了（stale，它的仓库照常补一个新的）
 #   spawn <仓库>      给没空闲 runner 的仓库补一个
 #   reclaim <容器名> <仓库>  满了：收掉一个「没 job 在跑的仓库」的空闲 runner，腾给有 job 在跑的这个仓库 ——
 #                     runner 只服务注册它的那个仓库，那边的 job 可能正占着 runner 等同仓库的 CI
@@ -138,8 +141,11 @@ decide() {
   total="$(printf '%s\n' "$rows" | awk 'NF' | wc -l | tr -d ' ')"
   while read -r name repo st; do
     [ -n "$name" ] || continue
-    [ "$st" = idle ] || continue
-    grep -qxF "$repo" "$repos_file" && continue
+    case "$st" in
+      stale) ;;
+      idle) grep -qxF "$repo" "$repos_file" && continue ;;
+      *) continue ;;
+    esac
     # 不在这一轮把它的位置让出去：它也许正好接到 job，收不成（下一轮它要么没了，要么算忙的）
     echo "remove $name"
     used="$used$name "
@@ -190,7 +196,7 @@ tick() {
       # 刚才那一眼之后它也许接到了 job：接到了就不收；reclaim 收不成就不补，下一轮重看
       remove)
         took_job "$target" ||
-          { docker rm -f "$target" >/dev/null && echo "收掉 $target（仓库撤了 GHWF_RUNNER）"; } ;;
+          { docker rm -f "$target" >/dev/null && echo "收掉空闲的 $target（仓库撤了 GHWF_RUNNER，或镜像旧了）"; } ;;
       reclaim)
         took_job "$target" && continue
         docker rm -f "$target" >/dev/null || continue

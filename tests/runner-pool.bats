@@ -95,3 +95,24 @@ spawn wf-smoke-test"
   refute_contains "$output" "spawned"
   assert_contains "$output" "列不出池里的容器"
 }
+
+@test "an idle runner on an old image is removed and its repo gets a new one" {
+  printf '%s\n' r1 >"$repos"
+  out="$(printf '%s\n' 'old1 r1 stale' | decide "$repos" 4)"
+  assert_equal "$out" "remove old1
+spawn r1"
+}
+
+@test "list_runners marks idle runners on an old image stale, and leaves busy ones busy" {
+  docker() {
+    case "$1" in
+      ps) printf '%s\n' 'a r1 ghwf-runner:old' "b r1 $image" 'c r2 ghwf-runner:old' ;;
+      logs) [ "$2" = c ] && echo "Running job: ci" ;;
+    esac
+    return 0
+  }
+  out="$(list_runners)"
+  assert_equal "$out" "a r1 stale
+b r1 idle
+c r2 busy"
+}
