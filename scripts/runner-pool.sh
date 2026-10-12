@@ -71,13 +71,14 @@ check_disk() {
   recover disk "磁盘空间够了，本机 runner 接着接 job。"
 }
 
-# 容器都是 --rm，攒下的是旧镜像和构建缓存。还在用的镜像删不掉，忽略报错。
+# 容器都是 --rm，攒下的只有改 Dockerfile 后的旧镜像。只删本池的（colima 也许还跑着主人别的东西）；
+# 还在用的镜像删不掉，忽略报错。
 prune() {
   local old
   for old in $(docker images ghwf-runner --format '{{.Repository}}:{{.Tag}}'); do
     [ "$old" = "$image" ] || docker rmi "$old" >/dev/null 2>&1 || true
   done
-  docker system prune -f --filter until=24h >/dev/null 2>&1 || true
+  docker image prune -f --filter label=ghwf.pool=1 >/dev/null 2>&1 || true
 }
 
 # 重读名单：私有仓库里 GHWF_RUNNER 等于本池标签的。单个仓库读失败（不是 404）就照旧留着它。
@@ -112,25 +113,47 @@ list_runners() {
     done
 }
 
-# decide <名单文件> <MAX_RUNNERS>，stdin 是 list_runners 的输出。
-# 输出 remove <容器名>（仓库撤了变量，收掉它空闲的）/ spawn <仓库> / full <仓库>（没空闲的，但已满）。
+# decide <名单文件> <MAX_RUNNERS>，stdin 是 list_runners 的输出。输出：
+#   remove <容器名>   仓库撤了变量，收掉它空闲的
+#   spawn <仓库>      给没空闲 runner 的仓库补一个
+#   reclaim <容器名>  满了：收掉一个「没 job 在跑的仓库」的空闲 runner，腾给有 job 在跑的仓库 ——
+#                     runner 只服务注册它的那个仓库，那边的 job 可能正占着 runner 等同仓库的 CI
+#   full <仓库>       满了，又没得腾，排队等
 decide() {
-  local repos_file=$1 max_runners=$2 rows total name repo st
+  local repos_file=$1 max_runners=$2 rows total name repo st victim used=" "
   rows="$(cat)"
   total="$(printf '%s\n' "$rows" | awk 'NF' | wc -l | tr -d ' ')"
   while read -r name repo st; do
     [ -n "$name" ] || continue
     [ "$st" = idle ] || continue
-    grep -qxF "$repo" "$repos_file" || echo "remove $name"
+    grep -qxF "$repo" "$repos_file" && continue
+    echo "remove $name"
+    total=$((total - 1))
   done <<<"$rows"
   while read -r repo; do
     [ -n "$repo" ] || continue
     printf '%s\n' "$rows" | awk -v r="$repo" '$2 == r && $3 == "idle" { f = 1 } END { exit !f }' && continue
-    if [ "$total" -ge "$max_runners" ]; then
-      echo "full $repo"
-    else
+    if [ "$total" -lt "$max_runners" ]; then
       echo "spawn $repo"
       total=$((total + 1))
+      continue
+    fi
+    victim=
+    if printf '%s\n' "$rows" | awk -v r="$repo" '$2 == r && $3 == "busy" { f = 1 } END { exit !f }'; then
+      victim="$(printf '%s\n' "$rows" | awk -v used="$used" '
+        $3 == "busy" { hot[$2] = 1 }
+        $3 == "idle" { idle[NR] = $1; owner[NR] = $2 }
+        END {
+          for (i = 1; i <= NR; i++)
+            if ((i in idle) && !(owner[i] in hot) && index(used, " " idle[i] " ") == 0) { print idle[i]; exit }
+        }')"
+    fi
+    if [ -n "$victim" ]; then
+      echo "reclaim $victim"
+      echo "spawn $repo"
+      used="$used$victim "
+    else
+      echo "full $repo"
     fi
   done <"$repos_file"
 }
@@ -150,6 +173,10 @@ tick() {
   while read -r action target; do
     case "$action" in
       remove) docker rm -f "$target" >/dev/null && echo "收掉 $target（仓库撤了 GHWF_RUNNER）" ;;
+      reclaim)
+        # 刚才那一眼之后它也许接到了 job：接到了就不收，下一个 spawn 多出一个也只是这一回
+        docker logs "$target" 2>&1 | grep -q 'Running job' ||
+          { docker rm -f "$target" >/dev/null && echo "满了，收掉闲着的 $target 腾地方"; } ;;
       spawn)
         if spawn "$target"; then echo "给 $target 补了一个空闲 runner"; else spawn_failed="$target"; fi ;;
       full) ;;  # 满了就等，不刷屏

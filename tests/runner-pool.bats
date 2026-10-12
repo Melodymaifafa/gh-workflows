@@ -20,11 +20,38 @@ setup() {
   assert_equal "$out" "spawn content-grabbers"
 }
 
-@test "at MAX_RUNNERS containers, idle ones included, nothing new starts" {
-  out="$(printf '%s\n' 'a content-grabbers busy' 'b other idle' | decide "$repos" 2)"
-  assert_contains "$out" "full content-grabbers"
-  assert_contains "$out" "full wf-smoke-test"
-  refute_contains "$out" "spawn"
+@test "at MAX_RUNNERS with nothing idle to take, repos wait" {
+  out="$(printf '%s\n' 'a content-grabbers busy' 'b wf-smoke-test busy' | decide "$repos" 2)"
+  assert_equal "$out" "full content-grabbers
+full wf-smoke-test"
+}
+
+@test "at MAX_RUNNERS a repo with a job running takes the idle runner of a repo with none" {
+  printf '%s\n' hot cold >"$repos"
+  out="$(printf '%s\n' 'h1 hot busy' 'c1 cold idle' | decide "$repos" 2)"
+  assert_equal "$out" "reclaim c1
+spawn hot"
+}
+
+@test "at MAX_RUNNERS a repo with no job running does not take anyone's runner" {
+  printf '%s\n' hot cold cold2 >"$repos"
+  out="$(printf '%s\n' 'h1 hot busy' 'h2 hot idle' 'c1 cold idle' | decide "$repos" 3)"
+  assert_equal "$out" "full cold2"
+}
+
+@test "one idle runner is reclaimed once, not for two repos" {
+  printf '%s\n' hotA hotB cold >"$repos"
+  out="$(printf '%s\n' 'a hotA busy' 'b hotB busy' 'c cold idle' | decide "$repos" 3)"
+  assert_equal "$out" "reclaim c
+spawn hotA
+full hotB"
+}
+
+@test "an idle runner removed for a dropped repo frees its room" {
+  printf '%s\n' r1 >"$repos"
+  out="$(printf '%s\n' 'x old idle' | decide "$repos" 1)"
+  assert_equal "$out" "remove x
+spawn r1"
 }
 
 @test "spawns in one tick stop at the remaining room" {

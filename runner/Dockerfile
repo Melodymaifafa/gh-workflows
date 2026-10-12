@@ -2,6 +2,7 @@
 # 尽量照 ubuntu-latest 摆：用户 runner（uid 1001）、免密 sudo、工作区 /home/runner/work —— 流水线里有写死这些的地方。
 # 每个容器只跑一个 job 就退出（JIT runner），下一个 job 拿全新的容器，跟 GitHub 的 runner 一样不留东西。
 FROM ubuntu:24.04
+LABEL ghwf.pool=1
 
 ARG RUNNER_VERSION=2.338.0
 # actions/runner 发布说明里 linux-arm64 包的 SHA256
