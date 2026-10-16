@@ -32,6 +32,7 @@
 # 评论带上召唤的标记和 codex-silent，合并检查走路径 G）。Codex 的回复里没有恢复时间，所以到点只
 # 试一次：又撞上就隔更久（1 / 2 / 4 / 8 小时），Codex 正常审完一次就清掉。状态记在 $OWNER/gh-workflows
 # 一条主人开的 issue 里（最后一行标记），iterate 和合并工作流召唤前也读它。读不到就按「额度正常」算。
+# 每轮先把所有 PR 读一遍、额度证据收齐，再逐个动手，所以喊不喊 Codex 跟先扫哪个 PR 无关。
 #
 # 环境变量：
 #   OWNER            仓库 owner（必填）
@@ -193,7 +194,7 @@ integration_base() {
 
 # ── Codex 额度（全局）──
 # $quota_file 一行：issue 号（0 = 还没建）、最后一次撞上的时间、再试的时间、连续撞上几次。
-# sweep_pr 跑在子 shell 里，所以状态放文件，不放变量。
+# collect_pr / sweep_pr 跑在子 shell 里，所以状态放文件，不放变量。
 quota_repo="$OWNER/gh-workflows"
 quota_file="$tmp/codex-quota"
 quota_known=1
@@ -286,7 +287,7 @@ save_quota() {
   fi
 }
 
-# 下面这些函数读 sweep_pr 设的 repo / n / H / alerts / url / who / hs。
+# 下面这些函数读 sweep_pr 设的 repo / n / H / alerts / url / who / hs，和主循环设的 dir（这个 PR 的数据目录）。
 # who / hs 是日志用的：公开仓库 "owner/名#N" 和 " (sha7)"，私有仓库只有标签、hs 为空。
 post_comment() {
   gh api -X POST "repos/$repo/issues/$n/comments" -f "body=$1" --silent
@@ -410,44 +411,66 @@ approve_held_runs() {
   done
 }
 
-# fetch_reactions：PR 正文和最近那条召唤上的 reaction 存进 $tmp；读不到返回 1。
+# fetch_reactions：PR 正文和最近那条召唤上的 reaction 存进 $dir；读不到返回 1。
 fetch_reactions() {
-  gh api --paginate --slurp "repos/$repo/issues/$n/reactions?per_page=100" >"$tmp/pr-reactions.raw" || return 1
-  gh api --paginate --slurp "repos/$repo/issues/comments/$summon_id/reactions?per_page=100" >"$tmp/summon-reactions.raw" || return 1
-  jq 'add // []' "$tmp/pr-reactions.raw" >"$tmp/pr-reactions.json" || return 1
-  jq 'add // []' "$tmp/summon-reactions.raw" >"$tmp/summon-reactions.json" || return 1
+  gh api --paginate --slurp "repos/$repo/issues/$n/reactions?per_page=100" >"$dir/pr-reactions.raw" || return 1
+  gh api --paginate --slurp "repos/$repo/issues/comments/$summon_id/reactions?per_page=100" >"$dir/summon-reactions.raw" || return 1
+  jq 'add // []' "$dir/pr-reactions.raw" >"$dir/pr-reactions.json" || return 1
+  jq 'add // []' "$dir/summon-reactions.raw" >"$dir/summon-reactions.json" || return 1
 }
 
 # codex_reaction <content> <since epoch>：Codex 在 PR 正文或最近那条召唤上、since 之后有没有这个 reaction（1/0）。
 codex_reaction() {
-  jq -n --slurpfile a "$tmp/pr-reactions.json" --slurpfile b "$tmp/summon-reactions.json" \
+  jq -n --slurpfile a "$dir/pr-reactions.json" --slurpfile b "$dir/summon-reactions.json" \
     --arg content "$1" --arg since "$2" --arg codex 'chatgpt-codex-connector[bot]' '
     def ts: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
     if any(($a[0] + $b[0])[]; .content == $content and .user.login == $codex and (.created_at | ts) >= ($since | tonumber))
     then 1 else 0 end'
 }
 
-# sweep_pr <owner/名> <N> <private> <集成分支，没接共享自动化是 -> <watched 1/0>
-sweep_pr() {
-  repo="$1" n="$2" private="$3" base="$4" watched="$5"
-  gh api "repos/$repo/pulls/$n" >"$tmp/pr.json"
-  gh api --paginate --slurp "repos/$repo/issues/$n/comments?per_page=100" | jq 'add // []' >"$tmp/comments.json"
-  gh api --paginate --slurp "repos/$repo/pulls/$n/reviews?per_page=100" | jq 'add // []' >"$tmp/reviews.json"
-  H="$(jq -r .head.sha "$tmp/pr.json")"
-  url="$(jq -r .html_url "$tmp/pr.json")"
-  if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
-
-  local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
-  local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded thumbs eyes
-  local quota_seen codex_ok_seen
-  facts="$(jq -rn --slurpfile pr "$tmp/pr.json" --slurpfile cs "$tmp/comments.json" --slurpfile rs "$tmp/reviews.json" \
-    --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq")"
+# read_facts：$dir/facts 那一行读进调用者的变量（sweep_pr 里是 local）。
+read_facts() {
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
     until_active until_passed fix_reason state merged total_retries judged judged_reviews \
     summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded \
-    quota_seen codex_ok_seen <<<"$facts"
-  echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
+    quota_seen codex_ok_seen <"$dir/facts"
+}
+
+# collect_pr <owner/名> <N>：读 PR、评论、review 存进 $dir，算好事实行；召唤过就连 Codex 的 👍 / 👀 一起读，
+# 读不到就不留 reactions 文件。再把这个 PR 上的额度证据并进这一轮。主循环先对所有 PR 跑完这个才
+# sweep_pr：额度是全局的，不能先扫到的 PR 已经喊了 @codex review，后面 PR 上那条「额度用完」才
+# 读到 —— 那样发出去的请求取决于 PR 的先后（Codex 2026-10-16 的 P2）。
+collect_pr() {
+  repo="$1" n="$2"
+  gh api "repos/$repo/pulls/$n" >"$dir/pr.json"
+  gh api --paginate --slurp "repos/$repo/issues/$n/comments?per_page=100" | jq 'add // []' >"$dir/comments.json"
+  gh api --paginate --slurp "repos/$repo/pulls/$n/reviews?per_page=100" | jq 'add // []' >"$dir/reviews.json"
+  H="$(jq -r .head.sha "$dir/pr.json")"
+  jq -rn --slurpfile pr "$dir/pr.json" --slurpfile cs "$dir/comments.json" --slurpfile rs "$dir/reviews.json" \
+    --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq" >"$dir/facts"
+  read_facts
   note_quota "$quota_seen" "$codex_ok_seen"
+  if [ "$summon_at" -gt 0 ] && fetch_reactions; then
+    thumbs="$(codex_reaction +1 "$summon_at")"
+    eyes="$(codex_reaction eyes "$summon_at")"
+    echo "$thumbs $eyes" >"$dir/reactions"
+    # 👍 也算 Codex 正常审完了一次（额度回来了）。
+    [ "$thumbs" = 0 ] || note_quota 0 "$summon_at"
+  fi
+}
+
+# sweep_pr <owner/名> <N> <private> <集成分支，没接共享自动化是 -> <watched 1/0>：按 collect_pr 存在 $dir 里的动手。
+sweep_pr() {
+  repo="$1" n="$2" private="$3" base="$4" watched="$5"
+  H="$(jq -r .head.sha "$dir/pr.json")"
+  url="$(jq -r .html_url "$dir/pr.json")"
+  if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
+
+  local idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
+  local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded thumbs eyes
+  local quota_seen codex_ok_seen
+  read_facts
+  echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
   # 0. 没人管：不叫审、不重修，告警一次。空闲 60 分钟再告，给人留时间改 base 或关掉。
   if [ "$watched" = 0 ]; then
@@ -534,13 +557,11 @@ sweep_pr() {
   fi
 
   # 6b / 6c. 最近一次召唤之后 Codex 的回应里，GitHub 不发事件的两种：👍，和什么都没有。
-  #       读不到 reaction 就分不清「点了 👍」和「没回应」，这两条都不走，交给下面的规则 5。
-  if [ "$summon_at" -gt 0 ] && fetch_reactions; then
-    thumbs="$(codex_reaction +1 "$summon_at")"
-    eyes="$(codex_reaction eyes "$summon_at")"
+  #       读不到 reaction（collect_pr 没留 reactions 文件）就分不清「点了 👍」和「没回应」，
+  #       这两条都不走，交给下面的规则 5。
+  if [ "$summon_at" -gt 0 ] && [ -f "$dir/reactions" ]; then
+    read -r thumbs eyes <"$dir/reactions"
     if [ "$thumbs" = 1 ]; then
-      # 👍 也算 Codex 正常审完了一次（额度回来了）。
-      note_quota 0 "$summon_at"
       # 叫醒的那次没合上（CI 红了又在同一个 head 上重跑绿了、当时还没跑完、一时合不了）：调用桩
       # 不接 CI 跑完的事件，同一个 head 上再没有什么会叫醒合并检查。所以同 4b，空闲 60 分钟再叫。
       # CI 还红着的那种在规则 2 就停车了，到不了这里。
@@ -599,6 +620,8 @@ repos="$(gh api --paginate --slurp "user/repos?affiliation=owner&per_page=100" |
 summary "### PR 巡检（${MODE}）"
 load_quota
 failed=0 unreadable=0 unreadable_labels="" unonboarded=0 unonboarded_labels=""
+# 第一遍：所有 PR 都读进 $tmp/pr/<序号>/（collect_pr），额度证据收齐；第二遍才逐个 sweep_pr 动手。
+k=0 queued=""
 for entry in $repos; do
   # 仓库名和分支名都不含 : 和空白。
   repo="${entry%%:*}" rest="${entry#*:}"
@@ -646,14 +669,29 @@ for entry in $repos; do
       [ "$legacy" = 0 ] || continue
       watched=0
     fi
+    if [ "$private" = true ]; then pr_label="$label"; else pr_label="$repo#$n"; fi
+    k=$((k + 1)) dir="$tmp/pr/$k"
+    mkdir -p "$dir"
+    echo "$repo $n $private $base $watched $pr_label" >"$dir/meta"
     # 一个 PR 出错不拖累其它 PR；子 shell 里重开 -e（|| 语境下 -e 会失效，所以不用 ||）。
     set +e
-    (set -e; sweep_pr "$repo" "$n" "$private" "$base" "$watched") 2>"$err"
+    (set -e; collect_pr "$repo" "$n") 2>"$err"
     rc=$?
     set -e
-    if [ "$private" = true ]; then pr_label="$label"; else pr_label="$repo#$n"; fi
-    [ "$rc" = 0 ] || { echo "::warning::$pr_label 巡检出错（exit ${rc}）"; failed=1; }
+    if [ "$rc" = 0 ]; then queued="$queued $k"; else echo "::warning::$pr_label 巡检出错（exit ${rc}）"; failed=1; fi
   done
+done
+# 第二遍：额度状态已经是这一轮所有 PR 的证据算出来的。
+for k in $queued; do
+  dir="$tmp/pr/$k"
+  read -r repo n private base watched pr_label <"$dir/meta"
+  err=/dev/stderr
+  [ "$private" = false ] || err=/dev/null
+  set +e
+  (set -e; sweep_pr "$repo" "$n" "$private" "$base" "$watched") 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" = 0 ] || { echo "::warning::$pr_label 巡检出错（exit ${rc}）"; failed=1; }
 done
 save_quota
 if [ "$unreadable" -gt 0 ]; then

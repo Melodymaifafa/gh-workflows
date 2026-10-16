@@ -1529,6 +1529,28 @@ claude_review_on() { gh_review "$1" Melodymaifafa OWNER "$2" "$(m3_body "$2")" "
   assert_contains "$(fake_last_body "$QUOTA_PATCH")" "<!-- codex-quota-state: hit=$((NOW_EPOCH - 1200)) until=0 strikes=0 -->"
 }
 
+@test "quota: a usage-limit answer on a later PR keeps an earlier PR's kick away from Codex too" {
+  local kick_pr hit_pr
+  kick_pr="$(pr_json 1 clean 900)"
+  hit_pr="$(pr_json 7 clean 11)"
+  # 先扫 #1（该 kick 了），再扫 #7（11 分钟前 Codex 回的「额度用完」）。
+  fake_route "repos/$R/pulls?state=open&per_page=100" "$(json_array "$kick_pr" "$hit_pr")"
+  fake_route "repos/$R/pulls/1" "$kick_pr"
+  fake_route "repos/$R/pulls/7" "$hit_pr"
+  fake_route "repos/$R/issues/1/comments?per_page=100" '[]'
+  fake_route "repos/$R/pulls/1/reviews?per_page=100" '[]'
+  comments "$(codex_quota_at 11)"
+  sweep
+  assert_equal "$status" 0
+  refute_contains "$(fake_all_bodies)" "@codex review"
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/1/comments")" "🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 09-18 20:49 之后再试 Codex。
+
+<!-- codex-review-head: $H -->
+<!-- pr-sweeper: kick -->
+<!-- pr-guard: codex-silent head=$H reason=quota -->"
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=quota -->"
+}
+
 @test "quota: a Codex 👍 after a summon clears the state" {
   quota_state "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH - 60))" 1
   one_pr clean 3
