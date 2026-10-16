@@ -32,7 +32,9 @@
 # 评论带上召唤的标记和 codex-silent，合并检查走路径 G）。Codex 的回复里没有恢复时间，所以到点只
 # 试一次：又撞上就隔更久（1 / 2 / 4 / 8 小时），Codex 正常审完一次就清掉。状态记在 $OWNER/gh-workflows
 # 一条主人开的 issue 里（最后一行标记），iterate 和合并工作流召唤前也读它。读不到就按「额度正常」算。
-# 每轮先把所有 PR 读一遍、额度证据收齐，再逐个动手，所以喊不喊 Codex 跟先扫哪个 PR 无关。
+# 每轮先把所有 PR 读一遍、额度证据收齐，再逐个动手，所以喊不喊 Codex 跟先扫哪个 PR 无关；动手前
+# 再读一遍那个 PR，按它眼下的样子动手。本机和 Actions 的巡检可能同时在跑，写回 issue 前也再读一次，
+# 别的巡检这期间写过就在它写的上面重算。
 #
 # 环境变量：
 #   OWNER            仓库 owner（必填）
@@ -203,11 +205,16 @@ quota_jq='[.[] | select((.pull_request | not) and .user.login == $o)
     | {n: .number, m: ((.body // "") | capture("<!-- codex-quota-state: hit=(?<h>[0-9]+) until=(?<u>[0-9]+) strikes=(?<s>[0-9]+) -->"))}]
   | first | if . == null then "0 0 0 0" else "\(.n) \(.m.h) \(.m.u) \(.m.s)" end'
 
+# read_quota_issue <文件>：issue 里记的状态写成一行进文件；读不到返回 1。
 # 只认主人开的 issue：仓库是 public，谁都能开一条带同样标记的 issue。
-load_quota() {
+read_quota_issue() {
   local issues
-  if issues="$(gh api "repos/$quota_repo/issues?state=open&creator=$OWNER&per_page=100" 2>/dev/null)" &&
-    jq -r --arg o "$OWNER" "$quota_jq" <<<"$issues" >"$quota_file" 2>/dev/null; then
+  issues="$(gh api "repos/$quota_repo/issues?state=open&creator=$OWNER&per_page=100" 2>/dev/null)" &&
+    jq -r --arg o "$OWNER" "$quota_jq" <<<"$issues" >"$1" 2>/dev/null
+}
+
+load_quota() {
+  if read_quota_issue "$quota_file"; then
     :
   else
     quota_known=0
@@ -265,6 +272,18 @@ codex_out() {
 save_quota() {
   cmp -s "$quota_file" "$tmp/codex-quota.loaded" && return 0
   local qi qh qu qs state body
+  # 本机每 5 分钟的巡检和 Actions 的定时巡检可能同时在跑：写之前再读一次 issue。这期间别的巡检写过，
+  # 就把这一轮看到的证据在它写的状态上重算一遍，免得拿开头读到的旧状态盖掉它记下的撞上、加长的等待
+  # 或清零，也免得两边各开一条 issue（Codex 2026-10-16 的 P2）。
+  if [ "$MODE" = live ] && [ "$quota_known" = 1 ]; then
+    read_quota_issue "$tmp/codex-quota.latest" ||
+      { echo "::warning::写回前读不到 Codex 额度状态（${quota_repo} 的 issue），这一轮不写"; return 0; }
+    if ! cmp -s "$tmp/codex-quota.latest" "$tmp/codex-quota.loaded"; then
+      cp "$tmp/codex-quota.latest" "$tmp/codex-quota.loaded"
+      note_quota 0 0
+      cmp -s "$quota_file" "$tmp/codex-quota.loaded" && return 0
+    fi
+  fi
   read -r qi qh qu qs <"$quota_file"
   if [ "$now" -lt "$qu" ]; then
     state="Codex 审查额度用完了。北京时间 $(beijing "$qu") 之后再试 Codex；在那之前，所有审查直接交给 Claude。"
@@ -436,12 +455,11 @@ read_facts() {
     quota_seen codex_ok_seen <"$dir/facts"
 }
 
-# collect_pr <owner/名> <N>：读 PR、评论、review 存进 $dir，算好事实行；召唤过就连 Codex 的 👍 / 👀 一起读，
-# 读不到就不留 reactions 文件。再把这个 PR 上的额度证据并进这一轮。主循环先对所有 PR 跑完这个才
-# sweep_pr：额度是全局的，不能先扫到的 PR 已经喊了 @codex review，后面 PR 上那条「额度用完」才
-# 读到 —— 那样发出去的请求取决于 PR 的先后（Codex 2026-10-16 的 P2）。
-collect_pr() {
+# fetch_pr <owner/名> <N>：读 PR、评论、review 存进 $dir，算好事实行；召唤过就连 Codex 的 👍 / 👀 一起读，
+# 读不到就不留 reactions 文件（上一次读的也删掉）。
+fetch_pr() {
   repo="$1" n="$2"
+  rm -f "$dir/reactions"
   gh api "repos/$repo/pulls/$n" >"$dir/pr.json"
   gh api --paginate --slurp "repos/$repo/issues/$n/comments?per_page=100" | jq 'add // []' >"$dir/comments.json"
   gh api --paginate --slurp "repos/$repo/pulls/$n/reviews?per_page=100" | jq 'add // []' >"$dir/reviews.json"
@@ -449,17 +467,24 @@ collect_pr() {
   jq -rn --slurpfile pr "$dir/pr.json" --slurpfile cs "$dir/comments.json" --slurpfile rs "$dir/reviews.json" \
     --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq" >"$dir/facts"
   read_facts
-  note_quota "$quota_seen" "$codex_ok_seen"
   if [ "$summon_at" -gt 0 ] && fetch_reactions; then
     thumbs="$(codex_reaction +1 "$summon_at")"
     eyes="$(codex_reaction eyes "$summon_at")"
     echo "$thumbs $eyes" >"$dir/reactions"
-    # 👍 也算 Codex 正常审完了一次（额度回来了）。
-    [ "$thumbs" = 0 ] || note_quota 0 "$summon_at"
   fi
 }
 
-# sweep_pr <owner/名> <N> <private> <集成分支，没接共享自动化是 -> <watched 1/0>：按 collect_pr 存在 $dir 里的动手。
+# collect_pr <owner/名> <N>：第一遍。fetch_pr，再把这个 PR 上的额度证据并进这一轮。主循环先对所有 PR
+# 跑完这个才 sweep_pr：额度是全局的，不能先扫到的 PR 已经喊了 @codex review，后面 PR 上那条「额度用完」
+# 才读到 —— 那样发出去的请求取决于 PR 的先后（Codex 2026-10-16 的 P2）。
+collect_pr() {
+  fetch_pr "$1" "$2"
+  note_quota "$quota_seen" "$codex_ok_seen"
+  # 👍 也算 Codex 正常审完了一次（额度回来了）。
+  if [ -f "$dir/reactions" ] && [ "$thumbs" != 0 ]; then note_quota 0 "$summon_at"; fi
+}
+
+# sweep_pr <owner/名> <N> <private> <集成分支，没接共享自动化是 -> <watched 1/0>：按 fetch_pr 存在 $dir 里的动手。
 sweep_pr() {
   repo="$1" n="$2" private="$3" base="$4" watched="$5"
   H="$(jq -r .head.sha "$dir/pr.json")"
@@ -681,14 +706,16 @@ for entry in $repos; do
     if [ "$rc" = 0 ]; then queued="$queued $k"; else echo "::warning::$pr_label 巡检出错（exit ${rc}）"; failed=1; fi
   done
 done
-# 第二遍：额度状态已经是这一轮所有 PR 的证据算出来的。
+# 第二遍：额度状态已经是这一轮所有 PR 的证据算出来的。第一遍读完所有仓库要一阵子，这期间 Codex 可能
+# 已经审完、点了 👍、回了意见，所以动手前把这个 PR 再读一遍，按新读到的动手（额度状态不跟着改，下一轮
+# 再并进来）；只比 head 不够（Codex 2026-10-16 的 P2）。
 for k in $queued; do
   dir="$tmp/pr/$k"
   read -r repo n private base watched pr_label <"$dir/meta"
   err=/dev/stderr
   [ "$private" = false ] || err=/dev/null
   set +e
-  (set -e; sweep_pr "$repo" "$n" "$private" "$base" "$watched") 2>"$err"
+  (set -e; fetch_pr "$repo" "$n"; sweep_pr "$repo" "$n" "$private" "$base" "$watched") 2>"$err"
   rc=$?
   set -e
   [ "$rc" = 0 ] || { echo "::warning::$pr_label 巡检出错（exit ${rc}）"; failed=1; }

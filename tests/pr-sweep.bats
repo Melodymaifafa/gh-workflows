@@ -25,11 +25,15 @@ setup() {
 }
 
 QUOTA_ROUTE="repos/Melodymaifafa/gh-workflows/issues?state=open&creator=Melodymaifafa&per_page=100"
-# quota_state [hit until strikes [开 issue 的人]]：gh-workflows 里记 Codex 额度的那条 issue（#40）；不给参数 = 还没有。
+# quota_issue hit until strikes [开 issue 的人]：列 issue 的响应，里面是记 Codex 额度的那条（#40）。
+quota_issue() {
+  jq -n --arg b "Codex 审查额度…"$'\n\n'"<!-- codex-quota-state: hit=$1 until=$2 strikes=$3 -->" \
+    --arg u "${4:-Melodymaifafa}" '[{number: 40, body: $b, user: {login: $u}}]'
+}
+# quota_state [hit until strikes [开 issue 的人]]：gh-workflows 里记 Codex 额度的那条 issue；不给参数 = 还没有。
 quota_state() {
   if [ "$#" = 0 ]; then fake_route "$QUOTA_ROUTE" '[]'; return; fi
-  fake_route "$QUOTA_ROUTE" "$(jq -n --arg b "Codex 审查额度…"$'\n\n'"<!-- codex-quota-state: hit=$1 until=$2 strikes=$3 -->" \
-    --arg u "${4:-Melodymaifafa}" '[{number: 40, body: $b, user: {login: $u}}]')"
+  fake_route "$QUOTA_ROUTE" "$(quota_issue "$@")"
 }
 # codex_quota_at <分钟前> [id]：Codex 回的「额度用完」
 codex_quota_at() { jq --arg at "$(ago "$1")" --argjson id "${2:-5711058128}" '.created_at = $at | .id = $id' "$FIXTURES_DIR/codex/quota-comment.json"; }
@@ -717,6 +721,18 @@ thumbs_comment() { owner_comment "$1" "🤖 巡检：…"$'\n\n'"<!-- pr-guard: 
   assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "reason=timeout -->"
 }
 
+@test "a Codex conclusion that lands after the first read is seen before acting" {
+  one_pr clean 3
+  # 第一遍读到的只有 30 分钟前的召唤；动手前再读，Codex 已经审完了这个 head。
+  fake_route "repos/$R/issues/7/comments?per_page=100" "$(json_array "$(summoned 30)")" 1
+  fake_route "repos/$R/issues/7/comments?per_page=100" "$(json_array "$(summoned 30)" \
+    "$(gh_comment 13 'chatgpt-codex-connector[bot]' NONE "Codex Review: Didn't find any major issues."$'\n\n'"**Reviewed commit:** \`${H:0:10}\`" "$(ago 1)")")" 2
+  no_reactions
+  sweep
+  assert_equal "$status" 0
+  refute_called "gh api POST repos/$R/issues/7/comments"
+}
+
 @test "quota: a Codex usage-limit comment after the summon hands the head to Claude at once" {
   one_pr clean 1
   comments "$(summoned 2)" "$(jq --arg at "$(ago 1)" '.created_at = $at' "$FIXTURES_DIR/codex/quota-comment.json")"
@@ -820,8 +836,10 @@ thumbs_comment() { owner_comment "$1" "🤖 巡检：…"$'\n\n'"<!-- pr-guard: 
   pr="$(pr_json 7 clean 900)"
   moved="$(pr_json 7 clean 900 "$OTHER")"
   fake_route "repos/$R/pulls?state=open&per_page=100" "$(json_array "$pr")"
+  # 第一遍读一次、动手前再读一次，都还是 H；写之前那次复查 head 已经变了。
   fake_route "repos/$R/pulls/7" "$pr" 1
-  fake_route "repos/$R/pulls/7" "$moved" 2
+  fake_route "repos/$R/pulls/7" "$pr" 2
+  fake_route "repos/$R/pulls/7" "$moved" 3
   sweep
   assert_equal "$status" 0
   refute_writes
@@ -1560,6 +1578,42 @@ claude_review_on() { gh_review "$1" Melodymaifafa OWNER "$2" "$(m3_body "$2")" "
   sweep
   assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "pr-guard: codex-thumbs head=$H"
   assert_contains "$(fake_last_body "$QUOTA_PATCH")" "until=0 strikes=0 -->"
+}
+
+@test "quota: a newer state another sweep wrote meanwhile is not overwritten" {
+  # 开头读到：半小时前撞上、还在等。写回前再读：另一个巡检刚又撞上一次，等待已经加长到 2 小时。
+  fake_route "$QUOTA_ROUTE" "$(quota_issue "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH + 1800))" 1)" 1
+  fake_route "$QUOTA_ROUTE" "$(quota_issue "$((NOW_EPOCH - 200))" "$((NOW_EPOCH + 7000))" 2)" 2
+  one_pr clean 5
+  comments "$(codex_quota_at 5)"
+  sweep
+  assert_equal "$status" 0
+  refute_called "gh api PATCH"
+  refute_called "$QUOTA_ISSUES"
+}
+
+@test "quota: a clear another sweep wrote meanwhile is the base this sweep's newer hit builds on" {
+  # 开头读到：还在等（1 小时后再试）。写回前再读：另一个巡检已经清零。这一轮看到 5 分钟前又撞上。
+  fake_route "$QUOTA_ROUTE" "$(quota_issue "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH + 1800))" 1)" 1
+  fake_route "$QUOTA_ROUTE" "$(quota_issue "$((NOW_EPOCH - 1800))" 0 0)" 2
+  one_pr clean 5
+  comments "$(codex_quota_at 5)"
+  sweep
+  q=$((NOW_EPOCH - 300))
+  assert_called "$QUOTA_PATCH" 1
+  assert_contains "$(fake_last_body "$QUOTA_PATCH")" "<!-- codex-quota-state: hit=$q until=$((q + 3600)) strikes=1 -->"
+}
+
+@test "quota: an issue another sweep opened meanwhile is not opened twice" {
+  q=$((NOW_EPOCH - 660))
+  fake_route "$QUOTA_ROUTE" '[]' 1
+  fake_route "$QUOTA_ROUTE" "$(quota_issue "$q" "$((q + 3600))" 1)" 2
+  one_pr clean 11
+  comments "$(codex_quota_at 11)"
+  sweep
+  assert_equal "$status" 0
+  refute_called "$QUOTA_ISSUES"
+  refute_called "gh api PATCH"
 }
 
 @test "quota: an issue someone else opened with the same marker is ignored" {
