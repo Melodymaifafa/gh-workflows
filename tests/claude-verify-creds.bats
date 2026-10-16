@@ -1144,6 +1144,48 @@ EOS
 <!-- pr-guard: fix-round head=$(git rev-parse HEAD) round=2 -->"
 }
 
+# 一轮一条评论：Gate 开修时记账的那条就地改成 M7，记账标记原样留着，不再另发一条（2026-10-16）。
+LEDGER_HEAD=1a7e81f6b5f27f0a1dbc33c6fafda1bb86f1483d
+LEDGER_BODY="🤖 第 2 轮开始修 review 3001（Claude 代审）。修好推上去之前，这批意见算没处理，这个 PR 不会自动合并。
+
+<!-- pr-guard: carried-findings review=3001 from=$LEDGER_HEAD -->"
+@test "claude: the round marker is written into this round's pending note instead of a new comment" {
+  push_workspace 'true'
+  export TARGET_REVIEW=3001 REVIEWED_HEAD="$LEDGER_HEAD" CLOSES=3001,
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(gh_comment 900 'github-actions[bot]' NONE "$LEDGER_BODY")" \
+    "$(gh_comment 901 mallory NONE "$LEDGER_BODY")")"
+  fake_route "repos/o/r/issues/comments/900" "$(gh_comment 900 'github-actions[bot]' NONE "$LEDGER_BODY")"
+
+  run_chain_trusted_push
+
+  assert_equal "$status" 0
+  new="$(git rev-parse HEAD)"
+  refute_called 'gh pr comment'
+  refute_called 'issues/comments/901'
+  assert_called 'gh api PATCH repos/o/r/issues/comments/900' 1
+  assert_equal "$(fake_last_body 'gh api PATCH repos/o/r/issues/comments/900')" "🤖 自动修复第 2 轮已推送。
+
+<!-- pr-guard: carried-findings review=3001 from=$LEDGER_HEAD -->
+<!-- pr-guard: fix-round head=$new round=2 -->
+<!-- pr-guard: carried-findings-cleared review=3001 head=$new -->"
+}
+
+@test "claude: no pending note for this round, or one that cannot be edited, still gets its own round marker" {
+  push_workspace 'true'
+  export TARGET_REVIEW=3001 REVIEWED_HEAD="$LEDGER_HEAD"
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(gh_comment 900 'github-actions[bot]' NONE "$LEDGER_BODY")")"
+  fake_route "repos/o/r/issues/comments/900" "$(gh_comment 900 'github-actions[bot]' NONE "$LEDGER_BODY")"
+  fake_route_fail -X PATCH "repos/o/r/issues/comments/900" 1
+
+  run_chain_trusted_push
+
+  assert_equal "$status" 0
+  assert_called 'gh pr comment 7 --repo o/r' 1
+  assert_contains "$(fake_last_body 'gh pr comment')" "<!-- pr-guard: fix-round head=$(git rev-parse HEAD) round=2 -->"
+}
+
 # 标记发不出去（gh 偶发失败，或者它不在写不动的目录里）只警告，不把这一轮判红：
 # 推已经成功了，为一条评论打红会让后面召唤复审跟着被跳过，链条反而静默停住。
 @test "claude: a round marker that fails to post only warns; the push still stands" {
@@ -1399,6 +1441,35 @@ origin_git() { "$REAL_GIT" --git-dir="$BATS_TEST_TMPDIR/origin.git" "$@"; }
   refute_contains "$body" 'pr-guard:'
   # 接到别人的新提交之后才推上去的，评论要说实话：合起来那一版交给 CI
   assert_contains "$body" '合起来的这一版由 CI 再验一遍'
+}
+
+# 一轮一条评论：推上去了，总结写进这一轮的 M7 评论（标记行原样留在最后），不另发。
+@test "claude: a pushed round's summary is written into the round's marker comment" {
+  trust_fake_bin
+  new=2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b
+  m7="🤖 自动修复第 2 轮已推送。
+
+<!-- pr-guard: carried-findings review=3001 from=$LEDGER_HEAD -->
+<!-- pr-guard: fix-round head=$new round=2 -->"
+  export STRUCTURED='{"pushed":true,"summary":"修了 2 条，跳过 0 条"}'
+  export PUSHED=true NEW_HEAD="$new" ROUND=2 REPO=o/r PR_NUMBER=7 GH_TOKEN=t CLAUDE_MODEL=claude-opus-5-5 CLAUDE_EFFORT=xhigh
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array "$(gh_comment 900 'github-actions[bot]' NONE "$m7")")"
+  fake_route "repos/o/r/issues/comments/900" "$(gh_comment 900 'github-actions[bot]' NONE "$m7")"
+
+  run run_step "$WF" "Post the Claude summary comment"
+
+  assert_equal "$status" 0
+  refute_called 'gh pr comment'
+  assert_equal "$(fake_last_body 'gh api PATCH repos/o/r/issues/comments/900')" "🤖 自动修复第 2 轮已推送。
+
+修了 2 条，跳过 0 条
+
+验证：本仓库的 lint 与测试已在不带写权限的独立步骤里跑过，全绿后才推送。
+
+模型：claude-opus-5-5 · 思考力度：xhigh
+
+<!-- pr-guard: carried-findings review=3001 from=$LEDGER_HEAD -->
+<!-- pr-guard: fix-round head=$new round=2 -->"
 }
 
 # 模型漏了 summary 只是少一条评论，不许把整轮判红 —— 代码已经验过、推过了。

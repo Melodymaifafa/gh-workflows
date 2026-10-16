@@ -219,11 +219,9 @@ refute_fallback() {
     assert_equal "$(step_output fallback)" true
     assert_equal "$(step_output head)" "$H"
     assert_equal "$(step_output reason)" "$reason"
-    assert_called 'gh api POST repos/o/r/issues/7/comments' 1
-    assert_equal "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" \
-      "🤖 Codex 这次审不了（额度用完/没回应），换 Claude 代审。
-
-<!-- pr-guard: fallback head=$H reason=$reason -->"
+    # 叫醒这一步的 codex-silent 评论已经说了「换 Claude」，这里不再发第二条（M2）。
+    refute_called 'gh api POST'
+    assert_contains "$output" "Codex unavailable ($reason); Claude reviews $H"
     refute_called 'sleep'
     refute_called 'gh pr merge'
     assert_bodies_inert

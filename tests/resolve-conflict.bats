@@ -471,11 +471,23 @@ nth_body() {
   note="$(nth_body 1 'gh api POST repos/o/r/issues/7/comments')"
   assert_contains "$note" "已经把 develop 合进来了（提交 \`${NEW:0:7}\`）"
   assert_contains "$note" '- `app.txt`：两边各改了第二行，合成了一行'
-  assert_contains "$note" '要等 CI 跑绿、Codex 再审一遍'
+  assert_contains "$note" '要等 CI 跑绿、再审一遍'
   assert_contains "$note" "<!-- pr-guard: conflict-merged head=$HEAD_SHA new=$NEW -->"
   refute_contains "$note" '@codex review'
   assert_equal "$(nth_body 2 'gh api POST repos/o/r/issues/7/comments')" \
     "@codex review"$'\n\n'"<!-- codex-review-head: $NEW -->"
+}
+
+@test "push: while Codex is out of review quota the merged head goes straight to Claude" {
+  resolved_and_committed
+  # 2100-01-01：再试时间远在以后。
+  fake_route "repos/o/gh-workflows/issues?state=open&creator=o&per_page=100" \
+    '[{"number":40,"user":{"login":"o"},"body":"x\n\n<!-- codex-quota-state: hit=1 until=4102444800 strikes=1 -->"}]'
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  assert_called 'gh api POST repos/o/r/issues/7/comments' 2
+  assert_equal "$(nth_body 2 'gh api POST repos/o/r/issues/7/comments')" \
+    "🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 01-01 08:00 之后再试 Codex。"$'\n\n'"<!-- codex-review-head: $NEW -->"$'\n'"<!-- pr-guard: codex-silent head=$NEW reason=quota -->"
 }
 
 @test "push: a merge git did by itself says so" {

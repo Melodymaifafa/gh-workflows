@@ -15,8 +15,8 @@ STEP='Post Claude verdict'
 SDK="$FIXTURES_DIR/sdk"
 REVIEWS='repos/o/r/pulls/7/reviews?per_page=100'
 COMMENTS='repos/o/r/issues/7/comments?per_page=100'
-M4_HEAD='🤖 Claude 代审：没发现要改的问题（Codex 本次不可用）。CI 全绿后自动合并。'
-M3_HEAD='### 🤖 Claude 代审（Codex 本次不可用）'
+M4_HEAD='🤖 Claude 审查：没发现要改的问题。CI 全绿后自动合并。'
+M3_HEAD='### 🤖 Claude 审查'
 
 setup() {
   setup_fake_env

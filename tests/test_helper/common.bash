@@ -679,12 +679,12 @@ m1_body() {
 # m3_body <H>：Claude 代审有问题（review 正文）
 m3_body() {
   # shellcheck disable=SC2016  # 反引号是 markdown，不是命令替换
-  printf '### 🤖 Claude 代审（Codex 本次不可用）\n\n- P1 `a.sh:1` 示例问题\n\n<!-- claude-review-findings: %s -->' "$1"
+  printf '### 🤖 Claude 审查\n\n- P1 `a.sh:1` 示例问题\n\n<!-- claude-review-findings: %s -->' "$1"
 }
 
 # m4_body <H>：Claude 代审没问题（issue 评论）
 m4_body() {
-  printf '🤖 Claude 代审：没发现要改的问题（Codex 本次不可用）。CI 全绿后自动合并。\n\n<!-- claude-review-clean: %s -->' "$1"
+  printf '🤖 Claude 审查：没发现要改的问题。CI 全绿后自动合并。\n\n<!-- claude-review-clean: %s -->' "$1"
 }
 
 # m6_marker <H> <reason> [until]
