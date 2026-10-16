@@ -214,6 +214,8 @@ load_quota() {
     echo "::warning::读不到 Codex 额度状态（${quota_repo} 的 issue），这一轮按「额度正常」算，也不写回"
   fi
   cp "$quota_file" "$tmp/codex-quota.loaded"
+  # 这一轮各 PR 上看到的：最晚一次撞上、最晚一次正常审完。
+  echo "0 0" >"$tmp/codex-quota.seen"
 }
 
 quota_backoff() { case "$1" in 1) echo 3600 ;; 2) echo 7200 ;; 3) echo 14400 ;; *) echo 28800 ;; esac; }
@@ -221,23 +223,34 @@ quota_backoff() { case "$1" in 1) echo 3600 ;; 2) echo 7200 ;; 3) echo 14400 ;; 
 # beijing <epoch>：北京时间 MM-DD HH:MM（macOS 的 date 没有 -d，用 jq）。
 beijing() { jq -nr --argjson t "$(($1 + 28800))" '$t | strftime("%m-%d %H:%M")'; }
 
-# note_quota <最近一次「额度用完」的时间> <最近一次 Codex 正常审完的时间>：把一个 PR 上看到的证据并进全局状态。
+# note_quota <最近一次「额度用完」的时间> <最近一次 Codex 正常审完的时间>：把一个 PR 上看到的证据并进这一轮的证据，
+# 再从读进来的状态重算全局状态。只看这一轮最晚的那次撞上和最晚的那次审完，结果跟先扫哪个 PR 无关 ——
+# 不然先扫到的 PR 上的「审完」清了状态，后扫到的 PR 上更早的「额度用完」又会被当成新撞上（Codex 2026-10-16 的 P2）。
 note_quota() {
-  local q="$1" ok="$2" qi qh qu qs
-  read -r qi qh qu qs <"$quota_file"
-  if [ "$q" -gt "$qh" ]; then
-    # 上次撞上已经是一天多以前：新的一段，从头算。
-    [ $((q - qh)) -le 86400 ] || qs=0
+  local q="$1" ok="$2" qi qh qu qs sq sok
+  read -r sq sok <"$tmp/codex-quota.seen"
+  [ "$q" -le "$sq" ] || sq="$q"
+  [ "$ok" -le "$sok" ] || sok="$ok"
+  echo "$sq $sok" >"$tmp/codex-quota.seen"
+  read -r qi qh qu qs <"$tmp/codex-quota.loaded"
+  if [ "$sq" -gt "$qh" ]; then
+    if [ "$sok" -gt "$qh" ]; then
+      # 上次撞上之后 Codex 正常审完过：额度回来过，这次撞上从头算。
+      qs=0 qu=0
+    elif [ $((sq - qh)) -gt 86400 ]; then
+      # 上次撞上已经是一天多以前：新的一段，从头算。
+      qs=0
+    fi
     # 到了再试的时间还撞上 = 试过一次没恢复，下次隔更久。没到时间的那些（打开 PR 时 Codex 自己去审、
     # 回的「额度用完」）只更新最后一次撞上的时间。
-    if [ "$q" -ge "$qu" ]; then
+    if [ "$sq" -ge "$qu" ]; then
       qs=$((qs + 1))
-      qu=$((q + $(quota_backoff "$qs")))
+      qu=$((sq + $(quota_backoff "$qs")))
     fi
-    qh="$q"
+    qh="$sq"
   fi
-  # 撞上之后 Codex 又正常审完了一次：额度回来了。
-  if [ "$ok" -gt "$qh" ] && [ "$qs" -gt 0 ]; then qs=0 qu=0; fi
+  # 最晚的一件事是 Codex 正常审完：额度回来了。
+  if [ "$sok" -gt "$qh" ] && [ "$qs" -gt 0 ]; then qs=0 qu=0; fi
   echo "$qi $qh $qu $qs" >"$quota_file"
 }
 
