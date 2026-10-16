@@ -1364,6 +1364,40 @@ summon_env() {
   refute_called "gh pr comment"
 }
 
+QUOTA_ROUTE="repos/o/gh-workflows/issues?state=open&creator=o&per_page=100"
+# quota_issue <until> [开 issue 的人]：巡检记 Codex 额度的那条 issue
+quota_issue() {
+  fake_route "$QUOTA_ROUTE" "$(jq -n --arg b "Codex 审查额度…"$'\n\n'"<!-- codex-quota-state: hit=1 until=$1 strikes=1 -->" \
+    --arg u "${2:-o}" '[{number: 40, body: $b, user: {login: $u}}]')"
+}
+
+@test "summon: while Codex is out of review quota it asks Claude at once, inside the cooldown too" {
+  summon_env
+  export FAKE_NOW=2026-09-18T08:02:00Z
+  quota_issue "$(jq -n '"2026-09-18T09:00:00Z" | fromdateiso8601')"
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$status" 0
+  assert_called "gh pr comment 7 --repo o/r" 1
+  assert_equal "$(fake_last_body "gh pr comment")" "🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 09-18 17:00 之后再试 Codex。
+
+<!-- codex-review-head: $H2 -->
+<!-- fix-round: 3 -->
+<!-- pr-guard: codex-silent head=$H2 reason=quota -->"
+  refute_contains "$(fake_last_body "gh pr comment")" "@codex"
+}
+
+@test "summon: a quota state past its retry time, or opened by someone else, still summons Codex" {
+  summon_env
+  fake_cli pr_view "{\"headRefOid\":\"$H2\"}"
+  quota_issue "$(jq -n '"2026-09-18T08:05:00Z" | fromdateiso8601')"
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$(fake_last_body "gh pr comment")" "$(printf '@codex review\n\n<!-- codex-review-head: %s -->\n<!-- fix-round: 3 -->' "$H2")"
+  quota_issue "$(jq -n '"2026-09-18T09:00:00Z" | fromdateiso8601')" mallory
+  run run_block "$WF" "Request Codex re-review after a new commit"
+  assert_equal "$(fake_last_body "gh pr comment")" "$(printf '@codex review\n\n<!-- codex-review-head: %s -->\n<!-- fix-round: 3 -->' "$H2")"
+}
+
 @test "summon: head unchanged -> nothing posted" {
   summon_env
   fake_cli pr_view "{\"headRefOid\":\"$H\"}"

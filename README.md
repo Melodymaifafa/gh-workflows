@@ -27,7 +27,7 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 ## 审核：Codex 优先，Claude 兜底（2026-09-18）
 
-每一次审核请求都先问 Codex。出现下面任一情况，**这一次**改由 Claude 只读代审，结果由 owner 的 PAT 发出（这样下一环才会被触发）：
+Codex 额度正常时，每一次审核请求都先问 Codex。出现下面任一情况，**这一次**改由 Claude 只读代审，结果由 owner 的 PAT 发出（这样下一环才会被触发）：
 
 - Codex 回复「reached your Codex usage limits」；
 - 喊了 `@codex review` 5 分钟没有 👀 也没有结论；
@@ -35,7 +35,9 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 
 **不在 runner 上等 Codex**（2026-10-11）：以前 PR 一开、一召唤，合并环节就起一个 runner 开着等 Codex 的 👍（GitHub 没有 reaction 事件），iterate 修完也开着 runner 等满 6 分钟召唤冷却。私有仓库按分钟计费，2026-10 的 1–9 号这两段等待占了约一半分钟，10 号就用完了每月 2,000 分钟的免费额度。现在 Codex 的 clean 评论照旧是事件；👍、沉默和冷却由巡检（每 5 分钟）来盯，看到了再用主人身份留标记叫醒合并环节：`codex-thumbs`（路径 F，再核一遍 👍 才合；没合上 —— 多半是当时 CI 还没绿，同一个 head 上重跑绿了也没有事件 —— 就空闲 60 分钟后再留一条，补 2 次还没合上告警 `stalled`）、`codex-silent`（路径 G，换 Claude 代审）。上面三条的「几分钟」因此按巡检的节奏算，最多晚 5 分钟。主人的 Mac 关着时由 `pr-sweeper.yml` 兜底，合并会晚几个小时。
 
-没有「Codex 已坏」的全局开关：下一轮照样先问 Codex，它额度恢复就自动接回。Claude 代审只读（Read/Glob/Grep），看不到任何密钥，结论必须是合法 JSON 才算数；空结果一律当「没审过」，绝不当「通过」。**有意见的 head 不会被合并**，唯一的例外是下面「修满轮数之后」那条路：Claude 逐条核过、点名放过的那几条意见。
+**Codex 额度用完就先不问它**（2026-10-16）：以前没有全局记录，每个新 head 都先喊一遍 `@codex review`、等它回「额度用完」再换 Claude —— linear-agent-team PR #74 上 Codex 回了 3 次同一句话，每次多等 5–10 分钟。现在巡检在任何 PR 上看到 Codex 回「额度用完」，就记进 gh-workflows 里一条主人开的 issue（最后一行 `<!-- codex-quota-state: hit=… until=… strikes=… -->`）。到 `until` 之前，巡检的 kick、修复那轮的召唤（巡检和 iterate 两处）、解冲突后的请审都不喊 Codex，改发一条带 `codex-silent` 的评论直接请 Claude 审。Codex 的回复里没有恢复时间，所以到点只试一次：又撞上就隔更久（1 / 2 / 4 / 8 小时，距上次撞上超过一天从 1 小时重来），Codex 正常审完一次（review、clean 评论或 👍）就清掉。读不到这条 issue 就按「额度正常」算。打开 PR 时 Codex 自己去审、回的那句「额度用完」拦不住，那是 Codex 应用的设置。
+
+Claude 代审只读（Read/Glob/Grep），看不到任何密钥，结论必须是合法 JSON 才算数；空结果一律当「没审过」，绝不当「通过」。**有意见的 head 不会被合并**，唯一的例外是下面「修满轮数之后」那条路：Claude 逐条核过、点名放过的那几条意见。
 
 机器之间靠藏在评论里的标记接力，只认 `github-actions[bot]` 或 OWNER 写的，`claude[bot]` 写什么都不算：
 
@@ -43,7 +45,9 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 |---|---|---|
 | `codex-review-head: H` | PAT（iterate / 巡检） | 请审 H；可带 `fix-round: N` 或 `pr-sweeper: kick` |
 | `pr-guard: conflict-merged head=H new=N` | PAT（合并环节的 resolve-conflict） | H 跟集成分支冲突，已把集成分支合进来、推成 N；后面紧跟一条请 Codex 审 N 的 M1 |
-| `pr-guard: fallback head=H` | GITHUB_TOKEN | Codex 这次不行，换 Claude |
+| `pr-guard: codex-silent head=H reason=R` | PAT（巡检 / iterate / 合并环节的 resolve-conflict） | Codex 这次不行（R = `quota` / `silent` / `timeout`），换 Claude（路径 G）。替代召唤时同一条评论还带 `codex-review-head: H`（和 `fix-round` 或 `pr-sweeper: kick`） |
+| `pr-guard: fallback head=H` | GITHUB_TOKEN | 旧标记，2026-10-16 起不再写（跟 codex-silent 说同一句话），读的地方照旧认 |
+| `codex-quota-state: hit=T until=U strikes=N` | PAT（巡检），gh-workflows 里主人开的一条 issue | Codex 审查额度：U 之前不问 Codex |
 | `claude-review-findings: H` | PAT | Claude 代审有意见（一条 COMMENT review） |
 | `claude-review-clean: H` | PAT | Claude 代审无意见，CI 绿就合 |
 | `claude-judge-clean: head=H reviews=ID,…` | PAT（iterate 的 round-cap-judge） | 修满轮数后 Claude 判定这几条 review 里的意见都不拦合并，CI 绿就合；之后在 H 上新出的 review 照样拦 |
@@ -83,7 +87,7 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 **分支在修的时候被人推过**（2026-10-07）：push 被判落后（non-fast-forward）时，拉下分支尖、把这一笔修复 rebase 上去、再推一次，只推一次，永不强推。接上去的那一版没在 runner 上重新验证（验证跑的是被审 PR 的代码，不许跟推送凭据同处一步），由 PR 自己的 CI 验，合并前必须全绿；Claude 的总结里会写明这一点。还是没推上去（冲突、拉不下来、重推又被拒）→ 告警 `findings-carried`，点名这一轮没修进去的意见。在那之前合并环节不自动合并（怎么接着修见下一段）。标记是推不上去之后才发的，所以合并前还要先看这个 PR 上有没有修复在跑（或排队），有就最多等一分钟，还在跑就这次不合 —— 免得新 head 审查通过得快，赶在旧那轮发标记之前合掉。人看过之后直接点 Merge 即可。这两种标记都只发一次，所以告警和 M7 发不出去时隔 10 / 30 / 60 秒再试；`carried-findings` 重试完还是没发出去，就再推一条手机提醒「拦合并的标记没发到 PR 上，先别让它合」，那一步红着停下。起因：wechat-mimic-finetune PR #15（2026-10-06），修复被丢、下一次复审没再报那条 P1，PR 带着 bug 合了进去。Claude 的总结评论署名 github-actions[bot]，所以发之前剥掉 HTML 注释、拆开标记关键字，免得一段被意见带偏的总结伪造出「已关掉」。
 
-**意见在推上去之前都记着账**（2026-10-08）：Gate 开修之前先发一条 `carried-findings` 标记（一行「第 N 轮开始修 review X」），有意见的 review 到的时候 head 已经变了也记一条。推上去的那一轮随 M7 发 `carried-findings-cleared` 关掉（Claude 那条路连带进来的一起关，Codex 那条路只关目标；修的是 judge 确认的 bug 时，这个 head 上 judge 核过的全部意见一起关）；主人的放行标记（M8）点了名的也算关掉。开着的意见下一轮附在 `.review/findings.md` 后面一并修。新 head 审查通过、只被这些开着的意见拦着时，没有「下一轮」会来：合并检查就用主人的 PAT 在这个 head 上补一条带 `claude-review-findings` 和 `carried-reraise` 标记的 review，iterate 照常开一轮把它们带上（那一轮失败了，这条 review 就是 head 上的意见，巡检照常重修）；标记点了这次带上的 review id，同一批意见每个 head 只补一次 —— 那一轮开修之后才记上账的意见不在它那批里，开着的意见里有没点过名的就再补一条。都点过名还拦着、没配 PAT 或者发不出去，才告警 `carried-open` 停下等人。Claude 判「都不用改」时这一轮没有推送，带进来的那几条（比如在新 head 上已经改好了）关不掉，所以复核的 judge 连它们一起判、M8 点它们的名；已有的 M8 没点到它们，就再判一次。以前只在「推不上去」之后才记，验证没过、撞额度、Claude 没跑成之后有人推一笔，或者 review 到的时候 head 已经变了，意见都会丢；合并检查也可能赶在那一笔记账之前合掉。代价：每轮多一条 PR 评论；记不上就不修、红着停下。
+**意见在推上去之前都记着账**（2026-10-08）：Gate 开修之前先发一条 `carried-findings` 标记（一行「第 N 轮开始修 review X」），有意见的 review 到的时候 head 已经变了也记一条。推上去的那一轮随 M7 发 `carried-findings-cleared` 关掉（Claude 那条路连带进来的一起关，Codex 那条路只关目标；修的是 judge 确认的 bug 时，这个 head 上 judge 核过的全部意见一起关）；主人的放行标记（M8）点了名的也算关掉。开着的意见下一轮附在 `.review/findings.md` 后面一并修。新 head 审查通过、只被这些开着的意见拦着时，没有「下一轮」会来：合并检查就用主人的 PAT 在这个 head 上补一条带 `claude-review-findings` 和 `carried-reraise` 标记的 review，iterate 照常开一轮把它们带上（那一轮失败了，这条 review 就是 head 上的意见，巡检照常重修）；标记点了这次带上的 review id，同一批意见每个 head 只补一次 —— 那一轮开修之后才记上账的意见不在它那批里，开着的意见里有没点过名的就再补一条。都点过名还拦着、没配 PAT 或者发不出去，才告警 `carried-open` 停下等人。Claude 判「都不用改」时这一轮没有推送，带进来的那几条（比如在新 head 上已经改好了）关不掉，所以复核的 judge 连它们一起判、M8 点它们的名；已有的 M8 没点到它们，就再判一次。以前只在「推不上去」之后才记，验证没过、撞额度、Claude 没跑成之后有人推一笔，或者 review 到的时候 head 已经变了，意见都会丢；合并检查也可能赶在那一笔记账之前合掉。代价：记不上就不修、红着停下。一轮只留一条评论（2026-10-16）：推上去之后 M7 就地写进开修时记账的那条，Claude 的总结再写进同一条，标记行原样留在最后；找不到或改不动才另发。
 
 审查通过却没合上时，合并环节会告警而不是只让 run 变红：`merge-refused` 是机器人的令牌没权限合（PR 开出后集成分支上的 workflow 文件被改过）——把集成分支合进 PR 分支再推上来，或手动点 Merge；`merge-failed` 是其它原因被拒，日志链接在告警里，巡检之后会再试。
 

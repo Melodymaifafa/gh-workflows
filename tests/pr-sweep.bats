@@ -21,7 +21,18 @@ setup() {
   stub "$R" "$(stub_yaml develop)"
   comments
   reviews
+  quota_state
 }
+
+QUOTA_ROUTE="repos/Melodymaifafa/gh-workflows/issues?state=open&creator=Melodymaifafa&per_page=100"
+# quota_state [hit until strikes [开 issue 的人]]：gh-workflows 里记 Codex 额度的那条 issue（#40）；不给参数 = 还没有。
+quota_state() {
+  if [ "$#" = 0 ]; then fake_route "$QUOTA_ROUTE" '[]'; return; fi
+  fake_route "$QUOTA_ROUTE" "$(jq -n --arg b "Codex 审查额度…"$'\n\n'"<!-- codex-quota-state: hit=$1 until=$2 strikes=$3 -->" \
+    --arg u "${4:-Melodymaifafa}" '[{number: 40, body: $b, user: {login: $u}}]')"
+}
+# codex_quota_at <分钟前> [id]：Codex 回的「额度用完」
+codex_quota_at() { jq --arg at "$(ago "$1")" --argjson id "${2:-5711058128}" '.created_at = $at | .id = $id' "$FIXTURES_DIR/codex/quota-comment.json"; }
 
 WF=.github/workflows
 # stub_yaml [base_branch 那一行]：合并调用桩；不给参数就不写 base_branch。
@@ -1394,4 +1405,146 @@ quota_trail() {
   GH_TOKEN="" LABEL_KEY="" run bash "$REPO_ROOT/scripts/pr-sweep.sh"
   assert_contains "$output" "repo-private"
   refute_contains "$output" "private-caller"
+}
+
+# ── Codex 额度（全局，记在 gh-workflows 的一条 issue 里） ──
+
+QUOTA_ISSUES="gh api POST repos/Melodymaifafa/gh-workflows/issues"
+QUOTA_PATCH="gh api PATCH repos/Melodymaifafa/gh-workflows/issues/40"
+claude_review_on() { gh_review "$1" Melodymaifafa OWNER "$2" "$(m3_body "$2")" "$(ago "$3")"; }
+
+@test "quota: a fresh usage-limit answer is recorded, and the head goes straight to Claude without @codex review" {
+  one_pr clean 11
+  comments "$(codex_quota_at 11)"
+  sweep
+  assert_equal "$status" 0
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 09-18 20:49 之后再试 Codex。
+
+<!-- codex-review-head: $H -->
+<!-- pr-sweeper: kick -->
+<!-- pr-guard: codex-silent head=$H reason=quota -->"
+  q=$((NOW_EPOCH - 660))
+  assert_called "$QUOTA_ISSUES" 1
+  assert_contains "$(fake_last_body "$QUOTA_ISSUES")" "<!-- codex-quota-state: hit=$q until=$((q + 3600)) strikes=1 -->"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "handed $LABEL to Claude (quota)"
+}
+
+@test "quota: while Codex is out, a fix round's head goes to Claude at once with its round, no 6-minute cooldown" {
+  no_held_runs
+  quota_state "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH + 1800))" 1
+  one_pr clean 2
+  comments "$(m7_comment 1 2 2)"
+  reviews "$(claude_review_on 4863267293 "$OTHER" 3)"
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 09-18 20:30 之后再试 Codex。
+
+<!-- codex-review-head: $H -->
+<!-- fix-round: 2 -->
+<!-- pr-guard: codex-silent head=$H reason=quota -->"
+  refute_called "gh api PATCH"
+  refute_called "$QUOTA_ISSUES"
+}
+
+@test "quota: a head handed to Claude in place of a summon is not summoned or handed again" {
+  no_held_runs
+  quota_state "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH + 1800))" 1
+  one_pr clean 3
+  comments "$(m7_comment 1 2 9)" "$(owner_comment 10 "🤖 Codex 审查额度用完了，这次请 Claude 审。"$'\n\n'"<!-- codex-review-head: $H -->"$'\n'"<!-- fix-round: 2 -->"$'\n'"<!-- pr-guard: codex-silent head=$H reason=quota -->" 3)"
+  no_reactions
+  sweep
+  refute_called "gh api POST repos/$R/issues/7/comments"
+}
+
+@test "quota: once the retry time passes, the next kick asks Codex again" {
+  quota_state "$((NOW_EPOCH - 7200))" "$((NOW_EPOCH - 60))" 1
+  one_pr clean 900
+  sweep
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
+  refute_called "gh api PATCH"
+  refute_called "$QUOTA_ISSUES"
+}
+
+@test "quota: Codex still out at the retry time doubles the wait" {
+  quota_state "$((NOW_EPOCH - 7200))" "$((NOW_EPOCH - 3600))" 1
+  one_pr clean 1
+  comments "$(summoned 3)" "$(codex_quota_at 2 11)"
+  no_reactions
+  sweep
+  q=$((NOW_EPOCH - 120))
+  assert_called "$QUOTA_PATCH" 1
+  assert_contains "$(fake_last_body "$QUOTA_PATCH")" "<!-- codex-quota-state: hit=$q until=$((q + 7200)) strikes=2 -->"
+  assert_contains "$(fake_last_body "$QUOTA_PATCH")" "北京时间 09-18 21:58 之后再试 Codex"
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 09-18 21:58 之后再试 Codex。
+
+<!-- pr-guard: codex-silent head=$H reason=quota -->"
+}
+
+@test "quota: a usage-limit answer before the retry time moves the hit, not the retry time" {
+  quota_state "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH + 1800))" 1
+  one_pr clean 5
+  comments "$(codex_quota_at 5)"
+  sweep
+  assert_called "$QUOTA_PATCH" 1
+  assert_contains "$(fake_last_body "$QUOTA_PATCH")" "<!-- codex-quota-state: hit=$((NOW_EPOCH - 300)) until=$((NOW_EPOCH + 1800)) strikes=1 -->"
+}
+
+@test "quota: a hit more than a day after the last one starts over at one hour" {
+  quota_state "$((NOW_EPOCH - 3 * 86400))" "$((NOW_EPOCH - 3 * 86400 + 28800))" 4
+  one_pr clean 5
+  comments "$(codex_quota_at 5)"
+  sweep
+  q=$((NOW_EPOCH - 300))
+  assert_contains "$(fake_last_body "$QUOTA_PATCH")" "<!-- codex-quota-state: hit=$q until=$((q + 3600)) strikes=1 -->"
+}
+
+@test "quota: a Codex clean result after the hit clears the state, and the next kick asks Codex" {
+  quota_state "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH + 1800))" 1
+  one_pr clean 20
+  comments "$(gh_comment 13 'chatgpt-codex-connector[bot]' NONE "Codex Review: Didn't find any major issues." "$(ago 20)")"
+  sweep
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
+  assert_contains "$(fake_last_body "$QUOTA_PATCH")" "Codex 审查额度正常。"
+  assert_contains "$(fake_last_body "$QUOTA_PATCH")" "<!-- codex-quota-state: hit=$((NOW_EPOCH - 1800)) until=0 strikes=0 -->"
+}
+
+@test "quota: a Codex 👍 after a summon clears the state" {
+  quota_state "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH - 60))" 1
+  one_pr clean 3
+  comments "$(summoned 8)"
+  pr_reactions "$(codex_reaction_at +1 6)"
+  summon_reactions
+  sweep
+  assert_contains "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "pr-guard: codex-thumbs head=$H"
+  assert_contains "$(fake_last_body "$QUOTA_PATCH")" "until=0 strikes=0 -->"
+}
+
+@test "quota: an issue someone else opened with the same marker is ignored" {
+  quota_state "$((NOW_EPOCH - 1800))" "$((NOW_EPOCH + 1800))" 1 mallory
+  one_pr clean 900
+  sweep
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
+  refute_called "$QUOTA_ISSUES"
+}
+
+@test "quota: dry mode only says what it would record" {
+  export SWEEP_MODE=dry
+  one_pr clean 11
+  comments "$(codex_quota_at 11)"
+  sweep
+  refute_writes
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "Codex 额度：Codex 审查额度用完了"
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "would hand $LABEL to Claude (quota)"
+}
+
+@test "quota: an unreadable state counts as normal and is never written back" {
+  fake_route_fail "$QUOTA_ROUTE" 1
+  one_pr clean 900
+  sweep
+  assert_equal "$status" 0
+  assert_contains "$output" "读不到 Codex 额度状态"
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
+  refute_called "$QUOTA_ISSUES"
+  refute_called "gh api PATCH"
 }

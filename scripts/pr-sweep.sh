@@ -27,6 +27,12 @@
 #   5. 其余              → 没人碰过且空闲 ≥ 10 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
 #                          每个 head 最多 3 次、间隔 ≥ 60 分钟；然后告警一次 stalled；然后 7 天内每天一次。
 #
+# Codex 额度（全局，所有仓库共用一个 ChatGPT 账号）：任何 PR 上 Codex 回了「额度用完」就记下来，
+# 到「再试」的时间之前，6a 的召唤和规则 5 的 kick 都不喊 @codex review，直接请 Claude 审（同一条
+# 评论带上召唤的标记和 codex-silent，合并检查走路径 G）。Codex 的回复里没有恢复时间，所以到点只
+# 试一次：又撞上就隔更久（1 / 2 / 4 / 8 小时），Codex 正常审完一次就清掉。状态记在 $OWNER/gh-workflows
+# 一条主人开的 issue 里（最后一行标记），iterate 和合并工作流召唤前也读它。读不到就按「额度正常」算。
+#
 # 环境变量：
 #   OWNER            仓库 owner（必填）
 #   SWEEP_MODE       off | dry | live。dry 只把「会做什么」写进 $GITHUB_STEP_SUMMARY，不写任何东西。
@@ -109,6 +115,7 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 | [ $now - $last,
     (if any($tc[]; has("<!-- codex-review-head: " + $h + " -->")
           or has("<!-- pr-guard: fallback head=" + $h + " ")
+          or has("<!-- pr-guard: codex-silent head=" + $h + " ")
           or has("<!-- claude-review-clean: " + $h + " -->")
           or has("<!-- claude-judge-clean: head=" + $h + " "))
         or any($tr[]; has("claude-review-findings: " + $h)) then 1 else 0 end),
@@ -141,7 +148,11 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     # 这次召唤才到也常见，那只算有动静（召唤之后的评论数、review 数），不算结论（Codex 2026-10-11 的 P2）。
     ([$r[] | select(.user.login == $codex and .commit_id == $h and (.submitted_at | ts) >= $summon.at)]
       + [$c[] | select(.user.login == $codex and (.created_at | ts) >= $summon.at and has("find any major issues") and reviewed_h)]
-      | length)
+      | length),
+    # 全局额度状态的证据（不分 head）：Codex 最近一次回「额度用完」，和最近一次正常审完（review 或 clean 评论）。
+    ([$c[] | select(.user.login == $codex and has("reached your Codex usage limits")) | .created_at | ts] | max // 0),
+    ([$r[] | select(.user.login == $codex) | .submitted_at | ts]
+      + [$c[] | select(.user.login == $codex and has("find any major issues")) | .created_at | ts] | max // 0)
   ] | @tsv
 '
 
@@ -180,6 +191,88 @@ integration_base() {
   return 3
 }
 
+# ── Codex 额度（全局）──
+# $quota_file 一行：issue 号（0 = 还没建）、最后一次撞上的时间、再试的时间、连续撞上几次。
+# sweep_pr 跑在子 shell 里，所以状态放文件，不放变量。
+quota_repo="$OWNER/gh-workflows"
+quota_file="$tmp/codex-quota"
+quota_known=1
+# shellcheck disable=SC2016  # jq 程序
+quota_jq='[.[] | select((.pull_request | not) and .user.login == $o)
+    | {n: .number, m: ((.body // "") | capture("<!-- codex-quota-state: hit=(?<h>[0-9]+) until=(?<u>[0-9]+) strikes=(?<s>[0-9]+) -->"))}]
+  | first | if . == null then "0 0 0 0" else "\(.n) \(.m.h) \(.m.u) \(.m.s)" end'
+
+# 只认主人开的 issue：仓库是 public，谁都能开一条带同样标记的 issue。
+load_quota() {
+  local issues
+  if issues="$(gh api "repos/$quota_repo/issues?state=open&creator=$OWNER&per_page=100" 2>/dev/null)" &&
+    jq -r --arg o "$OWNER" "$quota_jq" <<<"$issues" >"$quota_file" 2>/dev/null; then
+    :
+  else
+    quota_known=0
+    echo "0 0 0 0" >"$quota_file"
+    echo "::warning::读不到 Codex 额度状态（${quota_repo} 的 issue），这一轮按「额度正常」算，也不写回"
+  fi
+  cp "$quota_file" "$tmp/codex-quota.loaded"
+}
+
+quota_backoff() { case "$1" in 1) echo 3600 ;; 2) echo 7200 ;; 3) echo 14400 ;; *) echo 28800 ;; esac; }
+
+# beijing <epoch>：北京时间 MM-DD HH:MM（macOS 的 date 没有 -d，用 jq）。
+beijing() { jq -nr --argjson t "$(($1 + 28800))" '$t | strftime("%m-%d %H:%M")'; }
+
+# note_quota <最近一次「额度用完」的时间> <最近一次 Codex 正常审完的时间>：把一个 PR 上看到的证据并进全局状态。
+note_quota() {
+  local q="$1" ok="$2" qi qh qu qs
+  read -r qi qh qu qs <"$quota_file"
+  if [ "$q" -gt "$qh" ]; then
+    # 上次撞上已经是一天多以前：新的一段，从头算。
+    [ $((q - qh)) -le 86400 ] || qs=0
+    # 到了再试的时间还撞上 = 试过一次没恢复，下次隔更久。没到时间的那些（打开 PR 时 Codex 自己去审、
+    # 回的「额度用完」）只更新最后一次撞上的时间。
+    if [ "$q" -ge "$qu" ]; then
+      qs=$((qs + 1))
+      qu=$((q + $(quota_backoff "$qs")))
+    fi
+    qh="$q"
+  fi
+  # 撞上之后 Codex 又正常审完了一次：额度回来了。
+  if [ "$ok" -gt "$qh" ] && [ "$qs" -gt 0 ]; then qs=0 qu=0; fi
+  echo "$qi $qh $qu $qs" >"$quota_file"
+}
+
+codex_out() {
+  local qi qh qu qs
+  read -r qi qh qu qs <"$quota_file"
+  [ "$now" -lt "$qu" ]
+}
+
+# save_quota：状态变了才写回 issue（没有就开一条）。dry 只写进 run 摘要；读不到状态时不写，免得开出第二条。
+save_quota() {
+  cmp -s "$quota_file" "$tmp/codex-quota.loaded" && return 0
+  local qi qh qu qs state body
+  read -r qi qh qu qs <"$quota_file"
+  if [ "$now" -lt "$qu" ]; then
+    state="Codex 审查额度用完了。北京时间 $(beijing "$qu") 之后再试 Codex；在那之前，所有审查直接交给 Claude。"
+  elif [ "$qs" -gt 0 ]; then
+    state="Codex 审查额度到了再试的时间，下一次审查先试 Codex。"
+  else
+    state="Codex 审查额度正常。"
+  fi
+  summary "- Codex 额度：${state}"
+  [ "$MODE" = live ] && [ "$quota_known" = 1 ] || return 0
+  body="${state}"$'\n\n'"这条 issue 由 PR 巡检（scripts/pr-sweep.sh）自动维护：Codex 回「额度用完」就记下，到点再试一次，试通了就清掉。别关，也别改最后那行。"$'\n\n'"<!-- codex-quota-state: hit=$qh until=$qu strikes=$qs -->"
+  if [ "$qi" = 0 ]; then
+    # 还没有 issue、Codex 眼下也没被拦着（比如只看到一条早就过了再试时间的旧回复）：不值得开一条。
+    [ "$now" -lt "$qu" ] || return 0
+    gh api -X POST "repos/$quota_repo/issues" -f "title=Codex 审查额度（PR 巡检维护）" -f "body=$body" --silent ||
+      echo "::warning::Codex 额度状态写不进 ${quota_repo}（开 issue 失败）"
+  else
+    gh api -X PATCH "repos/$quota_repo/issues/$qi" -f "body=$body" --silent ||
+      echo "::warning::Codex 额度状态写不进 ${quota_repo}（改 issue 失败）"
+  fi
+}
+
 # 下面这些函数读 sweep_pr 设的 repo / n / H / alerts / url / who / hs。
 # who / hs 是日志用的：公开仓库 "owner/名#N" 和 " (sha7)"，私有仓库只有标签、hs 为空。
 post_comment() {
@@ -212,6 +305,7 @@ alert_once() {
 }
 
 kick() {
+  if codex_out; then hand_to_claude quota "<!-- codex-review-head: $H -->" "<!-- pr-sweeper: kick -->"; return 0; fi
   if [ "$MODE" = dry ]; then summary "- would kick $who$hs $1"; return 0; fi
   head_unchanged || return 0
   post_comment "@codex review"$'\n\n'"<!-- codex-review-head: $H -->"$'\n'"<!-- pr-sweeper: kick -->"
@@ -263,18 +357,27 @@ wake_merge() {
   summary "- woke the merge check $who$hs"
 }
 
-# hand_to_claude <quota|silent|timeout>：Codex 没接这次召唤，留路径 G 的标记，合并检查换 Claude 代审。
+# hand_to_claude <quota|silent|timeout> [标记行…]：留路径 G 的标记，合并检查换 Claude 代审。合并检查
+# 不再另发一条「换 Claude」，PR 上就这一句。Codex 额度还没恢复时，召唤和 kick 也走这里，多带的
+# 标记行（codex-review-head 加 fix-round 或 kick）让这条评论同时算这个 head 的一次审查请求。
 hand_to_claude() {
-  local why
-  case "$1" in
-    quota) why="Codex 额度用完" ;;
-    silent) why="5 分钟没任何回应" ;;
-    *) why="20 分钟没出结论" ;;
+  local reason="$1" msg body line qi qh qu qs
+  shift
+  case "$reason" in
+    quota)
+      read -r qi qh qu qs <"$quota_file"
+      msg="🤖 Codex 审查额度用完了，这次请 Claude 审。"
+      [ "$now" -ge "$qu" ] || msg+="北京时间 $(beijing "$qu") 之后再试 Codex。"
+      ;;
+    silent) msg="🤖 Codex 5 分钟没回应，这次请 Claude 审。" ;;
+    *) msg="🤖 Codex 20 分钟没出结论，这次请 Claude 审。" ;;
   esac
-  if [ "$MODE" = dry ]; then summary "- would hand $who$hs to Claude ($1)"; return 0; fi
+  if [ "$MODE" = dry ]; then summary "- would hand $who$hs to Claude ($reason)"; return 0; fi
   head_unchanged || return 0
-  post_comment "🤖 巡检：Codex 没接这次审查（${why}），请合并检查换 Claude 代审。"$'\n\n'"<!-- pr-guard: codex-silent head=$H reason=$1 -->"
-  summary "- handed $who$hs to Claude ($1)"
+  body="$msg"$'\n'
+  for line in "$@" "<!-- pr-guard: codex-silent head=$H reason=$reason -->"; do body+=$'\n'"$line"; done
+  post_comment "$body"
+  summary "- handed $who$hs to Claude ($reason)"
 }
 
 # approve_held_runs：GitHub 把本流水线推的提交上的 CI 扣成 action_required、等人点批准时（MEL-292），
@@ -323,12 +426,15 @@ sweep_pr() {
 
   local facts idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
   local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded thumbs eyes
+  local quota_seen codex_ok_seen
   facts="$(jq -rn --slurpfile pr "$tmp/pr.json" --slurpfile cs "$tmp/comments.json" --slurpfile rs "$tmp/reviews.json" \
     --arg h "$H" --arg now "$now" --arg codex 'chatgpt-codex-connector[bot]' "$facts_jq")"
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
     until_active until_passed fix_reason state merged total_retries judged judged_reviews \
-    summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded <<<"$facts"
+    summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded \
+    quota_seen codex_ok_seen <<<"$facts"
   echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
+  note_quota "$quota_seen" "$codex_ok_seen"
 
   # 0. 没人管：不叫审、不重修，告警一次。空闲 60 分钟再告，给人留时间改 base 或关掉。
   if [ "$watched" = 0 ]; then
@@ -402,8 +508,11 @@ sweep_pr() {
   fi
 
   # 6a. 修复那一轮推了 head、还没召唤：iterate 不再在 runner 上等 6 分钟冷却，冷却过了由这里召唤。
+  #     Codex 额度没恢复就不召唤、不等冷却，直接请 Claude 审（带上 fix-round，轮数照样累加）。
   if [ "$summon_at" = 0 ] && [ "$m7_round" -gt 0 ]; then
-    if [ $((now - last_review_at)) -ge 360 ]; then
+    if codex_out; then
+      hand_to_claude quota "<!-- codex-review-head: $H -->" "<!-- fix-round: $m7_round -->"
+    elif [ $((now - last_review_at)) -ge 360 ]; then
       summon_fix_round "$m7_round"
     else
       echo "  等召唤冷却"
@@ -417,6 +526,8 @@ sweep_pr() {
     thumbs="$(codex_reaction +1 "$summon_at")"
     eyes="$(codex_reaction eyes "$summon_at")"
     if [ "$thumbs" = 1 ]; then
+      # 👍 也算 Codex 正常审完了一次（额度回来了）。
+      note_quota 0 "$summon_at"
       # 叫醒的那次没合上（CI 红了又在同一个 head 上重跑绿了、当时还没跑完、一时合不了）：调用桩
       # 不接 CI 跑完的事件，同一个 head 上再没有什么会叫醒合并检查。所以同 4b，空闲 60 分钟再叫。
       # CI 还红着的那种在规则 2 就停车了，到不了这里。
@@ -473,6 +584,7 @@ repos="$(gh api --paginate --slurp "user/repos?affiliation=owner&per_page=100" |
     | "\(.full_name):\(.private == true):\(.default_branch)"')"
 
 summary "### PR 巡检（${MODE}）"
+load_quota
 failed=0 unreadable=0 unreadable_labels="" unonboarded=0 unonboarded_labels=""
 for entry in $repos; do
   # 仓库名和分支名都不含 : 和空白。
@@ -530,6 +642,7 @@ for entry in $repos; do
     [ "$rc" = 0 ] || { echo "::warning::$pr_label 巡检出错（exit ${rc}）"; failed=1; }
   done
 done
+save_quota
 if [ "$unreadable" -gt 0 ]; then
   echo "::warning::$unreadable 个仓库读不到合并调用桩，按旧规则只扫默认分支是 develop 的（多半是 CODEX_TRIGGER_TOKEN 缺 Contents 权限）：${unreadable_labels# }"
 fi

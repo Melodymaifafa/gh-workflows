@@ -204,10 +204,11 @@ jobs:
             [ "$found" = true ]
           }
 
-          # Codex 审不了这次请求：真人触发时留 M2 并交给 claude-review job；
-          # bot 触发时什么都不发，由巡检用主人身份重新请求。
+          # Codex 审不了这次请求：真人触发时交给 claude-review job；bot 触发时什么都不发，由巡检用
+          # 主人身份重新请求。不再另发一条「换 Claude 代审」（M2）：叫醒这里的那条 codex-silent 评论
+          # 已经说了同一句话，PR 上两个角色各说一遍（2026-10-16 linear-agent-team PR #74）。
           fallback() {
-            local reason="$1" live_head note
+            local reason="$1" live_head
             live_head="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)"
             if [ "$live_head" != "$expected_head" ]; then
               echo "::notice::PR head changed before the Claude fallback; skipping"
@@ -230,11 +231,6 @@ jobs:
               echo "head=$expected_head"
               echo "reason=$reason"
             } >>"$GITHUB_OUTPUT"
-            printf -v note \
-              '🤖 Codex 这次审不了（额度用完/没回应），换 Claude 代审。\n\n<!-- pr-guard: fallback head=%s reason=%s -->' \
-              "$expected_head" "$reason"
-            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$note" \
-              >/dev/null || echo "::warning::Could not post the fallback note"
             echo "::notice::Codex unavailable ($reason); Claude reviews $expected_head"
             exit 0
           }
@@ -1120,7 +1116,7 @@ jobs:
             if [ "$verdict" = findings ]; then
               body="$(
                 jq -r --arg head "$HEAD_SHA" "$sanitize"'
-                  "### 🤖 Claude 代审（Codex 本次不可用）\n\n"
+                  "### 🤖 Claude 审查\n\n"
                   + (.summary_zh | clean(400)) + "\n\n"
                   + ([.findings[:10][] | item] | join("\n"))
                   + "\n\n<!-- claude-review-findings: " + $head + " -->"
@@ -1133,7 +1129,7 @@ jobs:
             else
               body="$(
                 jq -r --arg head "$HEAD_SHA" "$sanitize"'
-                  "🤖 Claude 代审：没发现要改的问题（Codex 本次不可用）。CI 全绿后自动合并。"
+                  "🤖 Claude 审查：没发现要改的问题。CI 全绿后自动合并。"
                   + (if (.findings | length) > 0
                      then "\n\n可选建议（不影响合并）：\n"
                        + ([.findings[:10][] | item] | join("\n"))
@@ -1766,11 +1762,23 @@ jobs:
           else
             body+=$'\n\n'"git 自己就合上了，没有要人判断的地方。"
           fi
-          body+=$'\n\n'"合出来的这一版要等 CI 跑绿、Codex 再审一遍，都过了才会照常自动合并。"
+          body+=$'\n\n'"合出来的这一版要等 CI 跑绿、再审一遍，都过了才会照常自动合并。"
           body+=$'\n\n'"<!-- pr-guard: conflict-merged head=$HEAD_SHA new=$new_head -->"
           gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null ||
             echo "::warning::Could not post the merge note"
-          # 请 Codex 审合出来的这一版：跟巡检的请求同一个格式，单独一条。
-          gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
-            -f body="@codex review"$'\n\n'"<!-- codex-review-head: $new_head -->" >/dev/null ||
-            echo "::warning::Could not ask Codex for a review; the sweeper asks again later"
+          # 请 Codex 审合出来的这一版：跟巡检的请求同一个格式，单独一条。Codex 额度没恢复（巡检记在
+          # gh-workflows 的 issue 里，同 iterate 的召唤那一步）就直接请 Claude 审：同一条评论带上
+          # codex-silent，叫醒本 workflow 的路径 G。读不到就按额度正常算。
+          owner="${REPO%%/*}"
+          quota_until="$(gh api "repos/$owner/gh-workflows/issues?state=open&creator=$owner&per_page=100" --jq "
+            [.[] | select((.pull_request | not) and .user.login == \"$owner\") | (.body // \"\")
+              | capture(\"<!-- codex-quota-state: hit=[0-9]+ until=(?<u>[0-9]+) \").u | tonumber] | max // 0" 2>/dev/null)" ||
+            quota_until=0
+          [[ "$quota_until" =~ ^[0-9]+$ ]] || quota_until=0
+          request="@codex review"$'\n\n'"<!-- codex-review-head: $new_head -->"
+          if [ "$(date +%s)" -lt "$quota_until" ]; then
+            request="🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 $(date -u -d "@$((quota_until + 28800))" '+%m-%d %H:%M') 之后再试 Codex。"
+            request+=$'\n\n'"<!-- codex-review-head: $new_head -->"$'\n'"<!-- pr-guard: codex-silent head=$new_head reason=quota -->"
+          fi
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$request" >/dev/null ||
+            echo "::warning::Could not request a review; the sweeper asks again later"

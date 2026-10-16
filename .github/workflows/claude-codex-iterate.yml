@@ -1504,7 +1504,26 @@ jobs:
             # 全失败照旧只警告：推已经成功了，为一条评论打红会让后面召唤复审跟着被跳过。
             # 再试也一样的错就不再试，限流照样重试（判据同 alert_once，两处逐字一样）。
             m7_posted=''
+            # 一轮一条评论（2026-10-16，linear-agent-team PR #74 一轮发了三条：开始修 / 已推送 / 总结）：
+            # Gate 开修时记账的那条（carried-findings review=目标 from=审的 head）就地改成这一条，记账的
+            # 标记原样留着；Claude 那条路的总结再写进同一条。找不到、改不动就照旧另发一条。
+            ledger_id=''
+            if [[ "${TARGET_REVIEW:-}" =~ ^[0-9]+$ ]] && [[ "${REVIEWED_HEAD:-}" =~ ^[0-9a-f]{40}$ ]]; then
+              ledger_id="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --jq ".[]
+                | select(.user.login == \"github-actions[bot]\" and ((.body // \"\")
+                  | contains(\"<!-- pr-guard: carried-findings review=$TARGET_REVIEW from=$REVIEWED_HEAD -->\"))) | .id" 2>/dev/null |
+                tail -n 1)" || ledger_id=''
+            fi
+            if [[ "$ledger_id" =~ ^[0-9]+$ ]] &&
+              ledger_marks="$(gh api "repos/$REPO/issues/comments/$ledger_id" --jq .body 2>/dev/null | grep -E '^<!-- .* -->$')" &&
+              gh api -X PATCH "repos/$REPO/issues/comments/$ledger_id" \
+                -f body="${m7%%$'\n\n'*}"$'\n\n'"$ledger_marks"$'\n'"${m7#*$'\n\n'}" --silent >/dev/null 2>&1
+            then
+              m7_posted=1
+              echo "fix-round marker for $new_head written into the pending note of review $TARGET_REVIEW"
+            fi
             for pause in 0 10 30 60; do
+              [ -z "$m7_posted" ] || break
               [ "$pause" -eq 0 ] || { echo "fix-round marker for $new_head not posted; retrying in ${pause}s"; sleep "$pause" || true; }
               if m7_err="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$m7" 2>&1 >/dev/null)"; then
                 m7_posted=1
@@ -2094,6 +2113,9 @@ jobs:
           ROUND: ${{ steps.gate.outputs.round }}
           # 推上去之后关掉哪几条 review：这一轮的目标，加上一并交给 Claude 的以前没修完的那几条。
           CLOSES: ${{ steps.gate.outputs.closes }},${{ steps.gate.outputs.carried }}
+          # 开修时记账的那条评论就地改成 M7（一轮一条评论）。
+          TARGET_REVIEW: ${{ steps.gate.outputs.target }}
+          REVIEWED_HEAD: ${{ steps.gate.outputs.head }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
@@ -2128,6 +2150,8 @@ jobs:
           STRUCTURED: ${{ steps.fix.outputs.structured_output }}
           PUSHED: ${{ steps.claude_push.outputs.pushed }}
           REBASED: ${{ steps.claude_push.outputs.rebased }}
+          NEW_HEAD: ${{ steps.claude_push.outputs.head }}
+          ROUND: ${{ steps.gate.outputs.round }}
           EXEC_FILE: ${{ steps.fix.outputs.execution_file }}
           CLAUDE_MODEL: ${{ inputs.claude_model }}
           CLAUDE_EFFORT: ${{ inputs.claude_effort }}
@@ -2218,6 +2242,23 @@ jobs:
 
           if ! command -v gh >/dev/null 2>&1; then
             echo '::warning::gh is not available from a write-protected PATH entry; skipping the PR comment'
+            exit 0
+          fi
+          # 一轮一条评论：推上去了，就把总结写进这一轮的 M7 评论（推送那一步发的，或它就地改过的开修
+          # 记账那条），那条评论里的标记行原样留在最后。找不到、改不动就照旧另发一条。
+          m7_id=''
+          if [ "${PUSHED:-}" = true ] && [[ "${NEW_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] && [[ "${ROUND:-}" =~ ^[0-9]+$ ]]; then
+            m7_id="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --jq ".[]
+              | select(.user.login == \"github-actions[bot]\" and ((.body // \"\")
+                | contains(\"<!-- pr-guard: fix-round head=$NEW_HEAD round=$ROUND -->\"))) | .id" 2>/dev/null |
+              tail -n 1)" || m7_id=''
+          fi
+          if [[ "$m7_id" =~ ^[0-9]+$ ]] &&
+            m7_marks="$(gh api "repos/$REPO/issues/comments/$m7_id" --jq .body 2>/dev/null | grep -E '^<!-- .* -->$')" &&
+            gh api -X PATCH "repos/$REPO/issues/comments/$m7_id" \
+              -f body="🤖 自动修复第 $ROUND 轮已推送。"$'\n\n'"$body"$'\n\n'"$m7_marks" --silent >/dev/null 2>&1
+          then
+            echo "the summary was written into the round's comment $m7_id"
             exit 0
           fi
           printf '%s\n' "$body" |
@@ -3086,6 +3127,9 @@ jobs:
           FIX_PUSH_GUARD: ${{ steps.push_guard.outputs.push }}
           # 只关这一轮的目标：Codex 的补丁请求里没有以前没修完的那几条，推上去也不算处理过。
           CLOSES: ${{ steps.gate.outputs.closes }}
+          # 开修时记账的那条评论就地改成 M7（一轮一条评论）。
+          TARGET_REVIEW: ${{ steps.gate.outputs.target }}
+          REVIEWED_HEAD: ${{ steps.gate.outputs.head }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
@@ -3227,6 +3271,25 @@ jobs:
             done
           }
           reviewed_epoch="$(date -d "$REVIEWED_AT" +%s)"
+
+          # Codex 额度没恢复（巡检记在 $owner/gh-workflows 一条主人开的 issue 里，见 scripts/pr-sweep.sh）：
+          # 不喊 @codex review、也不等下面的冷却，直接请 Claude 审。同一条评论带上召唤的标记（fix-round
+          # 照样算轮数）和 codex-silent（叫醒合并检查的路径 G）。读不到就按额度正常算，照旧召唤 Codex。
+          owner="${REPO%%/*}"
+          quota_until="$(gh api "repos/$owner/gh-workflows/issues?state=open&creator=$owner&per_page=100" --jq "
+            [.[] | select((.pull_request | not) and .user.login == \"$owner\") | (.body // \"\")
+              | capture(\"<!-- codex-quota-state: hit=[0-9]+ until=(?<u>[0-9]+) \").u | tonumber] | max // 0" 2>/dev/null)" ||
+            quota_until=0
+          [[ "$quota_until" =~ ^[0-9]+$ ]] || quota_until=0
+          if [ "$(date +%s)" -lt "$quota_until" ]; then
+            approve_held_runs 1
+            printf -v request_body \
+              '🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 %s 之后再试 Codex。\n\n<!-- codex-review-head: %s -->\n<!-- fix-round: %s -->\n<!-- pr-guard: codex-silent head=%s reason=quota -->' \
+              "$(date -u -d "@$((quota_until + 28800))" '+%m-%d %H:%M')" "$head_sha" "$FIX_ROUND" "$head_sha"
+            comment_url="$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$request_body")"
+            echo "Codex is out of review quota; asked Claude to review round $FIX_ROUND ($comment_url)"
+            exit 0
+          fi
 
           # 召唤距上轮 review 至少 6 分钟：实测（2026-07-15 PR #54/#62）连发数次后
           # Codex 会限流静默。不够 6 分钟就不在 runner 上干等（等的每一分钟都计费，2026-10
