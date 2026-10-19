@@ -20,8 +20,8 @@ Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有�
 |---|---|---|
 | `ci.yml` | 每个 PR、推送到 main/develop | 装依赖 → lint → 测试 |
 | `claude-codex-iterate.yml` | Codex 或 Claude 代审提交意见后 | 选一个 fixer 读意见、只改代码；验证、push、发中文总结由不带凭据/带凭据的独立步骤接手，然后召唤复审；最多连修 3 轮，修满还有意见就让 Claude 逐条判断剩下的意见拦不拦合并（见下方「修满轮数之后」）。默认 Claude 先上，撞额度/限流/认证失效才换 Codex 接手 |
-| `codex-approved-merge.yml` | Codex 的 clean 评论 / 巡检看到 Codex 👍 或没回应 / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 / 巡检发现冲突 | 只看一眼、不在 runner 上等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop）。跟集成分支冲突就先把它合进 PR 分支（见下方「冲突」） |
-| `pr-sweeper.yml` | 定时（cron 写每 15 分钟，实测 2–7 小时一次；只在本仓库跑）。主力是主人 Mac 上每 5 分钟的 `scripts/pr-sweep-local.sh` | 扫 owner 名下所有仓库，集成分支取各仓库调用桩的 `base_branch`；替合并环节盯 Codex 的 👍 和沉默，修复那轮冷却过了再叫审；给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
+| `codex-approved-merge.yml` | Codex 的 clean 评论 / 巡检看到 Codex 👍、审查摘要审完或没回应 / Claude 代审通过 / 修满轮数后 Claude 判定剩下的意见不拦合并 / 巡检发现冲突 | 只看一眼、不在 runner 上等 Codex；Codex 不行就换 Claude 代审这一次。审核无意见 + CI 全绿，自动 squash 合入调用桩 `base_branch` 指定的分支（默认 develop）。跟集成分支冲突就先把它合进 PR 分支（见下方「冲突」） |
+| `pr-sweeper.yml` | 定时（cron 写每 15 分钟，实测 2–7 小时一次；只在本仓库跑）。主力是主人 Mac 上每 5 分钟的 `scripts/pr-sweep-local.sh` | 扫 owner 名下所有仓库，集成分支取各仓库调用桩的 `base_branch`；替合并环节盯 Codex 的 👍、审查摘要和沉默，修复那轮冷却过了再叫审；给没人管的 PR 重新叫审、重修，卡住就推一次手机通知 |
 | `ff-main.yml` | 每月 1 / 15 号 09:00，也可手动点 | 把 main 快进到 develop 上「泡够 7 天」的那个位置。CI 不全绿就跳过并推手机通知；分叉了直接拒绝 |
 | `move-v1.yml` | 每天 09:47（北京时间），也可手动点（只在本仓库跑） | 把 `v1` 标签移到 develop 上 CI 全绿的最新提交 —— 各仓库钉的是 `@v1`，这一步就是发布。移了推一条手机通知（带了哪些 PR、怎么回滚）；只往前挪 |
 
@@ -33,7 +33,9 @@ Codex 额度正常时，每一次审核请求都先问 Codex。出现下面任�
 - 喊了 `@codex review` 5 分钟没有 👀 也没有结论；
 - 20 分钟这个 head 还没有结论（晚到的、审上一个 head 的 review / clean 评论不算）。
 
-**不在 runner 上等 Codex**（2026-10-11）：以前 PR 一开、一召唤，合并环节就起一个 runner 开着等 Codex 的 👍（GitHub 没有 reaction 事件），iterate 修完也开着 runner 等满 6 分钟召唤冷却。私有仓库按分钟计费，2026-10 的 1–9 号这两段等待占了约一半分钟，10 号就用完了每月 2,000 分钟的免费额度。现在 Codex 的 clean 评论照旧是事件；👍、沉默和冷却由巡检（每 5 分钟）来盯，看到了再用主人身份留标记叫醒合并环节：`codex-thumbs`（路径 F，再核一遍 👍 才合；没合上 —— 多半是当时 CI 还没绿，同一个 head 上重跑绿了也没有事件 —— 就空闲 60 分钟后再留一条，补 2 次还没合上告警 `stalled`）、`codex-silent`（路径 G，换 Claude 代审）。上面三条的「几分钟」因此按巡检的节奏算，最多晚 5 分钟。主人的 Mac 关着时由 `pr-sweeper.yml` 兜底，合并会晚几个小时。
+**不在 runner 上等 Codex**（2026-10-11）：以前 PR 一开、一召唤，合并环节就起一个 runner 开着等 Codex 的 👍（GitHub 没有 reaction 事件），iterate 修完也开着 runner 等满 6 分钟召唤冷却。私有仓库按分钟计费，2026-10 的 1–9 号这两段等待占了约一半分钟，10 号就用完了每月 2,000 分钟的免费额度。现在 Codex 的 clean 评论照旧是事件；👍、沉默和冷却由巡检（每 5 分钟）来盯，看到了再用主人身份留标记叫醒合并环节：`codex-thumbs`（路径 F，再核一遍 👍 才合；没合上 —— 多半是当时 CI 还没绿，同一个 head 上重跑绿了也没有事件 —— 就空闲 60 分钟后再留一条，补 2 次还没合上告警 `stalled`）、`codex-silent`（路径 G，换 Claude 代审）、`codex-summary`（路径 H，见下一段）。上面三条的「几分钟」因此按巡检的节奏算，最多晚 5 分钟。主人的 Mac 关着时由 `pr-sweeper.yml` 兜底，合并会晚几个小时。
+
+**Codex 审查摘要审完就算审过**（2026-10-19）：Codex 打开 PR 时自己审，审完没意见只把那条「Codex Review Summary」评论原地改成 Completed，不发 clean 评论、不点 👍。以前巡检和合并检查都认不出这个结论，空闲 10 分钟就再喊一遍 `@codex review`：每个干净的 PR 白花一次 Codex 额度，晚合约 13 分钟（CodexBridge PR #8）。现在巡检读摘要里机器读的状态行：当前 head 审完满 2 分钟、没意见，就留 `codex-summary` 标记叫醒合并检查（路径 H，它再核一遍摘要才合）；摘要显示 Codex 正在审时也不重叫，20 分钟还在审才当卡住。只认 Codex 本人发的摘要。两边的判据各写一份（合并检查不检出任何代码），改一边要改另一边。
 
 **Codex 额度用完就先不问它**（2026-10-16）：以前没有全局记录，每个新 head 都先喊一遍 `@codex review`、等它回「额度用完」再换 Claude —— linear-agent-team PR #74 上 Codex 回了 3 次同一句话，每次多等 5–10 分钟。现在巡检在任何 PR 上看到 Codex 回「额度用完」，就记进 gh-workflows 里一条主人开的 issue（最后一行 `<!-- codex-quota-state: hit=… until=… strikes=… -->`）。到 `until` 之前，巡检的 kick、修复那轮的召唤（巡检和 iterate 两处）、解冲突后的请审都不喊 Codex，改发一条带 `codex-silent` 的评论直接请 Claude 审。Codex 的回复里没有恢复时间，所以到点只试一次：又撞上就隔更久（1 / 2 / 4 / 8 小时，距上次撞上超过一天从 1 小时重来），Codex 正常审完一次（review、clean 评论或 👍）就清掉。读不到这条 issue 就按「额度正常」算。打开 PR 时 Codex 自己去审、回的那句「额度用完」拦不住，那是 Codex 应用的设置。
 

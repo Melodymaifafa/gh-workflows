@@ -21,8 +21,12 @@
 #      b. 最近一次召唤之后 Codex 点了 👍    → 留 codex-thumbs 标记叫醒合并检查（路径 F），每次召唤一条；
 #                                             没合上（多半是当时 CI 还没绿）就空闲 ≥ 60 分钟再留一条，
 #                                             最多补 2 次，之后告警一次 stalled。
+#      d. Codex 审查摘要显示 H 审完、没意见 → 审完满 2 分钟就留 codex-summary 标记叫醒合并检查（路径 H），补叫同 b。
+#                                             打开 PR 时的自动审查审完没意见只改这条摘要，不发 clean 评论、不点 👍。
+#                                             H 上已有 Codex 的 clean 评论（它自己叫醒过路径 C）就算叫过一次。不再重审。
 #      c. Codex 没接这次召唤                → 额度用完马上、5 分钟没任何回应、或 20 分钟 head 上没结论（审它的 clean 评论 / review）时，
 #                                             留 codex-silent 标记让合并检查换 Claude 代审（路径 G），每次召唤一条。
+#      e. 摘要显示 Codex 正在审 H           → 等它，不重审；20 分钟还在审就当卡住，交给规则 5。
 #      带 M7 的 head（本流水线自己推的）上被 GitHub 扣住等批准的 CI，顺手批掉。
 #   5. 其余              → 没人碰过且空闲 ≥ 10 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
 #                          每个 head 最多 3 次、间隔 ≥ 60 分钟；然后告警一次 stalled；然后 7 天内每天一次。
@@ -85,6 +89,16 @@ def has($s): (.body // "") | contains($s);
 # Codex clean 评论审的是不是 H：同合并检查的路径 C，取第一行 **Reviewed commit:** `前缀`，H 以它开头才算。
 def reviewed_h: [(.body // "") | split("\n")[] | capture("^\\*\\*Reviewed commit:\\*\\* `(?<c>[0-9a-f]{7,40})`").c]
     | (first // "") as $pre | $pre != "" and ($h | startswith($pre));
+# Codex 审查摘要：Codex 在 PR 上开、之后原地改的那条评论，第二行 codex-review-state:v1 后面是机器读的状态。
+# 只认 Codex 本人（登录名 + Bot 类型）：OWNER / github-actions 贴一份同样的文字不算（同 M8，Codex 2026-10-04 的 P1）。
+# 读不出状态就当没有。合并检查的路径 H（codex_summary_clean）是同一套判据，改这里要一起改。
+def summary_state: select(.user.login == $codex and .user.type == "Bot" and has("<!-- codex-pull-request-review-summary -->"))
+    | [(.body // "") | capture("<!-- codex-review-state:v1 (?<s>\\{.*\\}) -->").s | try fromjson catch empty] | first // empty;
+def summary_on_h: (.code_review.commit_sha // "") as $s | ($s | length) >= 7 and ($h | startswith($s));
+# 审完 H 没意见：同 Codex 点 👍 的条件，跑过的审查（代码审查，和有的话安全审查）都审完了、都没意见。
+def summary_clean: .code_review.status == "completed" and summary_on_h
+    and all((.code_review, .security_review) | select(type == "object" and .status != null);
+      .status == "completed" and .has_any_findings == false);
 $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 | ($c | map(select(trusted))) as $tc
 | ($r | map(select(trusted))) as $tr
@@ -115,6 +129,11 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 | ([$alerts[] | select(.u != "-") | .u | tonumber] | max // 0) as $until
 | ([$alerts[] | select(.r == "fix-quota" or .r == "auth" or .r == "fix-failed")] | sort_by(.at) | last | .r // "none") as $fix_reason
 | ([$p.updated_at | ts] + [$c[] | .created_at | ts] + [$r[] | .submitted_at | ts] | max) as $last
+# 摘要按最后一次改的时间算（审完 / 开审的时间）。
+| ([$c[] | {id, at: (.updated_at // .created_at | ts), st: summary_state}] | max_by(.at)) as $sum
+| ($sum | if . == null then "none" elif (.st | summary_clean) then "clean"
+    elif (.st | summary_on_h and .code_review.status != "completed" and .code_review.status != null) then "running"
+    else "other" end) as $sum_status
 | [ $now - $last,
     (if any($tc[]; has("<!-- codex-review-head: " + $h + " -->")
           or has("<!-- pr-guard: fallback head=" + $h + " ")
@@ -155,7 +174,13 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
     # 全局额度状态的证据（不分 head）：Codex 最近一次回「额度用完」，和最近一次正常审完（review 或 clean 评论）。
     ([$c[] | select(.user.login == $codex and has("reached your Codex usage limits")) | .created_at | ts] | max // 0),
     ([$r[] | select(.user.login == $codex) | .submitted_at | ts]
-      + [$c[] | select(.user.login == $codex and has("find any major issues")) | .created_at | ts] | max // 0)
+      + [$c[] | select(.user.login == $codex and has("find any major issues")) | .created_at | ts] | max // 0),
+    ($sum.id // 0),
+    $sum_status,
+    ($sum.at // 0),
+    ([$tc[] | select(has("<!-- pr-guard: codex-summary head=" + $h + " "))] | length),
+    # H 上有 Codex 的 clean 评论：那条评论自己叫醒过合并检查的路径 C。
+    (if any($c[]; .user.login == $codex and has("find any major issues") and reviewed_h) then 1 else 0 end)
   ] | @tsv
 '
 
@@ -379,14 +404,26 @@ summon_fix_round() {
   summary "- summoned Codex for fix round $1 $who$hs"
 }
 
-# wake_merge [again]：Codex 点了 👍（GitHub 没有 reaction 事件），留路径 F 的标记叫醒合并检查；👍 由它再核。
-# again：上次叫醒了没合上，同一个标记再发一次（只换开头那句话）。
+# wake_merge <Codex 怎么表示的> <标记> <这个信号已叫醒过几次>：Codex 审过没意见，但没有叫得醒合并检查的事件
+# （👍 没有 reaction 事件；审查摘要是原地改的评论，调用桩只接新评论）。留路径 F / H 的标记叫醒它，信号由它再核。
+# 叫醒的那次没合上（CI 红了又在同一个 head 上重跑绿了、当时还没跑完、一时合不了）：调用桩不接 CI 跑完的事件，
+# 同一个 head 上再没有什么会叫醒合并检查。所以同 4b，空闲 60 分钟再叫，最多补 2 次，之后告警一次 stalled。
+# CI 还红着的那种在规则 2 就停车了，到不了这里。
 wake_merge() {
-  local msg="🤖 巡检：Codex 审过没意见（点了 👍），请合并检查跑一次。"
-  [ "${1:-}" != again ] || msg="🤖 巡检：Codex 审过没意见（点了 👍），但还没合上（多半是当时 CI 还没绿），再请合并检查跑一次。"
+  local how="$1" marker="$2" times="$3" msg
+  if [ "$times" = 0 ]; then
+    msg="🤖 巡检：Codex 审过没意见（${how}），请合并检查跑一次。"
+  elif [ "$idle" -lt 3600 ]; then
+    echo "  等合并检查"; return 0
+  elif [ "$times" -le "$max_merge_rekicks" ]; then
+    msg="🤖 巡检：Codex 审过没意见（${how}），但还没合上（多半是当时 CI 还没绿），再请合并检查跑一次。"
+  else
+    alert_once stalled - "🤖 巡检：Codex 审过没意见（${how}），但合并检查跑了 $times 次都没合上，请打开 PR 看看卡在哪。"
+    return 0
+  fi
   if [ "$MODE" = dry ]; then summary "- would wake the merge check $who$hs"; return 0; fi
   head_unchanged || return 0
-  post_comment "$msg"$'\n\n'"<!-- pr-guard: codex-thumbs head=$H summon=$summon_id -->"
+  post_comment "$msg"$'\n\n'"$marker"
   summary "- woke the merge check $who$hs"
 }
 
@@ -452,7 +489,7 @@ read_facts() {
   IFS=$'\t' read -r idle referenced findings target retries kicks last_kick stalled_at alerts \
     until_active until_passed fix_reason state merged total_retries judged judged_reviews \
     summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded \
-    quota_seen codex_ok_seen <"$dir/facts"
+    quota_seen codex_ok_seen summary_id summary_status summary_at summary_woken receipt_h <"$dir/facts"
 }
 
 # fetch_pr <owner/名> <N>：读 PR、评论、review 存进 $dir，算好事实行；召唤过就连 Codex 的 👍 / 👀 一起读，
@@ -493,7 +530,7 @@ sweep_pr() {
 
   local idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
   local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded thumbs eyes
-  local quota_seen codex_ok_seen
+  local quota_seen codex_ok_seen summary_id summary_status summary_at summary_woken receipt_h
   read_facts
   echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
@@ -587,32 +624,37 @@ sweep_pr() {
   if [ "$summon_at" -gt 0 ] && [ -f "$dir/reactions" ]; then
     read -r thumbs eyes <"$dir/reactions"
     if [ "$thumbs" = 1 ]; then
-      # 叫醒的那次没合上（CI 红了又在同一个 head 上重跑绿了、当时还没跑完、一时合不了）：调用桩
-      # 不接 CI 跑完的事件，同一个 head 上再没有什么会叫醒合并检查。所以同 4b，空闲 60 分钟再叫。
-      # CI 还红着的那种在规则 2 就停车了，到不了这里。
-      if [ "$woken" = 0 ]; then
-        wake_merge
-      elif [ "$idle" -lt 3600 ]; then
-        echo "  等合并检查"
-      elif [ "$woken" -le "$max_merge_rekicks" ]; then
-        wake_merge again
-      else
-        alert_once stalled - "🤖 巡检：Codex 审过没意见（点了 👍），但合并检查跑了 $woken 次都没合上，请打开 PR 看看卡在哪。"
-      fi
+      wake_merge "点了 👍" "<!-- pr-guard: codex-thumbs head=$H summon=$summon_id -->" "$woken"
       return 0
     fi
-    if [ "$handed" = 0 ] && [ "$codex_concluded" = 0 ]; then
-      local waited=$((now - summon_at))
-      if [ "$codex_quota" = 1 ]; then
-        hand_to_claude quota; return 0
-      elif [ "$codex_comments" = 0 ] && [ "$codex_reviews" = 0 ] && [ "$eyes" = 0 ] && [ "$waited" -ge 300 ]; then
-        hand_to_claude silent; return 0
-      # Codex 审的过程中会先发（再改）一条状态评论，上一个 head 的 review / clean 评论也可能晚于召唤才到，
-      # 这些都不是结论：20 分钟只看 H 上的 clean 评论和 review。
-      elif [ "$waited" -ge 1200 ]; then
-        hand_to_claude timeout; return 0
-      fi
+  fi
+
+  # 6d. 摘要显示 Codex 审完 H、没意见：这就是结论，不再重审、也不换 Claude。审完不满 2 分钟先等：
+  #     有意见的话 review 可能还在发，下一轮规则 4 会接住。H 上的 clean 评论自己叫醒过路径 C，算叫过一次。
+  if [ "$summary_status" = clean ]; then
+    [ $((now - summary_at)) -ge 120 ] || { echo "  Codex 刚审完，等它把结果发完"; return 0; }
+    wake_merge "审查摘要显示审完了" "<!-- pr-guard: codex-summary head=$H comment=$summary_id -->" \
+      $((summary_woken + receipt_h))
+    return 0
+  fi
+
+  # 6c. Codex 没接这次召唤（读不到 reaction 就不走，理由同 6b）。
+  if [ "$summon_at" -gt 0 ] && [ -f "$dir/reactions" ] && [ "$handed" = 0 ] && [ "$codex_concluded" = 0 ]; then
+    local waited=$((now - summon_at))
+    if [ "$codex_quota" = 1 ]; then
+      hand_to_claude quota; return 0
+    elif [ "$codex_comments" = 0 ] && [ "$codex_reviews" = 0 ] && [ "$eyes" = 0 ] && [ "$waited" -ge 300 ]; then
+      hand_to_claude silent; return 0
+    # Codex 审的过程中会先发（再改）一条状态评论，上一个 head 的 review / clean 评论也可能晚于召唤才到，
+    # 这些都不是结论：20 分钟只看 H 上的 clean 评论和 review（审完没意见的摘要在 6d 就接走了）。
+    elif [ "$waited" -ge 1200 ]; then
+      hand_to_claude timeout; return 0
     fi
+  fi
+
+  # 6e. 摘要显示 Codex 正在审 H（打开 PR 时它自己就审）：再叫只会白花一次额度。20 分钟还在审就当卡住，往下走。
+  if [ "$summary_status" = running ] && [ $((now - summary_at)) -lt 1200 ]; then
+    echo "  Codex 正在审"; return 0
   fi
 
   # 5. 没意见也没合：重新请求审查。没人碰过的 head 10 分钟就叫（打开 PR 时不再有 runner 等 Codex 的 👍）。

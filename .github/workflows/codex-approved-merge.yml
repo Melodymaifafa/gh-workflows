@@ -7,9 +7,11 @@ name: Merge after clean Codex review
 # October 2026 that waiting was a third of the private repos' Actions minutes).
 # So nothing here waits for Codex: the PR sweeper (scripts/pr-sweep.sh, every
 # 5 minutes on the owner's Mac, plus the backstop cron in this repo) watches for
-# the 👍 and for a Codex that never answered, and wakes this workflow with an
-# owner marker (paths F and G). The trusted workflow runs from main and never
-# checks out or executes PR code.
+# the 👍, for a review summary that Codex flipped to Completed without posting a
+# clean result (its automatic review on PR open does exactly that; an edited
+# comment fires no event the callers listen to), and for a Codex that never
+# answered, and wakes this workflow with an owner marker (paths F, H and G).
+# The trusted workflow runs from main and never checks out or executes PR code.
 #
 # Codex 审不了（额度用完 / 5 分钟没回应 / 20 分钟没结论，巡检判断后发路径 G 的标记）时，
 # 这一次请求改由 claude-review job 代审：有问题发 M3 review 交给 iterate 修，没问题发 M4
@@ -79,6 +81,7 @@ jobs:
         github.event.comment.author_association == 'OWNER' &&
         (
           contains(github.event.comment.body, 'pr-guard: codex-thumbs head=') ||
+          contains(github.event.comment.body, 'pr-guard: codex-summary head=') ||
           contains(github.event.comment.body, 'pr-guard: codex-silent head=')
         )
       )
@@ -204,6 +207,30 @@ jobs:
             [ "$found" = true ]
           }
 
+          # codex_summary_clean <评论 id>：路径 H 点名的那条 Codex 审查摘要审完了这个 head、没意见。
+          # 判据同巡检 facts_jq 的 summary_state / summary_clean（两边各一份，改一边要改另一边）：
+          # 只认 Codex 本人（登录名 + Bot 类型）发在这个 PR 上的那条；读机器读的状态行
+          # （codex-review-state:v1），代码审查 completed、commit 是这个 head（的前缀），跑过的审查
+          # 都没意见。审完满 2 分钟才算：有意见的话 review 这时也该发完了。读不到、读不出都不算。
+          codex_summary_clean() {
+            local summary
+            summary="$(gh api "repos/$REPO/issues/comments/$1")" || return 1
+            jq -e --arg bot "$codex_login" --arg h "$expected_head" \
+              --arg issue "/repos/$REPO/issues/$PR_NUMBER" --argjson now "$(now)" '
+                def ts: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+                .user.login == $bot and .user.type == "Bot" and
+                ((.issue_url // "") | endswith($issue)) and
+                ((.body // "") | contains("<!-- codex-pull-request-review-summary -->")) and
+                $now - (.updated_at | ts) >= 120 and
+                ([(.body // "") | capture("<!-- codex-review-state:v1 (?<s>\\{.*\\}) -->").s
+                    | try fromjson catch empty] | first
+                  | type == "object" and .code_review.status == "completed" and
+                    ((.code_review.commit_sha // "") as $s | ($s | length) >= 7 and ($h | startswith($s))) and
+                    all((.code_review, .security_review) | select(type == "object" and .status != null);
+                      .status == "completed" and .has_any_findings == false))
+              ' <<<"$summary" >/dev/null
+          }
+
           # Codex 审不了这次请求：真人触发时交给 claude-review job；bot 触发时什么都不发，由巡检用
           # 主人身份重新请求。不再另发一条「换 Claude 代审」（M2）：叫醒这里的那条 codex-silent 评论
           # 已经说了同一句话，PR 上两个角色各说一遍（2026-10-16 linear-agent-team PR #74）。
@@ -319,6 +346,28 @@ jobs:
             summon_id="${thumbs_marker#* }"
             signoff_kind=reaction
           elif [ "$association" = OWNER ] &&
+            [[ "$body" == *'pr-guard: codex-summary head='* ]]
+          then
+            # 路径 H：Codex 的审查摘要显示审完了这个 head、没意见，却没发 clean 评论、没点 👍（打开 PR 时
+            # 的自动审查就是这样）。摘要是原地改的评论，没有叫得醒这里的事件，所以巡检用主人身份留这条
+            # 标记，点名那条摘要。只认绑定当前 head 的标记；摘要下面再核一遍，标记只是叫醒。
+            summary_marker="$(
+              sed -nE \
+                's/.*<!--[[:space:]]*pr-guard: codex-summary head=([0-9a-f]{40}) comment=([0-9]+)[[:space:]]*-->.*/\1 \2/p' \
+                <<<"$body" |
+                head -1
+            )"
+            if [ -z "$summary_marker" ]; then
+              echo "::notice::Codex summary marker has no exact HEAD binding"
+              exit 0
+            fi
+            if [ "$expected_head" != "${summary_marker%% *}" ]; then
+              echo "::notice::Codex summary marker targets a stale PR head"
+              exit 0
+            fi
+            signoff_id="${summary_marker#* }"
+            signoff_kind=summary
+          elif [ "$association" = OWNER ] &&
             [[ "$body" == *'pr-guard: codex-silent head='* ]]
           then
             # 路径 G：巡检看到 Codex 没接最近一次召唤（额度用完 / 5 分钟没回应 / 20 分钟没结论），
@@ -394,6 +443,11 @@ jobs:
 
           if [ -n "$silent_reason" ]; then
             fallback "$silent_reason"
+          fi
+
+          if [ "$signoff_kind" = summary ] && ! codex_summary_clean "$signoff_id"; then
+            echo "::notice::The named Codex review summary does not show a clean review of this head"
+            exit 0
           fi
 
           if [ "$signoff_kind" = reaction ]; then
@@ -606,6 +660,11 @@ jobs:
               [ "$(jq -r '.user.login // empty' <<<"$reaction")" != "$codex_login" ]
             then
               echo "::notice::Codex sign-off was removed; skipping"
+              exit 0
+            fi
+          elif [ "$signoff_kind" = summary ]; then
+            if ! codex_summary_clean "$signoff_id"; then
+              echo "::notice::Codex review summary changed; skipping"
               exit 0
             fi
           elif [ "$signoff_kind" = claude ]; then

@@ -94,6 +94,7 @@ refute_fallback() {
   refute_contains "$job_if" "pull_request_target"
   refute_contains "$job_if" "'@codex review'"
   assert_contains "$job_if" "pr-guard: codex-thumbs head="
+  assert_contains "$job_if" "pr-guard: codex-summary head="
   assert_contains "$job_if" "pr-guard: codex-silent head="
   block="$(extract_run_block "$REPO_ROOT/$WF" "$STEP")"
   refute_contains "$block" 'WATCH_SECONDS'
@@ -206,6 +207,105 @@ refute_fallback() {
   run run_block "$WF" "$STEP"
   assert_equal "$status" 0
   assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+}
+
+# ---------- 路径 H：巡检看到 Codex 的审查摘要审完了、没意见 ----------
+
+# summary_json <fixture> [审的 commit] [改的时间] [作者] [身份]：Codex 的审查摘要（真数据，评论 6230570700），
+# 发在 o/r#7 上。默认 08:01 审完：FAKE_NOW 是 08:06，满 2 分钟。
+summary_json() {
+  jq --arg sha "${2:-$H}" --arg h "$H" --arg at "${3:-2026-09-18T08:01:00Z}" \
+    --arg login "${4:-$CODEX}" --arg assoc "${5:-NONE}" '
+      .body |= gsub($h; $sha) | .updated_at = $at | .author_association = $assoc
+      | .issue_url = "https://api.github.com/repos/o/r/issues/7"
+      | .user.login = $login | .user.type = (if ($login | endswith("[bot]")) then "Bot" else "User" end)' \
+    "$FIXTURES_DIR/codex/$1.json"
+}
+
+# path_h [标记绑的 head] [标记作者] [身份]：巡检留的 codex-summary 标记（评论 950），点名那条摘要；
+# 摘要默认审完了 H、没意见。
+path_h() {
+  export TARGET_ID=950
+  fake_route repos/o/r/issues/comments/950 "$(gh_comment 950 "${2:-Melodymaifafa}" "${3:-OWNER}" \
+    "🤖 巡检：Codex 审过没意见（审查摘要显示审完了），请合并检查跑一次。"$'\n\n'"<!-- pr-guard: codex-summary head=${1:-$H} comment=6230570700 -->" \
+    2026-09-18T08:05:00Z)"
+  fake_route repos/o/r/issues/comments/6230570700 "$(summary_json summary-completed)"
+}
+
+@test "path H: a Codex summary Completed on H with no findings merges after CI" {
+  path_h
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_called "gh pr merge 7 --repo o/r --squash --delete-branch --match-head-commit $H" 1
+  refute_fallback
+  refute_called 'curl'
+}
+
+@test "path H: a summary Running on H, Completed on another commit, or under 2 minutes old does not merge" {
+  for summary in "summary-running" "summary-completed $OTHER" "summary-completed $H 2026-09-18T08:05:00Z"; do
+    : >"$FAKE_LOG"
+    path_h
+    # shellcheck disable=SC2086  # 故意拆成 fixture、commit、时间几个参数
+    fake_route repos/o/r/issues/comments/6230570700 "$(summary_json $summary)"
+    green_checks
+    run run_block "$WF" "$STEP"
+    assert_equal "$status" 0
+    assert_contains "$output" 'does not show a clean review of this head'
+    refute_called 'sleep'
+    refute_called 'gh pr merge'
+    refute_fallback
+  done
+}
+
+@test "path H: a forged summary from the OWNER, github-actions, or another PR does not merge" {
+  for who in "Melodymaifafa OWNER" "github-actions[bot] NONE"; do
+    : >"$FAKE_LOG"
+    path_h
+    # shellcheck disable=SC2086  # 故意拆成 login 和身份两个参数
+    fake_route repos/o/r/issues/comments/6230570700 "$(summary_json summary-completed "$H" 2026-09-18T08:01:00Z $who)"
+    run run_block "$WF" "$STEP"
+    assert_contains "$output" 'does not show a clean review of this head'
+    refute_called 'gh pr merge'
+  done
+  fake_route repos/o/r/issues/comments/6230570700 \
+    "$(summary_json summary-completed | jq '.issue_url = "https://api.github.com/repos/o/r/issues/17"')"
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'does not show a clean review of this head'
+  refute_called 'gh pr merge'
+}
+
+@test "path H refuses a marker for a stale head, or one not written by the owner" {
+  path_h "$OTHER"
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'Codex summary marker targets a stale PR head'
+  refute_called 'gh pr merge'
+  path_h "$H" 'claude[bot]' NONE
+  run run_block "$WF" "$STEP"
+  assert_contains "$output" 'no longer eligible'
+  refute_called 'gh pr merge'
+}
+
+@test "path H: a Codex review on H blocks the merge even though the summary says Completed" {
+  path_h
+  green_checks
+  fake_route "repos/o/r/pulls/7/reviews?per_page=100" \
+    "$(json_array "$(gh_review 9 "$CODEX" NONE "$H" 'findings' 2026-09-18T08:02:00Z)")"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'has review findings'
+  refute_called 'gh pr merge'
+}
+
+@test "path H re-checks the summary after CI: a re-review that started meanwhile does not merge" {
+  path_h
+  fake_route repos/o/r/issues/comments/6230570700 "$(summary_json summary-completed)" 1
+  fake_route repos/o/r/issues/comments/6230570700 "$(summary_json summary-running "$H" 2026-09-18T08:07:00Z)" 2
+  green_checks
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 0
+  assert_contains "$output" 'Codex review summary changed; skipping'
+  refute_called 'gh pr merge'
 }
 
 # ---------- 路径 G：Codex 没接，换 Claude ----------
