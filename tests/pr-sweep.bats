@@ -779,6 +779,125 @@ thumbs_comment() { owner_comment "$1" "🤖 巡检：…"$'\n\n'"<!-- pr-guard: 
   refute_contains "$(fake_all_bodies)" "codex-silent"
 }
 
+# ── 6d / 6e：Codex 的审查摘要（打开 PR 时的自动审查审完没意见，只把摘要改成 Completed） ──
+
+# codex_summary <fixture> <审完 / 开审几分钟前> [审的 commit] [作者] [身份]：Codex 的审查摘要（真数据，
+# 评论 6230570700）。早 2 分钟发的，之后原地改：updated_at 是审完 / 开审的时间。
+codex_summary() {
+  jq --arg at "$(ago "$2")" --arg c "$(ago $(($2 + 2)))" --arg sha "${3:-$H}" --arg h "$H" \
+    --arg login "${4:-chatgpt-codex-connector[bot]}" --arg assoc "${5:-NONE}" '
+      .body |= gsub($h; $sha) | .created_at = $c | .updated_at = $at | .author_association = $assoc
+      | .user.login = $login | .user.type = (if ($login | endswith("[bot]")) then "Bot" else "User" end)' \
+    "$FIXTURES_DIR/codex/$1.json"
+}
+SUMMARY_MARKER="<!-- pr-guard: codex-summary head=$H comment=6230570700 -->"
+
+@test "a summary Completed on H with no findings wakes the merge check, never kicks, then waits for it" {
+  one_pr clean 14
+  comments "$(codex_summary summary-completed 12)"
+  sweep
+  assert_equal "$status" 0
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  assert_equal "${body##*$'\n'}" "$SUMMARY_MARKER"
+  refute_contains "$body" '@codex'
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "woke the merge check $LABEL"
+  : >"$FAKE_LOG"
+  comments "$(codex_summary summary-completed 12)" "$(owner_comment 11 "$body" 5)"
+  sweep
+  refute_writes
+  assert_contains "$output" "等合并检查"
+}
+
+@test "a summary that completed under 2 minutes ago waits instead of waking or kicking" {
+  one_pr clean 14
+  comments "$(codex_summary summary-completed 1)"
+  sweep
+  refute_writes
+  assert_contains "$output" "Codex 刚审完"
+}
+
+@test "a summary Completed on H does not hide a Codex review on H: that is findings, never a wake" {
+  one_pr clean 14
+  comments "$(codex_summary summary-completed 12)"
+  reviews "$(codex_findings 4863267293 "$H" 12)"
+  sweep
+  refute_writes
+  assert_contains "$output" "findings=1"
+}
+
+@test "a summary Running on H holds the kick; 20 minutes of Running counts as stuck and kicks" {
+  one_pr clean 14
+  comments "$(codex_summary summary-running 13)"
+  sweep
+  refute_writes
+  assert_contains "$output" "Codex 正在审"
+  one_pr clean 21
+  comments "$(codex_summary summary-running 21)"
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
+}
+
+@test "a summary whose code review Completed on H but security review is still Running on H holds the kick" {
+  one_pr clean 14
+  # 真数据里安全审查没跑（全是 null）；这里把它改成正在审 H。
+  comments "$(codex_summary summary-completed 13 | jq --arg h "$H" '.body |= sub("\"security_review\":\\{[^}]*\\}";
+    "\"security_review\":{\"commit_sha\":\"" + $h + "\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"}")')"
+  sweep
+  refute_writes
+  assert_contains "$output" "Codex 正在审"
+}
+
+@test "a summary Completed on an older commit still kicks after 10 idle minutes" {
+  comments "$(codex_summary summary-completed 12 "$OTHER")"
+  one_pr clean 9
+  sweep
+  refute_writes
+  one_pr clean 11
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
+}
+
+@test "a forged summary from the OWNER or github-actions is ignored: the head is kicked" {
+  for who in "Melodymaifafa OWNER" "github-actions[bot] NONE"; do
+    : >"$FAKE_LOG"
+    one_pr clean 14
+    # shellcheck disable=SC2086  # 故意拆成 login 和身份两个参数
+    comments "$(codex_summary summary-completed 12 "$H" $who)"
+    sweep
+    assert_called "gh api POST repos/$R/issues/7/comments" 1
+    assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
+  done
+}
+
+@test "a summoned head whose summary shows Completed on H goes to the merge check, not to Claude" {
+  one_pr clean 3
+  comments "$(summoned 25)" "$(codex_summary summary-completed 20)"
+  no_reactions
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  assert_equal "${body##*$'\n'}" "$SUMMARY_MARKER"
+  refute_contains "$body" 'codex-silent'
+}
+
+@test "a Codex clean comment on H counts as the first wake; 60 idle minutes later the summary wakes again, no kick" {
+  receipt="$(gh_comment 13 'chatgpt-codex-connector[bot]' NONE "Codex Review: Didn't find any major issues."$'\n\n'"**Reviewed commit:** \`${H:0:10}\`" "$(ago 65)")"
+  comments "$(summoned 70)" "$receipt" "$(codex_summary summary-completed 65)"
+  no_reactions
+  one_pr clean 30
+  sweep
+  refute_writes
+  one_pr clean 61
+  sweep
+  assert_called "gh api POST repos/$R/issues/7/comments" 1
+  body="$(fake_last_body "gh api POST repos/$R/issues/7/comments")"
+  assert_contains "$body" '再请合并检查跑一次'
+  assert_equal "${body##*$'\n'}" "$SUMMARY_MARKER"
+}
+
 # ── 信任：claude[bot] / 非 OWNER 写的标记一律不算 ──
 
 @test "forged M1/M2/M4 and a contributor M4 do not make the head referenced" {

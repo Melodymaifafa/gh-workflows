@@ -12,6 +12,8 @@
 - `reactions-eyes.json` — Codex 在 `@codex review` 评论上留的 👀 reaction 列表（gh-workflows #7）。
 - `reactions-thumbsup.json` — Codex 在 PR 正文上留的 👍 reaction 列表（gh-workflows #7）。
 - `summon-clean-sequence.json` — 私有调用方 PR 的一次召唤→干净：M1（d69c0a42…，22:04:30）+ Codex clean 评论（22:10:25）。
+- `summary-completed.json` — Codex 审查摘要（CodexBridge #8，评论 6230570700），打开 PR 时的自动审查审完没意见那一版（06:15:37）：状态行 `code_review` completed、`has_any_findings` false。审的 commit 换成了 H。
+- `summary-running.json` — 同一条评论最早那一版（06:14:27，从编辑历史取的）：`code_review` running。
 
 ## sdk/（claude-code-action 的 execution_file，JSON 数组）
 
