@@ -839,6 +839,16 @@ SUMMARY_MARKER="<!-- pr-guard: codex-summary head=$H comment=6230570700 -->"
   assert_equal "$(fake_last_body "gh api POST repos/$R/issues/7/comments")" "$KICK_BODY"
 }
 
+@test "a summary whose code review Completed on H but security review is still Running on H holds the kick" {
+  one_pr clean 14
+  # 真数据里安全审查没跑（全是 null）；这里把它改成正在审 H。
+  comments "$(codex_summary summary-completed 13 | jq --arg h "$H" '.body |= sub("\"security_review\":\\{[^}]*\\}";
+    "\"security_review\":{\"commit_sha\":\"" + $h + "\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"}")')"
+  sweep
+  refute_writes
+  assert_contains "$output" "Codex 正在审"
+}
+
 @test "a summary Completed on an older commit still kicks after 10 idle minutes" {
   comments "$(codex_summary summary-completed 12 "$OTHER")"
   one_pr clean 9

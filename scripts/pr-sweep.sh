@@ -27,6 +27,7 @@
 #      c. Codex 没接这次召唤                → 额度用完马上、5 分钟没任何回应、或 20 分钟 head 上没结论（审它的 clean 评论 / review）时，
 #                                             留 codex-silent 标记让合并检查换 Claude 代审（路径 G），每次召唤一条。
 #      e. 摘要显示 Codex 正在审 H           → 等它，不重审；20 分钟还在审就当卡住，交给规则 5。
+#                                             代码审查审完、安全审查还在审 H 也算正在审。
 #      带 M7 的 head（本流水线自己推的）上被 GitHub 扣住等批准的 CI，顺手批掉。
 #   5. 其余              → 没人碰过且空闲 ≥ 10 分钟、或空闲 ≥ 60 分钟时重新请求审查（M1 + 巡检标记）；
 #                          每个 head 最多 3 次、间隔 ≥ 60 分钟；然后告警一次 stalled；然后 7 天内每天一次。
@@ -94,11 +95,16 @@ def reviewed_h: [(.body // "") | split("\n")[] | capture("^\\*\\*Reviewed commit
 # 读不出状态就当没有。合并检查的路径 H（codex_summary_clean）是同一套判据，改这里要一起改。
 def summary_state: select(.user.login == $codex and .user.type == "Bot" and has("<!-- codex-pull-request-review-summary -->"))
     | [(.body // "") | capture("<!-- codex-review-state:v1 (?<s>\\{.*\\}) -->").s | try fromjson catch empty] | first // empty;
-def summary_on_h: (.code_review.commit_sha // "") as $s | ($s | length) >= 7 and ($h | startswith($s));
+def sha_on_h: (.commit_sha // "") as $s | ($s | length) >= 7 and ($h | startswith($s));
+def summary_on_h: .code_review | sha_on_h;
 # 审完 H 没意见：同 Codex 点 👍 的条件，跑过的审查（代码审查，和有的话安全审查）都审完了、都没意见。
 def summary_clean: .code_review.status == "completed" and summary_on_h
     and all((.code_review, .security_review) | select(type == "object" and .status != null);
       .status == "completed" and .has_any_findings == false);
+# 正在审 H：H 上有一项审查（代码审查或安全审查）开了还没审完。代码审查审完、安全审查还在跑也算，
+# 不然会落到「其他」，空闲够了就再喊一遍 @codex review（Codex 2026-10-19 的 P2）。
+def summary_running: any((.code_review, .security_review) | select(type == "object");
+    .status != null and .status != "completed" and sha_on_h);
 $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 | ($c | map(select(trusted))) as $tc
 | ($r | map(select(trusted))) as $tr
@@ -132,7 +138,7 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
 # 摘要按最后一次改的时间算（审完 / 开审的时间）。
 | ([$c[] | {id, at: (.updated_at // .created_at | ts), st: summary_state}] | max_by(.at)) as $sum
 | ($sum | if . == null then "none" elif (.st | summary_clean) then "clean"
-    elif (.st | summary_on_h and .code_review.status != "completed" and .code_review.status != null) then "running"
+    elif (.st | summary_running) then "running"
     else "other" end) as $sum_status
 | [ $now - $last,
     (if any($tc[]; has("<!-- codex-review-head: " + $h + " -->")
