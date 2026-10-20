@@ -2116,6 +2116,33 @@ resolve_ref() { # resolve_ref <referenced_workflows 的 JSON>
   assert_contains "$(fake_last_body "gh pr comment")" 'CLAUDE_CODE_OAUTH_TOKEN'
 }
 
+# 同 claude-verify-creds.bats 里种点文件的那两条，换一步、换一套命令：这一步拿 git 看「Claude 是不是已经
+# 写过这一轮」，git status 不带 GIT_CONFIG_GLOBAL，全局配置里一条 core.fsmonitor 它就替人跑起来，手上是
+# github.token 和 Pushover 两把钥匙。修复员和退回 runner 用户跑的验证命令都写得动那份配置（PR #74 复审）。
+# 所以这一步也从一个现开的空 $HOME 跑起。
+@test "takeover: a dotfile planted in HOME runs nothing and steers nothing in the takeover step" {
+  git init -q .
+  printf 'x\n' >tracked.txt
+  git add tracked.txt
+  git -c user.email=t@e -c user.name=t commit -q -m base
+  export BASE_SHA; BASE_SHA="$(git rev-parse HEAD)"
+  export REVIEW_FIXER=auto FIRST=claude FALLBACK_ALLOWED=true REVIEWER=Codex
+  export OUTCOME_RESULT=success OUTCOME_FAILED=true OUTCOME_REASON=auth OUTCOME_UNTIL=- HEAD_SHA="$H"
+  export EXECUTION_FILE="$BATS_TEST_TMPDIR/exec.json"
+  jq -n '[{type:"result",subtype:"error",is_error:true,result:"API Error: 401"}]' >"$EXECUTION_FILE"
+  trust_fake_bin
+  plant_home
+
+  run run_block "$WF" "Decide the takeover"
+
+  refute_planted_home_used
+  assert_equal "$status" 0
+  # 走到了 git status 那一判（换人之前最后一道），告警照发、Pushover 也推了
+  assert_equal "$(step_output run_codex)" true
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=auth'
+  assert_called 'curl -q ' 1
+}
+
 @test "takeover: a failing test suite is never handed over — the round goes red with an alert" {
   decide claude true fix-failed 'FAILED tests/test_rate_limit_error.py, I could not fix it'
   assert_equal "$status" 1

@@ -180,8 +180,8 @@ jobs:
           # curl 的第一个参数必须是 -q：不带它，curl 先读 $HOME 下的用户配置（~/.curlrc 那类）。
           # 修复员的改文件工具、退回 runner 用户跑的验证命令都写得动 $HOME，往里写一份 insecure
           # 加 resolve，后面手上有 PUSHOVER_TOKEN 的步骤一跑这条 POST，令牌就送到别人的机器上
-          # （Codex review 5590381303 的 P1）。-q 不在第一个就不作数。本 job 每一条 curl 都这样
-          # （tests/claude-verify-creds.bats 盯着）。
+          # （Codex review 5590381303 的 P1）。-q 不在第一个就不作数。本仓库每一条 curl 都这样
+          # （tests/claude-verify-creds.bats 盯着）；后面带凭据的步骤另外还从一个空 $HOME 跑起。
           pushover() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
               curl -q -sf -X POST https://api.pushover.net/1/messages.json \
@@ -1367,6 +1367,17 @@ jobs:
               trusted_path="${trusted_path:+$trusted_path:}$dir"
             done
             PATH="$trusted_path"
+            # $HOME 也换成这一步现开的空目录，在跑任何一条 jq / gh / git / curl 之前。修复员的改文件工具、
+            # 退回 runner 用户跑的验证命令都写得动原来那个 $HOME，而这几样命令先读它下面的点文件：jq 1.7.1
+            # 自动加载 ~/.jq，一个 def 就换掉 gsub / select（PR #74 复审的 Critical）；gh 读 ~/.config/gh
+            # （http_unix_socket 让每个请求都走别人的 socket），git 读 ~/.gitconfig，curl 读 ~/.curlrc。
+            # 逐个工具堵是跟着复审一条条追，所以整个换掉；指回原来那个 $HOME 的配置目录变量一并清掉
+            # （托管 runner 上 XDG_CONFIG_HOME 就是 /home/runner/.config）。这几步要的东西都不在 $HOME 里：
+            # gh 认 GH_TOKEN，push 的凭据和 git 配置都由下面现给，没有缓存。别的带凭据的步骤同一段三行
+            # （tests/claude-verify-creds.bats 盯着）。
+            HOME="$(mktemp -d)"
+            export HOME
+            unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
             if ! command -v git >/dev/null 2>&1; then
               echo '::error::git is not available from a write-protected PATH entry; refusing to run a credentialed git command'
               exit 1
@@ -2406,6 +2417,12 @@ jobs:
             trusted_path="${trusted_path:+$trusted_path:}$dir"
           done
           PATH="$trusted_path"
+          # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
+          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
+          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          HOME="$(mktemp -d)"
+          export HOME
+          unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
           # 少了就不发这条评论，而不是红着停下：这一步排在 Check the fix outcome 之前，
           # 它一红，M7 标记和召唤复审会跟着被跳过、链条静默停住（同下面 gh 偶发失败
           # 那条的处理）。不发评论顶多少一条总结，令牌一次也没交出去。
@@ -2552,6 +2569,12 @@ jobs:
             trusted_path="${trusted_path:+$trusted_path:}$dir"
           done
           PATH="$trusted_path"
+          # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
+          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
+          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          HOME="$(mktemp -d)"
+          export HOME
+          unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
           # 少了哪一样这一轮的结局都判不了 —— 红着停下，别静默空转。这一步红了后面
           # 全跳过，正是想要的：结局没人判，就不许有人去召唤下一轮复审。
           for tool in gh jq date curl sleep; do
@@ -2738,6 +2761,12 @@ jobs:
             trusted_path="${trusted_path:+$trusted_path:}$dir"
           done
           PATH="$trusted_path"
+          # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
+          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
+          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          HOME="$(mktemp -d)"
+          export HOME
+          unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
           # 少了哪一样这条链就没人裁决了 —— 红着停下，别静默空转。
           for tool in git jq sed gh curl date bash; do
             command -v "$tool" >/dev/null 2>&1 && continue
@@ -3007,6 +3036,12 @@ jobs:
             trusted_path="${trusted_path:+$trusted_path:}$dir"
           done
           PATH="$trusted_path"
+          # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
+          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
+          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          HOME="$(mktemp -d)"
+          export HOME
+          unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
           # 少了哪一样，「Codex 回的是不是一段能用的补丁」就没人判了 —— 红着停下，
           # 别静默空转。取补丁的脚本跟这一步同一份 PATH，它要的 awk / cat / mv 也在里面。
           for tool in git gh jq awk sed cat cut grep mktemp mv date sleep bash; do
@@ -3376,6 +3411,12 @@ jobs:
             trusted_path="${trusted_path:+$trusted_path:}$dir"
           done
           PATH="$trusted_path"
+          # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
+          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
+          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          HOME="$(mktemp -d)"
+          export HOME
+          unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
 
           # 链路断点告警：静默失败过一次就没人知道流水线停了（同 adb 看门狗的
           # 教训），每个终态失败路径都推一条 Pushover；每次 run 至多一条，不重复。
@@ -3530,6 +3571,12 @@ jobs:
             trusted_path="${trusted_path:+$trusted_path:}$dir"
           done
           PATH="$trusted_path"
+          # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
+          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
+          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          HOME="$(mktemp -d)"
+          export HOME
+          unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
 
           # 没推东西就没什么要说的：Codex 的回复已经在 PR 上，再补一句只会误导。
           if [ "${PUSHED:-}" != true ]; then
@@ -3589,7 +3636,7 @@ jobs:
           # 同前面几步：这一步手上有 github.token 和 Pushover 两个密钥，而前面跑验证那一步
           # 跑的是被审 PR 自己的代码 —— 往它写得动的 PATH 目录里放一个假 gh，令牌就递过去了。
           # 所以命令只从我们写不动的目录里找。下面那段挑原因的代码只用 shell 内建，排在
-          # 过滤之后仍然一条外部命令都没跑。
+          # 过滤之后，除了现开空 $HOME 的那个 mktemp，一条外部命令都没跑。
           path_is_protected() {
             local dir="$1"
             # 相对项（`.`、`bin`）一律不认：它按 cwd 解析，而 cwd 就是被审 PR 的工作
@@ -3614,6 +3661,12 @@ jobs:
             trusted_path="${trusted_path:+$trusted_path:}$dir"
           done
           PATH="$trusted_path"
+          # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
+          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
+          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          HOME="$(mktemp -d)"
+          export HOME
+          unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
 
           # Gate 还没判出 head（它自己红的、或更早的步骤红的）就没有可去重的对象：
           # 那种红跟「这一轮没推上去」不是一回事，这里不说话。
@@ -4092,7 +4145,7 @@ jobs:
           linear() { # linear <query> <variables-json>：打印响应里的 .data；HTTP 或 GraphQL 出错返回非零
             local resp
             resp="$(jq -cn --arg q "$1" --argjson v "$2" '{query: $q, variables: $v}' |
-              curl -sS --max-time 20 -X POST https://api.linear.app/graphql \
+              curl -q -sS --max-time 20 -X POST https://api.linear.app/graphql \
                 -H 'Content-Type: application/json' \
                 -H @<(printf 'Authorization: %s\n' "$LINEAR_API_KEY") \
                 --data-binary @-)" || return 1

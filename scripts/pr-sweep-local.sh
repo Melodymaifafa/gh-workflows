@@ -14,7 +14,7 @@ switch_alerted=
 
 notify() {
   if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then return 0; fi
-  curl -sf -X POST https://api.pushover.net/1/messages.json \
+  curl -q -sf -X POST https://api.pushover.net/1/messages.json \
     --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
     --form-string "title=$1" --form-string "message=$2" >/dev/null || echo "Pushover 发送失败" >&2
 }

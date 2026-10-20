@@ -41,7 +41,7 @@ if [ -z "${MODELS_JSON:-}" ]; then
     printf 'anthropic-beta: oauth-2025-04-20\n'
     printf 'anthropic-version: 2023-06-01\n'
   } >"$tmp/headers"
-  if ! curl -sS --fail-with-body -o "$models" -H @"$tmp/headers" \
+  if ! curl -q -sS --fail-with-body -o "$models" -H @"$tmp/headers" \
     "https://api.anthropic.com/v1/models?limit=100"; then
     echo "::error::取模型列表失败（/v1/models），这一轮不做判断、不推送"
     exit 1
@@ -155,7 +155,7 @@ fi
 
 message="最新的 Opus 是 $latest_name（$latest_id，$latest_when），仓库里钉的还是 $pinned_values。"
 message="$message 想换就把 claude-codex-iterate.yml 和 codex-approved-merge.yml 的 claude_model 默认值改成新的，合了 PR 再移 v1 标签；不换就不用管，这条下周不会再推。"
-if ! curl -sf -X POST https://api.pushover.net/1/messages.json \
+if ! curl -q -sf -X POST https://api.pushover.net/1/messages.json \
   --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
   --form-string "title=🤖 有新的 Opus 了" \
   --form-string "message=$message" >/dev/null; then

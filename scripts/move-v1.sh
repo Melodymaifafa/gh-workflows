@@ -23,7 +23,7 @@ say() { printf '%s\n' "$1" | tee -a "$summary_file"; }
 
 push() { # push <标题> <正文>
   [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ] || return 0
-  curl -sf -X POST https://api.pushover.net/1/messages.json \
+  curl -q -sf -X POST https://api.pushover.net/1/messages.json \
     --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
     --form-string "title=$1" --form-string "message=${2:0:1000}" >/dev/null 2>&1 || true
 }
