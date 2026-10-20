@@ -829,10 +829,19 @@ prepare_repo() {
 
 # ---------- job 形状（配置写错就没有安全边界） ----------
 
-@test "the iterate job hands judge, why, head, round and the pr-guard helpers to the judge job" {
+@test "the iterate job hands judge, why, head, round, rounds done and the pr-guard helpers to the judge job" {
   job="$(awk '/^  iterate:/{on=1} /^    steps:/{exit} on' "$REPO_ROOT/$WF")"
   # judge 有两个来源：修满轮数（Gate）和修复员判「不用改」（outcome，MEL-307）。
-  assert_contains "$job" $'      judge: ${{ steps.gate.outputs.judge || steps.outcome.outputs.judge }}\n      judge_reason: ${{ steps.gate.outputs.judge_reason || steps.outcome.outputs.judge_reason }}\n      head: ${{ steps.gate.outputs.head }}\n      round: ${{ steps.gate.outputs.round }}\n      pr_guard: ${{ steps.helpers.outputs.script }}\n'
+  assert_contains "$job" $'      judge: ${{ steps.gate.outputs.judge || steps.outcome.outputs.judge }}\n      judge_reason: ${{ steps.gate.outputs.judge_reason || steps.outcome.outputs.judge_reason }}\n      head: ${{ steps.gate.outputs.head }}\n      round: ${{ steps.gate.outputs.round }}\n      done_rounds: ${{ steps.gate.outputs.done_rounds }}\n      pr_guard: ${{ steps.helpers.outputs.script }}\n'
+}
+
+# 第二阶段修的轮数比 max_fix_rounds 多，prompt 要说实际修了几轮：数目取 Gate 交来的 done_rounds，
+# 不取 max_fix_rounds。
+@test "judge: the prompt counts the rounds actually done" {
+  job="$(awk '/^  round-cap-judge:/{on=1} on' "$REPO_ROOT/$WF")"
+  prompt="$(grep -F '这个 PR 已经自动修了' <<<"$job")"
+  assert_contains "$prompt" 'needs.iterate.outputs.done_rounds'
+  refute_contains "$prompt" 'inputs.max_fix_rounds'
 }
 
 @test "round-cap-judge job is locked down like the fallback reviewer" {

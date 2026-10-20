@@ -254,6 +254,30 @@ m7_body() { printf '🤖 自动修复第 %s 轮已推送。\n\n<!-- pr-guard: fi
   [ ! -e .review/findings.md ]
 }
 
+# judge 的 prompt 要写「已经自动修了几轮」。第二阶段修的轮数比 max_fix_rounds 多：
+# 数目由 Gate 按轮数算出来交过去，不拿输入参数顶。下面的数字是测试设定（max_fix_rounds=5，
+# max_confirmed_fix_rounds=10），不是生产默认值。
+@test "gate: a head handed to the judge reports how many rounds were done" {
+  codex_event
+  live_head "$H"
+  serve_review 4001 "$(gh_review 4001 "$CODEX" NONE "$H" 'body')"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 5)")")"
+  gate
+  assert_equal "$(step_output judge)" true
+  assert_equal "$(step_output round)" 6
+  assert_equal "$(step_output done_rounds)" 5
+}
+
+@test "gate: after the second stage the judge is told ten rounds were done, not max_fix_rounds" {
+  m9_event
+  live_head "$H"
+  fake_route "$COMMENTS" "$(json_array "$(gh_comment 2 melody OWNER "$(m1_body "$H" 10)")")"
+  gate
+  assert_equal "$(step_output judge)" true
+  assert_equal "$(step_output round)" 11
+  assert_equal "$(step_output done_rounds)" 10
+}
+
 # Codex 2026-10-04 的 P2：没有 PAT，judge 的结论发不出去，巡检会一遍遍重新叫它。
 @test "gate: without the owner PAT the cap parks right here with a round-cap alert, as before" {
   codex_event
