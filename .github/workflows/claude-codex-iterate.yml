@@ -4108,7 +4108,7 @@ jobs:
           if [ "$(jq -r .verdict <<<"$STRUCTURED_OUTPUT")" = merge ] && [ "${CODEX_P0:-}" != true ]; then
             file_followups || echo '::warning::filing the follow-ups in Linear failed; the verdict is posted anyway'
             body="$(
-              jq -r --arg head "$HEAD_SHA" --arg reviews "$REVIEWS" --arg n "$MAX_FIX_ROUNDS" --arg why "$park_reason" \
+              jq -r --arg head "$HEAD_SHA" --arg reviews "$REVIEWS" --arg n "$done_rounds" --arg why "$park_reason" \
                 --argjson filed "$filed" --argjson unfiled "$unfiled" "$sanitize$later_note"'
                 (if $why == "no-fix" then
                   "🤖 Claude 看完审查意见觉得都不用改，又逐条复核了一遍：\(.findings | length) 条都不拦合并；CI 全绿后自动合并。\n\n"

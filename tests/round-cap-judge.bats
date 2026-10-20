@@ -124,8 +124,20 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   export ROUND=11
   run run_block "$WF" "$POST"
   assert_equal "$status" 0
-  assert_contains "$(m8_post)" '🤖 自动修了 5 轮'
+  assert_contains "$(m8_post)" '🤖 自动修了 10 轮，审查意见还剩'
   assert_contains "$(m8_post)" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
+}
+
+# M8 写的是实际修了几轮（ROUND - 1），不是 max_fix_rounds：第二阶段修到第 8 轮才只剩 P2 放行时，
+# 已经修了 7 轮，写 5 就少报了。
+@test "a stage-two release counts the rounds actually done, not max_fix_rounds" {
+  use_verdict "$(verdict merge '确认的 bug 都修完了，剩下是措辞' "$(item P2 '措辞')")"
+  export ROUND=8
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$(m8_post)" '🤖 自动修了 7 轮，审查意见还剩 1 条。'
+  refute_contains "$(m8_post)" '自动修了 5 轮'
+  assert_equal "$(posted)" true
 }
 
 # Codex 标了 P0、Claude 一条都不认：不替人拿主意，停车通知，不接着修也不放行。
