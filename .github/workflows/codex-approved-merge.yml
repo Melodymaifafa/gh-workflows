@@ -1839,5 +1839,22 @@ jobs:
             request="🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 $(date -u -d "@$((quota_until + 28800))" '+%m-%d %H:%M') 之后再试 Codex。"
             request+=$'\n\n'"<!-- codex-review-head: $new_head -->"$'\n'"<!-- pr-guard: codex-silent head=$new_head reason=quota -->"
           fi
+          # 合出来的新 head 接着旧 head 的轮数：不带 fix-round，iterate 就从第 1 轮重新算，每解一次
+          # 冲突轮数清零一次，修复轮数上限永远到不了。判据同 iterate Gate 的 last_round（只认可信作者
+          # 的 M1 / M7）。读不到评论也照样请审，只是不带轮数。
+          last_round="$(gh api --paginate --slurp "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" |
+            jq -r --arg h "$HEAD_SHA" '
+              add // [] | map(select(.user.login == "github-actions[bot]" or .author_association == "OWNER"))
+              | [.[] | (.body // "")
+                | ((select(contains("<!-- codex-review-head: " + $h + " -->"))
+                    | capture("<!-- fix-round: (?<n>[0-9]+) -->").n),
+                   capture("<!-- pr-guard: fix-round head=" + $h + " round=(?<n>[0-9]+) -->").n)
+                | tonumber]
+              | max // 0')" || last_round=''
+          if ! [[ "$last_round" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Could not read the comments on the old head; the review request carries no fix-round"
+            last_round=0
+          fi
+          [ "$last_round" -eq 0 ] || request+=$'\n'"<!-- fix-round: $last_round -->"
           gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$request" >/dev/null ||
             echo "::warning::Could not request a review; the sweeper asks again later"
