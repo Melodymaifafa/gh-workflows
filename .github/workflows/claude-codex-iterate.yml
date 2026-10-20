@@ -92,11 +92,15 @@ on:
         type: string
         default: MEL
 
+# 不要 id-token: write：有了它，每个 run: 步骤的环境里都有 ACTIONS_ID_TOKEN_REQUEST_TOKEN / _URL
+# （2026-10-20 实测），跑被审 PR 验证命令的那一步也有 —— 它拿去换一个 OIDC JWT，再换成有写
+# 权限的 Claude App 令牌（MEL-254 要防的正是这个）。修复员改传 job 自己的令牌，action 就不再
+# 要 OIDC（见修复员那一步的 github_token）。这一块只管 iterate：round-cap-judge 和 round-cap-park
+# 各有自己的 permissions:。调用桩照旧给 id-token: write 也没关系，被调用的工作流只能比调用方要得少。
 permissions:
   contents: write
   pull-requests: write
   issues: write
-  id-token: write
   actions: read
 
 jobs:
@@ -2008,6 +2012,10 @@ jobs:
         continue-on-error: true
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # job 自己的 GITHUB_TOKEN：action 不再用 OIDC 换 App token（不要 OIDC、不做工作流校验、
+          # 也不吊销），所以本工作流不要 id-token: write（见顶上 permissions:）。写权限 job 层已给。
+          # action 会把它写进 origin 的地址、跑完不收回 —— Put back the PR's own config files 抹掉它。
+          github_token: ${{ github.token }}
           # action 默认无视 bot 发起的触发（防循环）；本工作流的触发者恰恰是 Codex bot
           allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"
           # 全量输出进日志，否则只有 init/result 两行，排障全靠猜；公开仓库日志人人可看，只在私有仓库开
@@ -2468,6 +2476,8 @@ jobs:
           # 判据故意不去读那句日志：同一份日志里原样带着 Codex 的 review 正文（外部输入），
           # 照抄那句报错就能骗出一条错的告警（同 classify-claude-failure.sh 开头那条规矩）。
           # 改成直接比它比的那两份文件 —— 这是伪造不了的，而且用不着 actions 读日志的权限。
+          # 修复员 2026-10-20 起传 job 自己的令牌，action 不再做这道校验，修复员这一步已经
+          # 走不到这种结局；判据留着，哪天换回 App token 还用得上。
           no_claude_record() {
             [ -z "${STRUCTURED:-}" ] || return 1
             [ -z "${EXEC_FILE:-}" ] || [ ! -f "$EXEC_FILE" ]

@@ -117,6 +117,29 @@ claude_prompt() {
   assert_equal "$(jq -c .permissions.deny <<<"$settings")" "$reviewer_deny"
 }
 
+# job 带着 id-token: write 时，每个 run: 步骤的环境里都有 ACTIONS_ID_TOKEN_REQUEST_TOKEN / _URL
+# （2026-10-20 实测），跑被审 PR 验证命令的那一步也有：它拿去换一个 OIDC JWT，再换成有写权限的
+# Claude App 令牌。iterate 有自己的 permissions: 就看那一块，没有就看工作流顶层那一块。
+@test "iterate: the job asks for no OIDC token" {
+  job="$(awk '/^  iterate:$/ { f = 1; next } f && /^  [a-z][a-z-]*:$/ { exit } f' "$REPO_ROOT/$WF")"
+  [ -n "$job" ] || { echo 'no iterate job found' >&2; return 1; }
+  perms="$(awk '/^    permissions:/ { f = 1; print; next } f && !/^      / { exit } f' <<<"$job")"
+  if [ -z "$perms" ]; then
+    perms="$(awk '/^permissions:/ { f = 1; print; next } f && !/^  / { exit } f' "$REPO_ROOT/$WF")"
+  fi
+  # 取到的确实是那一块权限，下面那条 refute 才不是在空字符串上空转
+  assert_contains "$perms" 'contents: write'
+  refute_contains "$perms" 'id-token'
+}
+
+# 传了 github_token，action 就直接用它，不去要 OIDC、不换 App 令牌（v1.0.241 的
+# src/github/token.ts setupGitHubToken）。只许一行：写两行时生效的是哪一行全看解析器。
+@test "fixer: passes the job token so the action never mints an App token" {
+  step="$(claude_step_block)"
+  assert_equal "$(grep -c '^          github_token:' <<<"$step")" 1
+  assert_contains "$step" $'\n          github_token: ${{ github.token }}\n'
+}
+
 # 验证命令只能出现在不带凭据的那一步的 env: 里，不能再写进提示词让 Claude 自己跑。
 @test "claude: the verify commands are no longer handed to the fixer prompt" {
   prompt="$(claude_prompt)"
