@@ -2023,7 +2023,8 @@ jobs:
           # 读不了 .git：action 在 Claude 开跑前就把令牌写进了 origin 的地址，读到就可能被意见
           # 带偏、抄进总结发出去。// 开头从文件系统根起算，GitHub 托管机和 ghwf-local 的工作区
           # 路径不同也一样管用；这一条同时挡住 Grep / Glob 搜 .git（2026-10-21 用 Claude Code
-          # 2.1.300 实测：不加时 Read 和 Grep 都读出了令牌，加了一个都读不到）。
+          # 2.1.300 实测，不是钉住的 action 自带的 2.1.289：不加时 Read 和 Grep 都读出了令牌，
+          # 加了一个都读不到）。
           settings: |
             {
               "disableAllHooks": true,
@@ -2048,8 +2049,9 @@ jobs:
           #   push、gh pr comment 早就不给了，验证、commit、push、发评论都在后面的独立步骤（MEL-254）。
           # · action 在 Claude 开跑前把 job 的令牌写进了 origin 的地址。Claude Code 自带一批免批的只读
           #   命令，不看 --allowedTools：只要还有 Bash，git remote -v、git config --get remote.origin.url
-          #   就能把它连令牌一起打出来（2026-10-21 实测）。Monitor 工具也跑命令，只禁 Bash 时它照样
-          #   跑得了 git remote -v（同日实测）。所以按白名单给工具：会跑命令的一样都不在里面。
+          #   就能把它连令牌一起打出来（2026-10-21 用 Claude Code 2.1.300 实测，不是钉住的 action
+          #   自带的 2.1.289）。Monitor 工具也跑命令，只禁 Bash 时它照样跑得了 git remote -v
+          #   （同日同版本实测）。所以按白名单给工具：会跑命令的一样都不在里面。
           # 修复员于是不能自己调 gh / git：意见由 Gate 预取到 .review/findings.md，PR 的文件直接用
           # Read / Glob / Grep 读。.git 读不到（上面 settings 的禁读），总结发出去前还剥一遍令牌。
           # 不许为了省事把任何 Bash(...) 放回来。
@@ -3900,7 +3902,8 @@ jobs:
               }
             }
           # 工具按白名单给（--tools），会跑命令的一样都没有：只禁 Bash 时 Monitor 工具照样能跑 Claude Code
-          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21 实测）。
+          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21
+          # 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。
           # Bash 和 Monitor 在 --disallowedTools 里再禁一次，白名单哪天没递进去也还有这一道。
           claude_args: |
             --model ${{ inputs.claude_model }}
