@@ -1013,7 +1013,7 @@ jobs:
             --add-dir pr
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
+            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,RunWorkflow,SendMessage,RemoteTrigger,PowerShell,CronCreate,AppifactRepl,self_hosted_runner_spawn_local,self_hosted_runner_requeue_session"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","findings","summary_zh"],"properties":{"verdict":{"type":"string","enum":["clean","findings"]},"summary_zh":{"type":"string","maxLength":400},"findings":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["path","line","severity","title","detail"],"properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":0},"severity":{"type":"string","enum":["P0","P1","P2"]},"title":{"type":"string","maxLength":120},"detail":{"type":"string","maxLength":800}}}}}}'
           prompt: |
             你在代替 Codex 审 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number || github.event.issue.number }}，只审 head 提交 ${{ needs.watch-and-merge.outputs.head }}。
@@ -1553,7 +1553,7 @@ jobs:
             --add-dir pr
             --tools "Read,Glob,Grep,Edit"
             --allowedTools "Read,Glob,Grep,Edit(pr/**)"
-            --disallowedTools "Bash,Monitor,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
+            --disallowedTools "Bash,Monitor,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,RunWorkflow,SendMessage,RemoteTrigger,PowerShell,CronCreate,AppifactRepl,self_hosted_runner_spawn_local,self_hosted_runner_requeue_session"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","files","summary_zh"],"properties":{"verdict":{"type":"string","enum":["resolved","give_up"]},"summary_zh":{"type":"string","maxLength":400},"files":{"type":"array","maxItems":15,"items":{"type":"object","additionalProperties":false,"required":["path","how"],"properties":{"path":{"type":"string"},"how":{"type":"string","maxLength":200}}}}}}'
           prompt: |
             ${{ github.repository }} 的 PR #${{ github.event.pull_request.number || github.event.issue.number }} 跟 ${{ inputs.base_branch }} 有冲突。

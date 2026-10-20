@@ -492,7 +492,7 @@ $markers" 'src/`x`.sh' 5)" \
   # （钉住的 2.1.289 里 --tools 管不住开跑后才注册的内置工具和旧工具名）。
   assert_contains "$job" '--tools "Read,Glob,Grep"'
   assert_contains "$job" '--allowedTools "Read,Glob,Grep"'
-  assert_contains "$job" '--disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"'
+  assert_contains "$job" '--disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,RunWorkflow,SendMessage,RemoteTrigger,PowerShell,CronCreate,AppifactRepl,self_hosted_runner_spawn_local,self_hosted_runner_requeue_session"'
   # CODEX_TRIGGER_TOKEN 只出现在 verdict step 里。
   assert_equal "$(count_of "$job" 'secrets.CODEX_TRIGGER_TOKEN')" 1
   verdict_step="$(awk '/- name: Post Claude verdict/{on=1} on' <<<"$job")"

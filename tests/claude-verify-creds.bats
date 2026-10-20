@@ -81,7 +81,7 @@ claude_prompt() {
   refute_contains "$tools" 'Bash(sh'
 
   # 还得真能改文件，否则这一步白跑、这条断言也就空转
-  assert_contains "$tools" 'Edit,MultiEdit,Write'
+  assert_contains "$tools" 'Edit(./**)'
 }
 
 # 写权限动作全部挪出这一步：它自己 push / 发评论就意味着验证命令跟凭据同处一步。
@@ -143,10 +143,10 @@ claude_prompt() {
   assert_equal "$(sed -nE 's/^--tools "(.*)"$/\1/p' <<<"$args")" 'Read,Glob,Grep,Edit,MultiEdit,Write'
   assert_equal "$(grep -c '^--tools ' <<<"$args")" 1
   disallowed="$(sed -nE 's/^--disallowedTools "(.*)"$/\1/p' <<<"$args")"
-  assert_equal "$disallowed" 'Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell'
+  assert_equal "$disallowed" 'Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,RunWorkflow,SendMessage,RemoteTrigger,PowerShell,CronCreate,AppifactRepl,self_hosted_runner_spawn_local,self_hosted_runner_requeue_session'
   assert_equal "$(grep -c '^--disallowedTools' <<<"$args")" 1
   tools="$(sed -nE 's/^--allowedTools "(.*)"$/\1/p' <<<"$args")"
-  assert_equal "$tools" 'Edit,MultiEdit,Write'
+  assert_equal "$tools" 'Edit(./**)'
   refute_contains "$args" 'Bash('
 
   settings="$(with_block settings <<<"$step")"
@@ -156,6 +156,25 @@ claude_prompt() {
   for rule in '//**/.git' '//**/.git/**' '~/.gitconfig' '~/.config/git/**'; do
     assert_contains "$deny" "\"Edit($rule)\""
   done
+}
+
+# 修复员的改文件工具以前不限路径（--allowedTools 里是光秃秃的 Edit,MultiEdit,Write）：被意见带偏，它能写
+# ~/.jq、~/.curlrc 这类后面带凭据的步骤会读的点文件，也能写 /tmp、写到工作区外面（PR #74 复审）。现在只放行
+# 工作区里的路径，照解冲突那一步的 Edit(pr/**)：工作区就是修复员的 cwd，所以写成相对 cwd 的 Edit(./**)；
+# Edit 规则管所有改文件的工具，Write 也算；headless 下清单没放行的改动一律拒掉。2026-10-21 用 Claude Code
+# 2.1.300 实测（钉住的 action 自带 2.1.289）：工作区里新建文件、改 .github/workflows 下的文件都行，~/.jq、
+# /tmp/x、../outside.txt 都被拒，.git 照旧禁写；换回光秃秃的 Edit,MultiEdit,Write，外面那三个当场都写成了。
+@test "fixer: the Claude fixer may write only inside the workspace" {
+  step="$(claude_step_block)"
+  args="$(with_block claude_args <<<"$step")"
+  assert_equal "$(grep -c '^--allowedTools' <<<"$args")" 1
+  assert_equal "$(sed -nE 's/^--allowedTools "(.*)"$/\1/p' <<<"$args")" 'Edit(./**)'
+  # 放行规则管的工具还得真在白名单里，不然这一步改不了文件、白跑
+  tools=",$(sed -nE 's/^--tools "(.*)"$/\1/p' <<<"$args"),"
+  assert_contains "$tools" ',Edit,'
+  assert_contains "$tools" ',Write,'
+  # 工作区里的 .git 不归放行规则管，仍然靠禁写挡着
+  assert_contains "$(with_block settings <<<"$step" | jq -c .permissions.deny)" '"Edit(//**/.git/**)"'
 }
 
 # curl_calls <文件>…：每一处 curl 调用打一行 `ok|bad <文件>:<行号>: <原文>`。bad = curl 后面紧跟的
@@ -242,7 +261,11 @@ curl_calls() {
         assert_contains "$allowed" " $t "
       done
       disallowed="$(sed -nE 's/^ *--disallowedTools "(.*)"$/\1/p' <<<"$block")"
-      for t in Bash Monitor PowerShell Agent Task Skill Workflow SendMessage RemoteTrigger; do
+      # RunWorkflow 起是 Claude Code 2.1.300 里另外几个会跑代码的工具：Workflow 的别名 RunWorkflow、排定时
+      # prompt 的 CronCreate、跑 JavaScript 的 AppifactRepl（PR #74 复审点的名），加上二进制里同样标着
+      # 「会执行代码」的两个 self_hosted_runner_*（起本机进程）。
+      for t in Bash Monitor PowerShell Agent Task Skill Workflow RunWorkflow SendMessage RemoteTrigger \
+               CronCreate AppifactRepl self_hosted_runner_spawn_local self_hosted_runner_requeue_session; do
         assert_contains ",$disallowed," ",$t,"
       done
     done <<<"$blocks"

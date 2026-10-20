@@ -1367,10 +1367,11 @@ jobs:
               trusted_path="${trusted_path:+$trusted_path:}$dir"
             done
             PATH="$trusted_path"
-            # $HOME 也换成这一步现开的空目录，在跑任何一条 jq / gh / git / curl 之前。修复员的改文件工具、
-            # 退回 runner 用户跑的验证命令都写得动原来那个 $HOME，而这几样命令先读它下面的点文件：jq 1.7.1
-            # 自动加载 ~/.jq，一个 def 就换掉 gsub / select（PR #74 复审的 Critical）；gh 读 ~/.config/gh
-            # （http_unix_socket 让每个请求都走别人的 socket），git 读 ~/.gitconfig，curl 读 ~/.curlrc。
+            # $HOME 也换成这一步现开的空目录，在跑任何一条 jq / gh / git / curl 之前。退回 runner 用户跑的
+            # 验证命令写得动原来那个 $HOME（修复员以前也写得动，现在只放行工作区），而这几样命令先读它下面的
+            # 点文件：jq 1.7.1 自动加载 ~/.jq，一个 def 就换掉 gsub / select（PR #74 复审的 Critical）；
+            # gh 读 ~/.config/gh（http_unix_socket 让每个请求都走别人的 socket），git 读 ~/.gitconfig，
+            # curl 读 ~/.curlrc。
             # 逐个工具堵是跟着复审一条条追，所以整个换掉；指回原来那个 $HOME 的配置目录变量一并清掉
             # （托管 runner 上 XDG_CONFIG_HOME 就是 /home/runner/.config）。这几步要的东西都不在 $HOME 里：
             # gh 认 GH_TOKEN，push 的凭据和 git 配置都由下面现给，没有缓存。别的带凭据的步骤同一段三行
@@ -2069,10 +2070,17 @@ jobs:
             }
           # 修复员没有 Bash：工具按白名单给（--tools），只有读文件的 Read / Glob / Grep 和改文件的
           # Edit / MultiEdit / Write。会跑命令、会派子代理的工具在 --disallowedTools 里再一个个点名禁掉
-          # （Bash、Monitor、PowerShell、Agent 和它的旧名 Task、Skill、Workflow、SendMessage、RemoteTrigger）：
+          # （Bash、Monitor、PowerShell、Agent 和它的旧名 Task、Skill、Workflow 和它的别名 RunWorkflow、
+          # SendMessage、RemoteTrigger、排定时 prompt 的 CronCreate、跑 JavaScript 的 AppifactRepl、起本机进程的
+          # 两个 self_hosted_runner_*，后面这几样是 2.1.300 二进制里标着「会执行代码」的工具）：
           # 钉住的 action 自带的 Claude Code 2.1.289 里，--tools 管不住开跑后才注册的内置工具，旧工具名
           # 也摸得到白名单外的工具（2.1.295 的 release notes 写着修了这两处），光靠白名单不够。
-          # 注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件。
+          # 改文件只放行工作区里的路径（--allowedTools "Edit(./**)"，照解冲突那一步的 Edit(pr/**)）：工作区
+          # 就是 action 的 cwd，规则相对 cwd，托管机和 ghwf-local 都一样；Edit 规则管所有改文件的工具，Write
+          # 也算；headless 下没放行的改动一律拒掉。以前光秃秃的 Edit,MultiEdit,Write 不限路径，被意见带偏就能写
+          # ~/.jq、~/.curlrc 这类后面带凭据的步骤会读的点文件（PR #74 复审）。2026-10-21 用 Claude Code 2.1.300
+          # 实测：收窄之后 ~/.jq、/tmp/x、../outside.txt 都被拒，工作区里新建、改 .github/ 下的文件照旧行。
+          # 注意 --allowedTools 是全量清单：这条 Edit 规则不列出来就改不了文件。
           # 为什么一条 Bash 都不留：
           # · 这一步必须有写权限令牌（action 自己要用），被审 PR 的代码一旦在这一步跑起来，它跟令牌
           #   同一个用户，/proc/<pid>/environ 就把令牌读回去。所以 runtime 工具链、git add / commit /
@@ -2092,8 +2100,8 @@ jobs:
             --strict-mcp-config
             --max-turns 80
             --tools "Read,Glob,Grep,Edit,MultiEdit,Write"
-            --allowedTools "Edit,MultiEdit,Write"
-            --disallowedTools "Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
+            --allowedTools "Edit(./**)"
+            --disallowedTools "Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,RunWorkflow,SendMessage,RemoteTrigger,PowerShell,CronCreate,AppifactRepl,self_hosted_runner_spawn_local,self_hosted_runner_requeue_session"
             --json-schema '{"type":"object","properties":{"pushed":{"type":"boolean"},"fixed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["pushed","fixed","skipped"],"additionalProperties":false}'
           prompt: |
             ${{ steps.gate.outputs.reviewer }} 刚刚 review 了 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }}。
@@ -2418,8 +2426,8 @@ jobs:
           done
           PATH="$trusted_path"
           # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
-          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
-          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          # 之前。前面退回 runner 用户跑的验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件
+          # （~/.jq 一个 def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
           HOME="$(mktemp -d)"
           export HOME
           unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
@@ -2570,8 +2578,8 @@ jobs:
           done
           PATH="$trusted_path"
           # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
-          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
-          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          # 之前。前面退回 runner 用户跑的验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件
+          # （~/.jq 一个 def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
           HOME="$(mktemp -d)"
           export HOME
           unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
@@ -2762,8 +2770,8 @@ jobs:
           done
           PATH="$trusted_path"
           # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
-          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
-          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          # 之前。前面退回 runner 用户跑的验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件
+          # （~/.jq 一个 def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
           HOME="$(mktemp -d)"
           export HOME
           unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
@@ -3037,8 +3045,8 @@ jobs:
           done
           PATH="$trusted_path"
           # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
-          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
-          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          # 之前。前面退回 runner 用户跑的验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件
+          # （~/.jq 一个 def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
           HOME="$(mktemp -d)"
           export HOME
           unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
@@ -3412,8 +3420,8 @@ jobs:
           done
           PATH="$trusted_path"
           # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
-          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
-          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          # 之前。前面退回 runner 用户跑的验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件
+          # （~/.jq 一个 def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
           HOME="$(mktemp -d)"
           export HOME
           unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
@@ -3572,8 +3580,8 @@ jobs:
           done
           PATH="$trusted_path"
           # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
-          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
-          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          # 之前。前面退回 runner 用户跑的验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件
+          # （~/.jq 一个 def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
           HOME="$(mktemp -d)"
           export HOME
           unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
@@ -3662,8 +3670,8 @@ jobs:
           done
           PATH="$trusted_path"
           # 再换掉 $HOME：现开一个空目录，指回原来那个 $HOME 的配置目录变量一并清掉，在跑任何一条外部命令
-          # 之前。前面的修复员和验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件（~/.jq 一个
-          # def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
+          # 之前。前面退回 runner 用户跑的验证命令写得动原来那个，jq / gh / git / curl 都先读它下面的点文件
+          # （~/.jq 一个 def 就换掉 gsub、select）。理由见 Define the fix push guard 里同一段。
           HOME="$(mktemp -d)"
           export HOME
           unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR CURL_HOME GIT_CONFIG_GLOBAL NPM_CONFIG_USERCONFIG
@@ -3986,7 +3994,7 @@ jobs:
             --add-dir pr
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
+            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,RunWorkflow,SendMessage,RemoteTrigger,PowerShell,CronCreate,AppifactRepl,self_hosted_runner_spawn_local,self_hosted_runner_requeue_session"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","findings","summary_zh"],"properties":{"verdict":{"type":"string","enum":["merge","stop"]},"summary_zh":{"type":"string","maxLength":400},"findings":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"object","additionalProperties":false,"required":["id","severity","later","title","reason"],"properties":{"id":{"type":"string","pattern":"^F[0-9]+$"},"severity":{"type":"string","enum":["P0","P1","P2"]},"later":{"type":"boolean"},"title":{"type":"string","maxLength":120},"reason":{"type":"string","maxLength":400}}}}}}'
           prompt: |
             你在给 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }} 做收尾判断。
