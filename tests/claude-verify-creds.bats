@@ -127,8 +127,9 @@ claude_prompt() {
 # action 在 Claude 开跑前就把 job 自己的令牌写进了 origin 的地址（git-config.ts）。修复员读得到
 # 它，再被意见带偏写进总结，后面那一步就把它发到 PR 上。Claude Code 自带一批免批的只读命令
 # （git remote -v、git config --get …），不看 --allowedTools，放一条 Bash(...) 就等于全放
-# （2026-10-21 实测）。光在 --disallowedTools 里去掉 Bash 还不够：Monitor 工具也跑命令，同一批
-# 免批命令照样能跑（同日实测，git remote -v 又打出了令牌）。所以工具按白名单给（--tools），
+# （2026-10-21 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。光在
+# --disallowedTools 里去掉 Bash 还不够：Monitor 工具也跑命令，同一批免批命令照样能跑
+# （同日同版本实测，git remote -v 又打出了令牌）。所以工具按白名单给（--tools），
 # 只有读文件和改文件的那几样，Bash 和 Monitor 另外再禁一次（白名单哪天没递进去也还有这一道）；
 # 读文件的工具碰不到 .git（规则从文件系统根起算，GitHub 托管机和 ghwf-local 都管用）。
 @test "fixer: the Claude fixer has no Bash tool at all and cannot read .git" {

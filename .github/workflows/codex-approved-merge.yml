@@ -1002,7 +1002,8 @@ jobs:
               }
             }
           # 工具按白名单给（--tools），会跑命令的一样都没有：只禁 Bash 时 Monitor 工具照样能跑 Claude Code
-          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21 实测）。
+          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21
+          # 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。
           # Bash 和 Monitor 在 --disallowedTools 里再禁一次，白名单哪天没递进去也还有这一道。
           claude_args: |
             --model ${{ inputs.claude_model }}
@@ -1540,7 +1541,8 @@ jobs:
             }
           # 只许改 pr/ 下已有的文件：没有 Bash（不跑任何命令），没有 Write（不新建文件）。
           # 工具按白名单给（--tools），会跑命令的一样都没有：只禁 Bash 时 Monitor 工具照样能跑 Claude Code
-          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21 实测）。
+          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21
+          # 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。
           # Bash 和 Monitor 在 --disallowedTools 里再禁一次，白名单哪天没递进去也还有这一道。
           claude_args: |
             --model ${{ inputs.claude_model }}
