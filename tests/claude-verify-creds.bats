@@ -130,7 +130,8 @@ claude_prompt() {
 # （2026-10-21 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。光在
 # --disallowedTools 里去掉 Bash 还不够：Monitor 工具也跑命令，同一批免批命令照样能跑
 # （同日同版本实测，git remote -v 又打出了令牌）。所以工具按白名单给（--tools），
-# 只有读文件和改文件的那几样，Bash 和 Monitor 另外再禁一次（白名单哪天没递进去也还有这一道）；
+# 只有读文件和改文件的那几样，会跑命令、会派子代理的工具另外再点名禁一次（钉住的 2.1.289 里
+# 白名单管不住开跑后才注册的内置工具和旧工具名，2.1.295 才修）；
 # 读文件的工具碰不到 .git（规则从文件系统根起算，GitHub 托管机和 ghwf-local 都管用）。
 @test "fixer: the Claude fixer has no Bash tool at all and cannot read .git" {
   step="$(claude_step_block)"
@@ -138,7 +139,7 @@ claude_prompt() {
   assert_equal "$(sed -nE 's/^--tools "(.*)"$/\1/p' <<<"$args")" 'Read,Glob,Grep,Edit,MultiEdit,Write'
   assert_equal "$(grep -c '^--tools ' <<<"$args")" 1
   disallowed="$(sed -nE 's/^--disallowedTools "(.*)"$/\1/p' <<<"$args")"
-  assert_equal "$disallowed" 'Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task'
+  assert_equal "$disallowed" 'Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell'
   assert_equal "$(grep -c '^--disallowedTools' <<<"$args")" 1
   tools="$(sed -nE 's/^--allowedTools "(.*)"$/\1/p' <<<"$args")"
   assert_equal "$tools" 'Edit,MultiEdit,Write'
@@ -152,7 +153,9 @@ claude_prompt() {
 
 # 同一个缺口不只在修复员身上：只靠 --disallowedTools 去掉 Bash 时，Monitor 照样能跑免批的
 # 只读命令。所以两个工作流里每一个 claude-code-action 步骤都要有一行 --tools 白名单，里面只有
-# 读文件 / 改文件的工具，Bash 和 Monitor 另外再禁一次。步骤数也数一遍，免得判定空转。
+# 读文件 / 改文件的工具；会跑命令、会派子代理的工具另外再一个个点名禁掉：钉住的 2.1.289 里
+# --tools 管不住开跑后才注册的内置工具，旧工具名（Task）也摸得到白名单外的工具（2.1.295 才修）。
+# 步骤数也数一遍，免得判定空转。
 @test "every Claude step runs with a tool whitelist that holds no command-running tool" {
   allowed=' Read Glob Grep Edit MultiEdit Write '
   steps=0
@@ -171,8 +174,9 @@ claude_prompt() {
         assert_contains "$allowed" " $t "
       done
       disallowed="$(sed -nE 's/^ *--disallowedTools "(.*)"$/\1/p' <<<"$block")"
-      assert_contains ",$disallowed," ',Bash,'
-      assert_contains ",$disallowed," ',Monitor,'
+      for t in Bash Monitor PowerShell Agent Task Skill Workflow SendMessage RemoteTrigger; do
+        assert_contains ",$disallowed," ",$t,"
+      done
     done <<<"$blocks"
   done
   # 修复员、judge、代审、解冲突

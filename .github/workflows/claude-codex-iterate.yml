@@ -2041,8 +2041,11 @@ jobs:
               }
             }
           # 修复员没有 Bash：工具按白名单给（--tools），只有读文件的 Read / Glob / Grep 和改文件的
-          # Edit / MultiEdit / Write；Bash 和 Monitor 在 --disallowedTools 里再禁一次，白名单哪天没递进去
-          # 也还有这一道。注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件。
+          # Edit / MultiEdit / Write。会跑命令、会派子代理的工具在 --disallowedTools 里再一个个点名禁掉
+          # （Bash、Monitor、PowerShell、Agent 和它的旧名 Task、Skill、Workflow、SendMessage、RemoteTrigger）：
+          # 钉住的 action 自带的 Claude Code 2.1.289 里，--tools 管不住开跑后才注册的内置工具，旧工具名
+          # 也摸得到白名单外的工具（2.1.295 的 release notes 写着修了这两处），光靠白名单不够。
+          # 注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件。
           # 为什么一条 Bash 都不留：
           # · 这一步必须有写权限令牌（action 自己要用），被审 PR 的代码一旦在这一步跑起来，它跟令牌
           #   同一个用户，/proc/<pid>/environ 就把令牌读回去。所以 runtime 工具链、git add / commit /
@@ -2063,7 +2066,7 @@ jobs:
             --max-turns 80
             --tools "Read,Glob,Grep,Edit,MultiEdit,Write"
             --allowedTools "Edit,MultiEdit,Write"
-            --disallowedTools "Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task"
+            --disallowedTools "Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
             --json-schema '{"type":"object","properties":{"pushed":{"type":"boolean"},"fixed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["pushed","fixed","skipped"],"additionalProperties":false}'
           prompt: |
             ${{ steps.gate.outputs.reviewer }} 刚刚 review 了 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }}。
@@ -3904,7 +3907,8 @@ jobs:
           # 工具按白名单给（--tools），会跑命令的一样都没有：只禁 Bash 时 Monitor 工具照样能跑 Claude Code
           # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21
           # 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。
-          # Bash 和 Monitor 在 --disallowedTools 里再禁一次，白名单哪天没递进去也还有这一道。
+          # 会跑命令、会派子代理的工具在 --disallowedTools 里再一个个点名禁掉（点名的那几样同修复员）：
+          # 2.1.289 的 --tools 管不住开跑后才注册的内置工具，旧工具名也摸得到白名单外的工具（2.1.295 才修）。
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
@@ -3912,7 +3916,7 @@ jobs:
             --add-dir pr
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"
+            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","findings","summary_zh"],"properties":{"verdict":{"type":"string","enum":["merge","stop"]},"summary_zh":{"type":"string","maxLength":400},"findings":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"object","additionalProperties":false,"required":["id","severity","later","title","reason"],"properties":{"id":{"type":"string","pattern":"^F[0-9]+$"},"severity":{"type":"string","enum":["P0","P1","P2"]},"later":{"type":"boolean"},"title":{"type":"string","maxLength":120},"reason":{"type":"string","maxLength":400}}}}}}'
           prompt: |
             你在给 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }} 做收尾判断。

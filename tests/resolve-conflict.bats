@@ -761,7 +761,7 @@ stuck_env() { # stuck_env <reason> [detail]
   assert_contains "$claude" '--add-dir pr'
   assert_contains "$claude" '--tools "Read,Glob,Grep,Edit"'
   assert_contains "$claude" '--allowedTools "Read,Glob,Grep,Edit(pr/**)"'
-  assert_contains "$claude" '--disallowedTools "Bash,Monitor,Write,NotebookEdit,WebFetch,WebSearch,Task"'
+  assert_contains "$claude" '--disallowedTools "Bash,Monitor,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"'
   assert_contains "$claude" '"Edit(pr/.git/**)"'
   assert_contains "$claude" '"disableAllHooks": true'
   assert_contains "$claude" 'github_token: ${{ github.token }}'
