@@ -490,6 +490,71 @@ nth_body() {
     "🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 01-01 08:00 之后再试 Codex。"$'\n\n'"<!-- codex-review-head: $NEW -->"$'\n'"<!-- pr-guard: codex-silent head=$NEW reason=quota -->"
 }
 
+# 旧 head 上修到第 2 轮：可信的 M1（第 1 轮）和 M7（第 2 轮）。claude[bot] 写的轮数、别的 head 上的轮数不算。
+old_head_at_round_2() {
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(gh_comment 1 Melodymaifafa OWNER "$(m1_body "$HEAD_SHA" 1)")" \
+    "$(gh_comment 2 'github-actions[bot]' NONE "🤖 第 2 轮修复已推送。"$'\n\n'"<!-- pr-guard: fix-round head=$HEAD_SHA round=2 -->")" \
+    "$(gh_comment 3 'claude[bot]' NONE "<!-- pr-guard: fix-round head=$HEAD_SHA round=9 -->")" \
+    "$(gh_comment 4 Melodymaifafa OWNER "$(m1_body "$OTHER" 5)")")"
+}
+
+@test "resolve-conflict: the review request for the merged head carries the old head's round" {
+  resolved_and_committed
+  old_head_at_round_2
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  assert_called 'gh api POST repos/o/r/issues/7/comments' 2
+  assert_equal "$(nth_body 2 'gh api POST repos/o/r/issues/7/comments')" \
+    "@codex review"$'\n\n'"<!-- codex-review-head: $NEW -->"$'\n'"<!-- fix-round: 2 -->"
+}
+
+# 连着两次自动合冲突：旧 head 本身就是上一次合并出来的，上面没有 M7，轮数只写在上一条请审（M1）里。
+@test "resolve-conflict: a round carried only on the previous review request is kept" {
+  resolved_and_committed
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(gh_comment 1 Melodymaifafa OWNER "$(m1_body "$HEAD_SHA" 3)")")"
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  assert_equal "$(nth_body 2 'gh api POST repos/o/r/issues/7/comments')" \
+    "@codex review"$'\n\n'"<!-- codex-review-head: $NEW -->"$'\n'"<!-- fix-round: 3 -->"
+}
+
+@test "resolve-conflict: a head with no fix rounds gets no fix-round marker" {
+  resolved_and_committed
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(gh_comment 1 Melodymaifafa OWNER "$(m1_body "$HEAD_SHA")")" \
+    "$(gh_comment 2 'github-actions[bot]' NONE "<!-- pr-guard: fix-round head=$OTHER round=3 -->")")"
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  request="$(nth_body 2 'gh api POST repos/o/r/issues/7/comments')"
+  assert_equal "$request" "@codex review"$'\n\n'"<!-- codex-review-head: $NEW -->"
+  refute_contains "$request" 'fix-round'
+}
+
+@test "resolve-conflict: the codex-silent variant carries the round too" {
+  resolved_and_committed
+  old_head_at_round_2
+  fake_route "repos/o/gh-workflows/issues?state=open&creator=o&per_page=100" \
+    '[{"number":40,"user":{"login":"o"},"body":"x\n\n<!-- codex-quota-state: hit=1 until=4102444800 strikes=1 -->"}]'
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  assert_equal "$(nth_body 2 'gh api POST repos/o/r/issues/7/comments')" \
+    "🤖 Codex 审查额度用完了，这次请 Claude 审。北京时间 01-01 08:00 之后再试 Codex。"$'\n\n'"<!-- codex-review-head: $NEW -->"$'\n'"<!-- pr-guard: codex-silent head=$NEW reason=quota -->"$'\n'"<!-- fix-round: 2 -->"
+}
+
+# 读不到评论也照样请审，只是不带轮数：请审不能因为算不出轮数就不发。
+@test "resolve-conflict: an unreadable comment list still asks for the review, without a round" {
+  resolved_and_committed
+  old_head_at_round_2
+  fake_route_fail "repos/o/r/issues/7/comments?per_page=100" 1
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  assert_contains "$output" '::warning::Could not read the comments on the old head'
+  assert_equal "$(nth_body 2 'gh api POST repos/o/r/issues/7/comments')" \
+    "@codex review"$'\n\n'"<!-- codex-review-head: $NEW -->"
+}
+
 @test "push: a merge git did by itself says so" {
   conflict_repo clean
   run_step "$WF" "$MERGE" >/dev/null

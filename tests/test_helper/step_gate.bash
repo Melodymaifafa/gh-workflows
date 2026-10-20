@@ -87,6 +87,9 @@ gate_term() {
       ;;
     'always()' | '!cancelled()') return 0 ;;
     'cancelled()') return 1 ;;
+    # 括号那一组算完换成的字面值（见 gate_eval）
+    'true') return 0 ;;
+    'false') return 1 ;;
   esac
 
   case "$t" in
@@ -111,15 +114,31 @@ gate_term() {
   fi
 }
 
-# gate_eval <expr> → 0 真 / 1 假 / 2 看不懂。&& 和 || 混用直接判看不懂：
-# 本仓库没有这种写法，与其猜优先级，不如让测试红。
+# gate_eval <expr> → 0 真 / 1 假 / 2 看不懂。不带括号的 && 和 || 混用直接判看不懂：
+# 与其猜优先级，不如让测试红。带括号的一组（`a && (b || c)`）先算出来、换成
+# true / false 再看外层；success() 这类空括号不算一组。
 gate_eval() {
-  local expr rest term rc any
+  local expr rest term rc any group value before
   expr="$(gate_trim "$1")"
   expr="${expr#\$\{\{}"
   expr="${expr%\}\}}"
   expr="$(gate_trim "$expr")"
   [ -n "$expr" ] || return 0
+
+  while :; do
+    case "$expr" in *'('*) ;; *) break ;; esac
+    group="$(printf '%s\n' "$expr" |
+      awk 'match($0, /\([^()]*[^() ][^()]*\)/) { print substr($0, RSTART, RLENGTH) }')"
+    [ -n "$group" ] || break
+    if gate_eval "${group:1:${#group}-2}"; then value=true; else
+      rc=$?
+      [ "$rc" -ne 2 ] || return 2
+      value=false
+    fi
+    before="$expr"
+    expr="${expr%%"$group"*}$value${expr#*"$group"}"
+    [ "$expr" != "$before" ] || return 2
+  done
 
   case "$expr" in
     *'&&'*)

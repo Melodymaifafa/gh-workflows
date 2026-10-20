@@ -792,6 +792,13 @@ codex_summary() {
 }
 SUMMARY_MARKER="<!-- pr-guard: codex-summary head=$H comment=6230570700 -->"
 
+# stdin 里的摘要评论：把 security_review 改成正在审 H（真数据里它全是 null）。写成顶层函数而不是
+# 内联在 "$(...)" 里：macOS 的 /bin/bash 3.2 会把 "$(...)" 里单引号中的 {a,b} 当花括号展开，造出几条坏 JSON。
+security_running() {
+  jq --arg h "$H" '.body |= sub("\"security_review\":\\{[^}]*\\}";
+    "\"security_review\":{\"commit_sha\":\"" + $h + "\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"}")'
+}
+
 @test "a summary Completed on H with no findings wakes the merge check, never kicks, then waits for it" {
   one_pr clean 14
   comments "$(codex_summary summary-completed 12)"
@@ -841,9 +848,7 @@ SUMMARY_MARKER="<!-- pr-guard: codex-summary head=$H comment=6230570700 -->"
 
 @test "a summary whose code review Completed on H but security review is still Running on H holds the kick" {
   one_pr clean 14
-  # 真数据里安全审查没跑（全是 null）；这里把它改成正在审 H。
-  comments "$(codex_summary summary-completed 13 | jq --arg h "$H" '.body |= sub("\"security_review\":\\{[^}]*\\}";
-    "\"security_review\":{\"commit_sha\":\"" + $h + "\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"}")')"
+  comments "$(codex_summary summary-completed 13 | security_running)"
   sweep
   refute_writes
   assert_contains "$output" "Codex 正在审"

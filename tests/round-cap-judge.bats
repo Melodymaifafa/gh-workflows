@@ -124,8 +124,20 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   export ROUND=11
   run run_block "$WF" "$POST"
   assert_equal "$status" 0
-  assert_contains "$(m8_post)" '🤖 自动修了 5 轮'
+  assert_contains "$(m8_post)" '🤖 自动修了 10 轮，审查意见还剩'
   assert_contains "$(m8_post)" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
+}
+
+# M8 写的是实际修了几轮（ROUND - 1），不是 max_fix_rounds：第二阶段修到第 8 轮才只剩 P2 放行时，
+# 已经修了 7 轮，写 5 就少报了。
+@test "a stage-two release counts the rounds actually done, not max_fix_rounds" {
+  use_verdict "$(verdict merge '确认的 bug 都修完了，剩下是措辞' "$(item P2 '措辞')")"
+  export ROUND=8
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  assert_contains "$(m8_post)" '🤖 自动修了 7 轮，审查意见还剩 1 条。'
+  refute_contains "$(m8_post)" '自动修了 5 轮'
+  assert_equal "$(posted)" true
 }
 
 # Codex 标了 P0、Claude 一条都不认：不替人拿主意，停车通知，不接着修也不放行。
@@ -829,10 +841,19 @@ prepare_repo() {
 
 # ---------- job 形状（配置写错就没有安全边界） ----------
 
-@test "the iterate job hands judge, why, head, round and the pr-guard helpers to the judge job" {
+@test "the iterate job hands judge, why, head, round, rounds done and the pr-guard helpers to the judge job" {
   job="$(awk '/^  iterate:/{on=1} /^    steps:/{exit} on' "$REPO_ROOT/$WF")"
   # judge 有两个来源：修满轮数（Gate）和修复员判「不用改」（outcome，MEL-307）。
-  assert_contains "$job" $'      judge: ${{ steps.gate.outputs.judge || steps.outcome.outputs.judge }}\n      judge_reason: ${{ steps.gate.outputs.judge_reason || steps.outcome.outputs.judge_reason }}\n      head: ${{ steps.gate.outputs.head }}\n      round: ${{ steps.gate.outputs.round }}\n      pr_guard: ${{ steps.helpers.outputs.script }}\n'
+  assert_contains "$job" $'      judge: ${{ steps.gate.outputs.judge || steps.outcome.outputs.judge }}\n      judge_reason: ${{ steps.gate.outputs.judge_reason || steps.outcome.outputs.judge_reason }}\n      head: ${{ steps.gate.outputs.head }}\n      round: ${{ steps.gate.outputs.round }}\n      done_rounds: ${{ steps.gate.outputs.done_rounds }}\n      pr_guard: ${{ steps.helpers.outputs.script }}\n'
+}
+
+# 第二阶段修的轮数比 max_fix_rounds 多，prompt 要说实际修了几轮：数目取 Gate 交来的 done_rounds，
+# 不取 max_fix_rounds。
+@test "judge: the prompt counts the rounds actually done" {
+  job="$(awk '/^  round-cap-judge:/{on=1} on' "$REPO_ROOT/$WF")"
+  prompt="$(grep -F '这个 PR 已经自动修了' <<<"$job")"
+  assert_contains "$prompt" 'needs.iterate.outputs.done_rounds'
+  refute_contains "$prompt" 'inputs.max_fix_rounds'
 }
 
 @test "round-cap-judge job is locked down like the fallback reviewer" {
@@ -846,11 +867,15 @@ prepare_repo() {
   while [[ "$s" == *'persist-credentials: false'* ]]; do s="${s#*'persist-credentials: false'}"; n=$((n + 1)); done
   assert_equal "$n" 2
   assert_contains "$job" 'uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea'
-  # 和代审钉同一个版本：旧版本认不得默认模型时两处一起坏，升级也一起升。
+  # 和代审、修复员钉同一个版本：旧版本认不得默认模型时几处一起坏，升级也一起升。
   # 合并工作流里代审和解冲突各一处，钉的是同一个（tests/resolve-conflict.bats 守着），去重后比。
-  reviewer_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' "$REPO_ROOT/.github/workflows/codex-approved-merge.yml" | sort -u)"
-  judge_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' <<<"$job")"
+  # 修复员那一步以 `- uses:` 开头，先把 `- ` 去掉再比。
+  pin_of() { sed -nE 's/^ +(- )?(uses: anthropics\/claude-code-action@.*)$/\2/p' | sort -u; }
+  reviewer_pin="$(pin_of <"$REPO_ROOT/.github/workflows/codex-approved-merge.yml")"
+  judge_pin="$(pin_of <<<"$job")"
+  fixer_pin="$(awk '/^  iterate:/{on=1} /^  round-cap-judge:/{exit} on' "$REPO_ROOT/$WF" | pin_of)"
   assert_equal "$judge_pin" "$reviewer_pin"
+  assert_equal "$fixer_pin" "$reviewer_pin"
   # 主路径的触发者是 Codex bot：不放行它，Claude 一次都不跑。
   assert_contains "$job" 'allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"'
   assert_contains "$job" 'continue-on-error: true'

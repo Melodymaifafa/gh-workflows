@@ -311,10 +311,10 @@ fake_now_epoch() {
 # ---------------------------------------------------------------------------
 # 假命令目录跟「PATH 只认写不动的目录」那道过滤的关系
 #
-# 有九步在自己的 run: 块里把 PATH 过滤掉所有「这台机器上写得动的目录」——「我们写得
-# 动 = 被审 PR 的验证命令也写得动」。tests/test_helper/fake-bin 就在仓库里，谁都写得
-# 动，所以过滤之后它必然被滤掉：假 gh、假时钟、假 curl 一个都调不到。这正是过滤要挡
-# 的那一类东西，不是 bug。
+# 带凭据的步骤在自己的 run: 块（或共用的验证 / 推送正文）里把 PATH 过滤掉所有「这台机器
+# 上写得动的目录」——「我们写得动 = 被审 PR 的验证命令也写得动」。
+# tests/test_helper/fake-bin 就在仓库里，谁都写得动，所以过滤之后它必然被滤掉：假 gh、
+# 假时钟、假 curl 一个都调不到。这正是过滤要挡的那一类东西，不是 bug。
 #
 # 于是两种测试要分开：
 #   - 安全判定（种一个假 gh，看这一步跑不跑它）跑原样的块，绝不调 trust_fake_bin；
@@ -354,7 +354,7 @@ trusted_path_block() { # trusted_path_block <step>
 
 # step_path_guard <step>：这一步真正跑的那份 path_is_protected。验证 / 推送那四步跑的
 # 是共用正文里的函数，所以先看它 eval 的是哪一个，再去定义它的那一步里取；其余几步
-# 正文就写在自己的 run 块里。九个带凭据的步骤靠这个助手比成同一份。
+# 正文就写在自己的 run 块里。所有带凭据的步骤靠这个助手比成同一份。
 step_path_guard() { # step_path_guard <step>
   local block fn
   block="$(extract_run_block "$ITERATE_WORKFLOW" "$1")"
