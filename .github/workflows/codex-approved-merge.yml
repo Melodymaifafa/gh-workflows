@@ -976,7 +976,7 @@ jobs:
         id: review
         continue-on-error: true
         # 钉的版本必须认得默认模型：v1.0.229 自带的 Claude Code 2.1.276 调 claude-opus-5-5 时请求一发出去
-        # 就报错（0.4 秒、零花费，2026-10-04 round-cap-judge 演练实测），代审从没真正跑成过。选的是 fixer
+        # 就报错（0.4 秒、零花费，2026-10-04 round-cap-judge 演练实测），代审从没真正跑成过。选的是修复员
         # 的 @v1 当天解析到的提交；修复员和 round-cap-judge 现在都钉这一个（tests/round-cap-judge.bats 盯着几处一致）。
         uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
         with:

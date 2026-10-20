@@ -1879,8 +1879,8 @@ jobs:
           # 接手写第二笔（一轮只允许一个 fixer 写 PR）。
           echo "BASE_SHA=$(git rev-parse HEAD)" >>"$GITHUB_ENV"
 
-      # prompt 要求跑构建/测试命令，runner 不预装这些工具链；
-      # 缺了它 Claude 会耗几轮尝试自装（pip 不在白名单）直到轮数耗尽
+      # 验证命令（Verify the Claude / Codex fix）要用这些工具链，runner 不预装，缺了它们
+      # 验证就跑不起来。修复员自己早就不跑构建 / 测试，只改文件（MEL-254）。
       - uses: astral-sh/setup-uv@v5
         if: inputs.runtime == 'python'
 
@@ -2192,8 +2192,8 @@ jobs:
           # 假 gh / 假 jq，这一步就把令牌交到它手上。验证那一步的三道门都看不见这件事：
           # 文件在仓库外（树差异看不见）、没动 .git（指纹看不见）、放的是文件不是进程
           # （残留清点看不见），$GITHUB_PATH 那道也只挡「新追加目录」。所以同上一步：
-          # PATH 过滤成我们写不动的目录，目录和它的上一级一起看。这一段现在还有七处逐字
-          # 节相同的副本（五步各一份 + 两条路共用的验证 / 推送正文里各一份），
+          # PATH 过滤成我们写不动的目录，目录和它的上一级一起看。这一段在本文件里共有九处逐字
+          # 节相同的副本（七步各一份 + 两条路共用的验证 / 推送正文里各一份），
           # tests/claude-verify-creds.bats 有一条判定盯着它们不许各改各的；下一张同时动
           # 这几步的票顺手收成一份。
           path_is_protected() {
@@ -2334,7 +2334,7 @@ jobs:
           # 一步就把 github.token（contents + pull-requests 写权限）连同 Pushover 那两
           # 个密钥一起交到它手上，顺带让「head 变没变」由它说了算。验证那一步的三道门
           # 都看不见这件事：文件在仓库外（树差异看不见）、没动 .git（指纹看不见）、放
-          # 的是文件不是进程（残留清点看不见）。这一段跟其余六处逐字节相同
+          # 的是文件不是进程（残留清点看不见）。这一段跟其余八处逐字节相同
           # （tests/claude-verify-creds.bats 有一条判定盯着）。
           path_is_protected() {
             local dir="$1"
@@ -2832,7 +2832,7 @@ jobs:
           set -euo pipefail
 
           # 这一步手上同时有 CODEX_TRIGGER_TOKEN（真人账号的 fine-grained PAT）和
-          # github.token，所以命令只从「我们写不动的目录」里找，这一段跟其余九处
+          # github.token，所以命令只从「我们写不动的目录」里找，这一段跟其余八处
           # 逐字节相同（tests/claude-verify-creds.bats 有一条判定盯着）。
           path_is_protected() {
             local dir="$1"
@@ -4184,8 +4184,10 @@ jobs:
             echo '::error::the pr-guard helpers did not arrive from the iterate job'
             exit 1
           }
-          # ROUND 是 Gate 算出来的「下一轮」：第二阶段修到第 10 轮后兜底，要写 10 轮，不是 5 轮
-          # （Codex 2026-10-04 的 P2）。
+          # ROUND 是 Gate 算出来的「下一轮」，已经修的轮数是 ROUND - 1。告警别写 max_fix_rounds：
+          # 第二阶段会一直修到 max_confirmed_fix_rounds 才兜底，那时写 max_fix_rounds 就少说了
+          # 好几轮（默认 3 和 6，调用方可改；Codex 2026-10-04 的 P2）。只有 ROUND 拿不到，才退回按
+          # max_fix_rounds 算。
           [[ "${ROUND:-}" =~ ^[0-9]+$ ]] || ROUND="$((MAX_FIX_ROUNDS + 1))"
           live_head="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)"
           if [ "$live_head" != "$HEAD_SHA" ]; then
