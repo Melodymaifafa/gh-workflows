@@ -408,11 +408,15 @@ chmod +x .git/hooks/post-index-change'
   cp -R .git "$BATS_TEST_TMPDIR/git-pristine"
 
   # 换 base 版这一下也得在重跑里重做，否则重跑那次压根没东西要放回、空转着绿
+  # 放回那一步要认得出 runner 的文件命令目录（它要清空前面各步的那些文件），给它一个真样子的。
+  cmd_dir="$BATS_TEST_TMPDIR/runner-temp/_runner_file_commands"
+  mkdir -p "$cmd_dir"
   swap_then_push() {
     printf 'base-version\n' >CLAUDE.md
     mkdir -p .claude-pr
     printf 'pr-version\n' >.claude-pr/CLAUDE.md
-    run_block "$WF" "Put back the PR's own config files" && verify_and_push
+    GITHUB_OUTPUT="$cmd_dir/set_output_0f0f0f0f-1111-2222-3333-444444444444" \
+      run_block "$WF" "Put back the PR's own config files" && verify_and_push
   }
   tries=0
   run swap_then_push

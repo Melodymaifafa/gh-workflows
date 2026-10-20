@@ -2013,7 +2013,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # job 自己的 GITHUB_TOKEN：action 不再用 OIDC 换 App token（不要 OIDC、不做工作流校验、
-          # 也不吊销），所以本工作流不要 id-token: write（见顶上 permissions:）。写权限 job 层已给。
+          # 也不吊销），所以本工作流不要 id-token: write。写权限在工作流顶层的 permissions: 里。
           # action 会把它写进 origin 的地址、跑完不收回 —— Put back the PR's own config files 抹掉它。
           github_token: ${{ github.token }}
           # action 默认无视 bot 发起的触发（防循环）；本工作流的触发者恰恰是 Codex bot
@@ -2103,9 +2103,17 @@ jobs:
       # 它换来的 App token 靠 action 自己吊销，吊销失败也不报（action.yml 那句 curl 带 || true）；
       # 传 job 自己的令牌时更没人吊销，整个 job 都有效。验证那一步跑被审 PR 自己的命令、就在这个
       # checkout 里，读个文件就拿走了（MEL-254）。所以这里把 remote 地址里的凭据、extraheader、
-      # credential.* 全抹掉，再验一遍：还剩一样就红着停下，验证不开跑。
-      # push 不靠 origin 地址里的凭据：它把凭据只递给那一条 git push（见 commit_and_push_the_fix）。
-      # 不拿任何凭据：只动工作区、索引和 .git/config。git 关掉钩子：按路径 restore 也会触发 post-checkout。
+      # credential.*、insteadOf 键名里的凭据全抹掉（worktree 那一级也算），再验一遍：还剩一样
+      # 就红着停下，验证不开跑。push 不靠 origin 地址里的凭据：它把凭据只递给那一条 git push
+      # （见 commit_and_push_the_fix）。
+      # 第三件事：前面各步的 runner 文件命令文件（$RUNNER_TEMP/_runner_file_commands 下的
+      # set_output_* 之类）清空。action 把令牌当 output 写进了它那一步的文件（core.setOutput
+      # github_token，src/entrypoints/run.ts），runner 到 job 结束才删这些文件，0644，验证命令
+      # 读得到（2026-10-20 在 ghwf-local 上实测，run 39458080241）。它们在各自那一步结束时就
+      # 处理完了，清空不影响什么；这一步自己那组（同一个 GUID）runner 还没处理，step_summary_*
+      # 的副本 runner 稍后还要上传，都不动。
+      # 不拿任何凭据：只动工作区、索引、git 配置和 runner 的文件命令文件。git 关掉钩子：按路径
+      # restore 也会触发 post-checkout。
       - name: Put back the PR's own config files
         id: unrestore
         if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude' && (steps.fix.outcome == 'success' || steps.fix.outcome == 'failure')
@@ -2130,39 +2138,98 @@ jobs:
           done
           rm -rf .claude-pr
 
-          # 先抹凭据。抹的那几下失败不算数，后面那次检查说了算。
-          # 地址带 user:pass@ 的 remote：origin 换回干净的地址，别的只去掉那一段。
-          git remote | while IFS= read -r name; do
-            url="$(git config --local --get "remote.$name.url" || true)"
-            case "$url" in *://*@*) ;; *) continue ;; esac
-            if [ "$name" = origin ]; then
-              clean="https://github.com/$GITHUB_REPOSITORY.git"
-            else
-              clean="$(printf '%s\n' "$url" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#')"
+          # 先抹凭据，再验。抹的那几下失败不算数，后面那次检查说了算。
+          # 日志里只留键名，键名里的 user:pass@ 也打成 ***。
+          mask() { sed -E 's#://[^/]*@#://***@#'; }
+          strip_userinfo() { sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@#\1#'; }
+          scopes=(local)
+          # 打开 extensions.worktreeConfig 时 git 还读 .git/config.worktree（--worktree 那一份）。
+          if [ "$(git config --local --bool --get extensions.worktreeConfig 2>/dev/null || true)" = true ]; then
+            scopes+=(worktree)
+          fi
+          for scope in "${scopes[@]}"; do
+            if ! keys="$(git config "--$scope" --name-only --list)"; then
+              echo "::error::could not list the $scope git config; refusing to start the verify command"
+              exit 1
             fi
-            if git -c core.hooksPath=/dev/null remote set-url "$name" "$clean"; then
-              echo "removed the credential from remote.$name.url"
-            fi
-          done
-          keys="$(git config --local --name-only --get-regexp '^(http\.(.*\.)?extraheader|credential\..*)$' || true)"
-          printf '%s\n' "$keys" | sort -u | while IFS= read -r key; do
-            [ -n "$key" ] || continue
-            if git -c core.hooksPath=/dev/null config --local --unset-all "$key"; then
-              echo "removed $key"
-            fi
+            while IFS= read -r key; do
+              [ -n "$key" ] || continue
+              case "$key" in
+                # 整条就是凭据（extraheader、credential.*），或者键名里带着 user:pass@
+                # （url.<base>.insteadOf / pushInsteadOf）：整条删。
+                http.*extraheader | credential.* | *://*@*)
+                  if git -c core.hooksPath=/dev/null config "--$scope" --unset-all "$key"; then
+                    echo "removed $(printf '%s' "$key" | mask) ($scope)"
+                  fi
+                  continue
+                  ;;
+              esac
+              # 值里带 user:pass@ 的（remote 的 url / pushurl、submodule.*.url…）：origin 的 url
+              # 换回干净的地址，别的只去掉那一段。多值的键先整条删，再一个个加回去。
+              values="$(git config "--$scope" --get-all "$key" || true)"
+              case "$values" in *://*@*) ;; *) continue ;; esac
+              git -c core.hooksPath=/dev/null config "--$scope" --unset-all "$key" || continue
+              while IFS= read -r value; do
+                case "$key $value" in
+                  'remote.origin.url '*://*@*) value="https://github.com/$GITHUB_REPOSITORY.git" ;;
+                  *) value="$(printf '%s\n' "$value" | strip_userinfo)" ;;
+                esac
+                git -c core.hooksPath=/dev/null config "--$scope" --add "$key" "$value" || true
+              done <<<"$values"
+              echo "removed the credential from $key ($scope)"
+            done <<<"$(printf '%s\n' "$keys" | sort -u)"
           done
 
-          # 再验：.git/config 连同它 include 进来的文件，remote 地址里没有 @、没有 extraheader、
-          # 没有 credential.*。只报键名，不报值。
-          if ! cfg="$(git config --local --includes --list)"; then
-            echo '::error::could not read .git/config; refusing to start the verify command'
+          # 再验：本仓库和 worktree 两级的配置（连同 include 进来的文件）里，不许还有 extraheader、
+          # credential.*、带 user:pass@ 的地址（键名或值都算），remote 的地址里也不许有 @。
+          if ! cfg="$(git config --list --show-scope --includes)"; then
+            echo '::error::could not read the git config; refusing to start the verify command'
             exit 1
           fi
           left="$(printf '%s\n' "$cfg" |
-            grep -Ei '^(remote\.[^=]*\.(url|pushurl)=.*@|http\.([^=]*\.)?extraheader=|credential\.)' |
-            cut -d= -f1 | sed -E 's#://[^/@]*@#://***@#' | sort -u | tr '\n' ' ' || true)"
+            awk -F'\t' '$1 == "local" || $1 == "worktree" { sub(/^[^\t]*\t/, ""); print }' |
+            grep -Ei '^(http\.([^=]*\.)?extraheader=|credential\.|remote\.[^=]*\.(url|pushurl)=.*@)|://[^/@]*@' |
+            cut -d= -f1 | mask | sort -u | tr '\n' ' ' || true)"
           if [ -n "$left" ]; then
             echo "::error::.git/config still holds a credential after the fixer (${left% }); refusing to start the verify command"
+            exit 1
+          fi
+
+          # 前面各步的 runner 文件命令文件清空，再验（理由见这一步上面的注释）。按「目录里除了
+          # 这一步自己那组和 step_summary_* 之外的每一个文件」清，不按前缀清单：runner 哪天多一种
+          # 文件命令也漏不过去。认不出目录或这一步自己那组，就分不清哪些能清 —— 红，不猜。
+          own_output="${GITHUB_OUTPUT:-}"
+          cmd_dir="${own_output%/*}"
+          own="${own_output##*_}"
+          case "$cmd_dir" in
+            */_runner_file_commands) ;;
+            *)
+              echo "::error::GITHUB_OUTPUT is not in the runner's _runner_file_commands directory; refusing to start the verify command"
+              exit 1
+              ;;
+          esac
+          case "$own" in
+            '' | *[!0-9A-Fa-f-]*)
+              echo "::error::cannot tell this step's own runner files apart (${own_output##*/}); refusing to start the verify command"
+              exit 1
+              ;;
+          esac
+          earlier_runner_files() {
+            local f
+            for f in "$cmd_dir"/* "$cmd_dir"/.[!.]*; do
+              [ -f "$f" ] || continue
+              case "${f##*/}" in step_summary_* | *"$own") continue ;; esac
+              printf '%s\n' "$f"
+            done
+          }
+          earlier_runner_files | while IFS= read -r f; do
+            { : >"$f"; } 2>/dev/null || true
+          done
+          left="$(earlier_runner_files | while IFS= read -r f; do
+            [ ! -s "$f" ] || printf '%s ' "${f##*/}"
+          done)"
+          if [ -n "$left" ]; then
+            echo "::error::an earlier step's runner file still has content (${left% }); refusing to start the verify command"
             exit 1
           fi
 
