@@ -20,6 +20,8 @@ setup() {
   git init -q -b topic .
   git config user.email t@e
   git config user.name t
+  # CI 上跑 bats 时这个变量是本仓库自己的名字，这里盖掉，判定才不跟着跑在哪儿变。
+  export GITHUB_REPOSITORY=o/r
 }
 
 # 被审 PR 的 HEAD：它自己的 CLAUDE.md 和 .claude/settings.json，外加一个普通源文件。
@@ -167,8 +169,85 @@ step_text() {
   assert_equal "$(cat "$BATS_TEST_TMPDIR/hook-ran" 2>/dev/null)" ''
 }
 
+# action 在 agent 模式下把手上的令牌写进 origin 的地址（v1.0.241 的
+# src/github/operations/git-config.ts），跑完不收回；修复员传的是 job 自己的令牌，整个 job
+# 都有效。验证那一步跑被审 PR 自己的命令，读个文件就拿走了。这一步把它抹掉。
+@test "unrestore: the token the action wrote into a remote's URL is gone before verify" {
+  pr_commit
+  git remote add origin 'https://x-access-token:abc@github.com/o/r.git'
+  git remote add upstream 'https://user:pw@example.com/up.git'
+  git remote add mirror "$BATS_TEST_TMPDIR/mirror.git"
+
+  run_block "$WF" "$STEP"
+
+  assert_equal "$(git config --local --get remote.origin.url)" 'https://github.com/o/r.git'
+  assert_equal "$(git config --local --get remote.upstream.url)" 'https://example.com/up.git'
+  # 不带凭据的地址原样留着：真跑那条链的测试里 origin 就是一个本地裸仓库
+  assert_equal "$(git config --local --get remote.mirror.url)" "$BATS_TEST_TMPDIR/mirror.git"
+  refute_contains "$(cat .git/config)" 'abc'
+  refute_contains "$(cat .git/config)" 'pw@'
+}
+
+# actions/checkout 的 extraheader（本 job 关了持久化，这里仍然种一份）、任何一种 credential
+# 配置（helper 是「! 开头就是 shell」的那种，也可能直接吐出密码）都不许留到验证。
+@test "unrestore: an extraheader and a credential helper in .git/config are removed" {
+  pr_commit
+  git config --local http.https://github.com/.extraheader 'AUTHORIZATION: basic c2VjcmV0'
+  git config --local --add http.https://github.com/.extraheader 'AUTHORIZATION: basic second'
+  git config --local http.extraheader 'AUTHORIZATION: bearer third'
+  git config --local credential.helper '!f() { echo password=secret; }; f'
+  git config --local credential.https://github.com.username x-access-token
+
+  run_block "$WF" "$STEP"
+
+  cfg="$(git config --local --list)"
+  refute_contains "$cfg" 'extraheader'
+  refute_contains "$cfg" 'credential.'
+  refute_contains "$cfg" 'secret'
+  refute_contains "$cfg" 'c2VjcmV0'
+  # 别的配置照旧
+  assert_equal "$(git config --local --get user.name)" t
+}
+
+# 抹不掉就不许往下走：宁可这一轮红，也不让验证命令带着一份凭据开跑。报的是键名，不是值。
+@test "unrestore: a credential the step cannot remove turns the step red" {
+  pr_commit
+  git remote add origin 'https://x-access-token:abc@github.com/o/r.git'
+  git config --local http.https://github.com/.extraheader 'AUTHORIZATION: basic c2VjcmV0'
+  # 一个改不动配置的 git：写配置的那几下都失败，别的照常
+  real_git="$(command -v git)"
+  mkdir -p "$BATS_TEST_TMPDIR/stuck-git"
+  printf '#!/bin/sh\ncase " $* " in\n  *" set-url "*|*" --unset-all "*) echo "error: could not lock config file" >&2; exit 255 ;;\nesac\nexec "%s" "$@"\n' \
+    "$real_git" >"$BATS_TEST_TMPDIR/stuck-git/git"
+  chmod +x "$BATS_TEST_TMPDIR/stuck-git/git"
+
+  PATH="$BATS_TEST_TMPDIR/stuck-git:$PATH" run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$output" '::error::'
+  assert_contains "$output" 'remote.origin.url'
+  assert_contains "$output" 'http.https://github.com/.extraheader'
+  refute_contains "$output" 'abc'
+  refute_contains "$output" 'c2VjcmV0'
+}
+
+# 凭据也可能在 .git/config 用 include.path 引进来的另一个文件里（actions/checkout v4.3.1 起
+# 持久化就写在那儿）。这一步只改 .git/config 自己，所以那一份抹不掉 —— 照样红。
+@test "unrestore: a credential pulled in through include.path also turns the step red" {
+  pr_commit
+  printf '[http "https://github.com/"]\n\textraheader = AUTHORIZATION: basic c2VjcmV0\n' \
+    >"$BATS_TEST_TMPDIR/included.cfg"
+  git config --local include.path "$BATS_TEST_TMPDIR/included.cfg"
+
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$output" '::error::'
+  assert_contains "$output" 'http.https://github.com/.extraheader'
+}
+
 # 它放在验证前紧挨着的那一步：排在它后面的 Claude 步骤会再换一次 base 版。它不碰凭据：
-# 只动工作区和索引。
+# 只动工作区、索引和 .git/config。
 @test "unrestore: the step runs right before the first verify step and holds no credentials" {
   before_verify="$(step_names | awk '$0 == "Verify the Claude fix" { print prev; exit } { prev = $0 }')"
   assert_equal "$before_verify" "$STEP"

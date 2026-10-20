@@ -2090,7 +2090,14 @@ jobs:
       # 修复员看到的是 base 版，它在这几个路径里改的东西底子就是错的，一并丢掉。
       # 这一步必须是验证之前的最后一步：每跑一次 action 都会再换一次，排在它后面的 Claude
       # 步骤会把 base 版又换回来。以后加的 Claude 步骤（自审、第二遍）一律插在它前面。
-      # 不拿任何凭据：只动工作区和索引。git 关掉钩子：按路径 restore 也会触发 post-checkout。
+      # 第二件事：.git/config 里一份凭据都不留。action 在 agent 模式下把手上的令牌写进 origin
+      # 的地址（v1.0.241 的 src/github/operations/git-config.ts configureGitAuth），跑完不从那儿删。
+      # 它换来的 App token 靠 action 自己吊销，吊销失败也不报（action.yml 那句 curl 带 || true）；
+      # 传 job 自己的令牌时更没人吊销，整个 job 都有效。验证那一步跑被审 PR 自己的命令、就在这个
+      # checkout 里，读个文件就拿走了（MEL-254）。所以这里把 remote 地址里的凭据、extraheader、
+      # credential.* 全抹掉，再验一遍：还剩一样就红着停下，验证不开跑。
+      # push 不靠 origin 地址里的凭据：它把凭据只递给那一条 git push（见 commit_and_push_the_fix）。
+      # 不拿任何凭据：只动工作区、索引和 .git/config。git 关掉钩子：按路径 restore 也会触发 post-checkout。
       - name: Put back the PR's own config files
         id: unrestore
         if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude' && (steps.fix.outcome == 'success' || steps.fix.outcome == 'failure')
@@ -2114,6 +2121,42 @@ jobs:
             fi
           done
           rm -rf .claude-pr
+
+          # 先抹凭据。抹的那几下失败不算数，后面那次检查说了算。
+          # 地址带 user:pass@ 的 remote：origin 换回干净的地址，别的只去掉那一段。
+          git remote | while IFS= read -r name; do
+            url="$(git config --local --get "remote.$name.url" || true)"
+            case "$url" in *://*@*) ;; *) continue ;; esac
+            if [ "$name" = origin ]; then
+              clean="https://github.com/$GITHUB_REPOSITORY.git"
+            else
+              clean="$(printf '%s\n' "$url" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#')"
+            fi
+            if git -c core.hooksPath=/dev/null remote set-url "$name" "$clean"; then
+              echo "removed the credential from remote.$name.url"
+            fi
+          done
+          keys="$(git config --local --name-only --get-regexp '^(http\.(.*\.)?extraheader|credential\..*)$' || true)"
+          printf '%s\n' "$keys" | sort -u | while IFS= read -r key; do
+            [ -n "$key" ] || continue
+            if git -c core.hooksPath=/dev/null config --local --unset-all "$key"; then
+              echo "removed $key"
+            fi
+          done
+
+          # 再验：.git/config 连同它 include 进来的文件，remote 地址里没有 @、没有 extraheader、
+          # 没有 credential.*。只报键名，不报值。
+          if ! cfg="$(git config --local --includes --list)"; then
+            echo '::error::could not read .git/config; refusing to start the verify command'
+            exit 1
+          fi
+          left="$(printf '%s\n' "$cfg" |
+            grep -Ei '^(remote\.[^=]*\.(url|pushurl)=.*@|http\.([^=]*\.)?extraheader=|credential\.)' |
+            cut -d= -f1 | sed -E 's#://[^/@]*@#://***@#' | sort -u | tr '\n' ' ' || true)"
+          if [ -n "$left" ]; then
+            echo "::error::.git/config still holds a credential after the fixer (${left% }); refusing to start the verify command"
+            exit 1
+          fi
 
       # Claude 那一步只改文件；验证、commit、push 挪到下面三步，形状和判定跟
       # Codex 那条路一模一样。为什么必须挪：验证跑的是被审 PR 自己带的命令，它跟
