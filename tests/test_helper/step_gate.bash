@@ -128,7 +128,7 @@ gate_eval() {
   while :; do
     case "$expr" in *'('*) ;; *) break ;; esac
     group="$(printf '%s\n' "$expr" |
-      awk 'match($0, /\([^()]*[^()[:space:]][^()]*\)/) { print substr($0, RSTART, RLENGTH) }')"
+      awk 'match($0, /\([^()]*[^() ][^()]*\)/) { print substr($0, RSTART, RLENGTH) }')"
     [ -n "$group" ] || break
     if gate_eval "${group:1:${#group}-2}"; then value=true; else
       rc=$?

@@ -2102,8 +2102,11 @@ jobs:
           paths=(.claude .mcp.json .claude.json .gitmodules .ripgreprc CLAUDE.md CLAUDE.local.md .husky)
           for p in "${paths[@]}"; do
             # 先整个删掉再从 HEAD 取：只 restore 删不掉 base 才有、HEAD 没有的文件。
+            # 「HEAD 有没有」只问树里那一条，不问对象在不在：子模块的提交不在本仓库里
+            # （checkout 默认不拉子模块），cat-file -e 会把它当成没有，删掉之后 add -A 就
+            # 推一笔删 PR 子模块的提交。
             rm -rf -- "$p"
-            if git cat-file -e "HEAD:$p" 2>/dev/null; then
+            if git rev-parse -q --verify "HEAD:$p" >/dev/null; then
               git -c core.hooksPath=/dev/null restore --source=HEAD --staged --worktree -- "$p"
               echo "put back $p from HEAD"
             else

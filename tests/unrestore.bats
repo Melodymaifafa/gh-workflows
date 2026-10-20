@@ -35,6 +35,7 @@ pr_commit() {
 # 照 action 的样子换进 base 版：PR 的原样快照进 .claude-pr/（action 把它写进
 # .git/info/exclude），再换上 base 的内容，外加一个只有 base 才有的文件。action 自己会
 # git reset 取消暂存；这里故意留一份在暂存区，看这一步连索引一起放回去。
+# 测试自己写索引时关掉钩子：钩子那一条种下的 post-index-change 只许被这一步触发。
 swap_in_base() {
   mkdir -p .claude-pr/.claude
   cp CLAUDE.md .claude-pr/CLAUDE.md
@@ -43,7 +44,7 @@ swap_in_base() {
   printf 'base-version\n' >CLAUDE.md
   printf '{"base":true}\n' >.claude/settings.json
   printf '{"base_only":true}\n' >.claude/base-only.json
-  git add CLAUDE.md
+  git -c core.hooksPath=/dev/null add CLAUDE.md
 }
 
 # 按出现顺序列出 workflow 里每一步的名字；`- uses:` 开头的记成「uses: 后面那一串」，
@@ -96,6 +97,32 @@ step_text() {
   assert_equal "$(git status --porcelain --untracked-files=all --ignored)" ''
 }
 
+# HEAD 里那个路径是子模块：actions/checkout 默认不拉子模块，它那个提交对象不在本仓库里，
+# 可它照样是「HEAD 有」。当成「HEAD 没有」去删，后面的 add -A 就推一笔删掉 PR 子模块的提交。
+@test "unrestore: a submodule the PR has at one of these paths is kept, not deleted" {
+  printf '[submodule ".claude"]\n\tpath = .claude\n\turl = https://example.invalid/sub.git\n' >.gitmodules
+  sub="$(printf 'not-in-this-repo' | git hash-object --stdin)"
+  git add .gitmodules
+  git update-index --add --cacheinfo "160000,$sub,.claude"
+  git commit -q -m pr
+
+  # 照 action 的样子换进 base 版：base 的 .claude/ 是个普通目录。第一遍 base 的
+  # .gitmodules 跟 PR 一样（删子模块那一下会悄悄进索引），第二遍也不一样（git rm 会
+  # 当场报错、整轮红掉）。
+  for base_gitmodules in same different; do
+    mkdir -p .claude
+    printf '{"base":true}\n' >.claude/settings.json
+    [ "$base_gitmodules" = same ] || printf '# base\n' >.gitmodules
+
+    run_block "$WF" "$STEP"
+
+    assert_equal "$(git ls-files -s .claude)" "160000 $sub 0"$'\t'".claude"
+    assert_equal "$(ls -A .claude)" ''
+    assert_equal "$(cat .gitmodules)" "$(git show HEAD:.gitmodules)"
+    assert_equal "$(git status --porcelain --untracked-files=all --ignored)" ''
+  done
+}
+
 @test "unrestore: the fixer's own edits outside these paths stay" {
   pr_commit
   swap_in_base
@@ -112,24 +139,32 @@ step_text() {
   assert_equal "$(git diff --cached --name-only)" $'src/a.sh\nsrc/b.sh'
 }
 
-# 按路径 restore 也会触发 post-checkout。仓库里种下的钩子（.git/hooks 里的，或者
-# .git/config 里 core.hooksPath 指过去的）都不许借这一步跑起来。
+# 按路径 restore 会触发 post-checkout，restore 和 rm --cached 写索引都会触发
+# post-index-change。仓库里种下的钩子（.git/hooks 里的，或者 .git/config 里
+# core.hooksPath 指过去的）都不许借这一步跑起来。
 @test "unrestore: a hook planted in the checkout never runs" {
   pr_commit
-  swap_in_base
   mkdir -p "$BATS_TEST_TMPDIR/elsewhere-hooks"
   for dir in .git/hooks "$BATS_TEST_TMPDIR/elsewhere-hooks"; do
-    printf '#!/bin/sh\ntouch "%s/hook-ran"\n' "$BATS_TEST_TMPDIR" >"$dir/post-checkout"
-    chmod +x "$dir/post-checkout"
+    for hook in post-checkout post-index-change; do
+      printf '#!/bin/sh\necho %s >>"%s/hook-ran"\n' "$hook" "$BATS_TEST_TMPDIR" >"$dir/$hook"
+      chmod +x "$dir/$hook"
+    done
   done
 
-  run_block "$WF" "$STEP"
-  git config core.hooksPath "$BATS_TEST_TMPDIR/elsewhere-hooks"
-  swap_in_base
-  run_block "$WF" "$STEP"
+  for round in hooks-dir hooks-path; do
+    [ "$round" = hooks-dir ] || git config core.hooksPath "$BATS_TEST_TMPDIR/elsewhere-hooks"
+    swap_in_base
+    # HEAD 没有的 .mcp.json 也留一份在暂存区：rm --cached 那一行也得写一次索引
+    printf '{"mcpServers":{}}\n' >.mcp.json
+    git -c core.hooksPath=/dev/null add .mcp.json
 
-  assert_equal "$(cat CLAUDE.md)" 'pr-version'
-  assert_equal "$(ls -A "$BATS_TEST_TMPDIR" | grep -cxF hook-ran)" 0
+    run_block "$WF" "$STEP"
+
+    assert_equal "$(cat CLAUDE.md)" 'pr-version'
+    assert_equal "$(git ls-files -- .mcp.json)" ''
+  done
+  assert_equal "$(cat "$BATS_TEST_TMPDIR/hook-ran" 2>/dev/null)" ''
 }
 
 # 它放在验证前紧挨着的那一步：排在它后面的 Claude 步骤会再换一次 base 版。它不碰凭据：
