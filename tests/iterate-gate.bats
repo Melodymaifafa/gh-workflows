@@ -1154,6 +1154,20 @@ carry_env() {
   assert_equal "$(grep -c -- '-->' <<<"$body")" 2
 }
 
+# fix round 4：以前反引号在剥定界符、拆关键字之后才删，标题或路径里一个 `<!`-- pr`-guard…` 就
+# 拼回一个真的 carried-findings-cleared。看不见的字符同理。现在先删它们，再剥、再拆。
+@test "carry: backticks or invisible characters in a finding cannot reassemble a marker" {
+  local payload
+  carry_env
+  for payload in "$(forged_backticks)" "$(forged_invisible)"; do
+    : >"$FAKE_LOG"
+    fake_route "$INLINE" "$(json_array "$(codex_inline 1 P1 "a.sh $payload" 1 "$payload")")"
+    stuck
+    assert_equal "$status" 0
+    refute_forged_markers "$(fake_last_body "gh pr comment")" 2
+  done
+}
+
 # 同一段话也是手机推送的正文，Pushover 超过 1024 字整条发不出去：最多点名 3 条。
 @test "carry: at most three findings are named, the rest are counted" {
   carry_env

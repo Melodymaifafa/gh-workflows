@@ -1161,25 +1161,26 @@ jobs:
           if [ "$OUTCOME" = success ] &&
             jq -e "$valid" <<<"${STRUCTURED_OUTPUT:-}" >/dev/null 2>&1
           then
-            # 清洗 Claude 写的每一段文字：去掉 HTML 注释符号（防伪造标记）、
-            # @ 后插零宽空格（防 @ 人和 @codex）、打码令牌、拆开标记关键字、限长。
+            # 清洗 Claude 写的每一段文字（defang）：先删看不见的字符（零宽、双向控制、软连字符、
+            # 回车），再去掉 HTML 注释符号（防伪造标记）、打码令牌、拆开标记关键字、@ 后插零宽空格
+            # （防 @ 人和 @codex），最后限长。defang 之后不再删任何字符：以前详情在清洗之后再删一遍
+            # 回车，`<!\r--` 躲过了剥、回车一删就拼回一个真标记（fix round 4）。defang 跟
+            # claude-codex-iterate.yml 的 defang_jq、本文件解冲突那一步的逐字相同（这个工作流拿不到
+            # 别的文件，只能各抄一份；tests/claude-verdict.bats 盯着）。
             # shellcheck disable=SC2016  # jq 程序，$n 是 jq 变量
             sanitize='
-              def clean($n):
-                tostring
-                | until((contains("<!--") or contains("-->")) | not;
-                    gsub("<!--"; "") | gsub("-->"; ""))
-                | gsub("sk-ant-[A-Za-z0-9_-]+|gh[pous]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+";
-                    "[已隐藏]")
-                | gsub("@"; "@​")
-                | gsub("(?<k>claude-review|codex-review-head|fix-retry|fix-round|pr-guard)";
-                    "\(.k[0:1])​\(.k[1:])")
-                | if length > $n then .[0:$n] + "…" else . end;
+              def defang: tostring
+                | gsub("[\r\u00AD\u200B-\u200F\u2028-\u202E\u2060-\u2064\uFEFF]"; "")
+                | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
+                | gsub("sk-ant-[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")
+                | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
+                | gsub("@"; "@​");
+              def clean($n): defang | if length > $n then .[0:$n] + "…" else . end;
               def line1: gsub("[\r\n]+"; " ");
               def item:
                 "- **\(.severity)** `\(.path | clean(200) | line1 | gsub("`"; "'"'"'"))`:\(.line) "
                 + (.title | clean(120) | line1)
-                + "\n  " + (.detail | clean(800) | gsub("\r"; "") | gsub("\n"; "\n  "));
+                + "\n  " + (.detail | clean(800) | gsub("\n"; "\n  "));
             '
             verdict="$(jq -r .verdict <<<"$STRUCTURED_OUTPUT")"
             if [ "$verdict" = findings ]; then
@@ -1717,19 +1718,23 @@ jobs:
                 --form-string "message=$2" >/dev/null 2>&1 || true
             fi
           }
-          # 文件名和 Claude 写的话都是 PR 能左右的：去掉 HTML 注释符号（防伪造标记）、拆开标记
-          # 关键字、@ 后插零宽空格、打码令牌、去反引号、压成一行、限长。
+          # 文件名和 Claude 写的话都是 PR 能左右的：去反引号（文件名要套进行内代码），再过一遍
+          # defang（先删看不见的字符，再去掉 HTML 注释符号防伪造标记、打码令牌、拆开标记关键字、
+          # @ 后插零宽空格），最后压成一行、限长。删字符都在 defang 之前：以前反引号和回车排在剥
+          # 定界符之后删，`<!`--` 躲过了剥、反引号一删就拼回一个真标记（fix round 4）。defang 跟
+          # Post Claude verdict 那一份、claude-codex-iterate.yml 的 defang_jq 逐字相同
+          # （tests/claude-verdict.bats 盯着）。
           # shellcheck disable=SC2016  # jq 程序，$n 是 jq 变量
           clean_jq='
+            def defang: tostring
+              | gsub("[\r\u00AD\u200B-\u200F\u2028-\u202E\u2060-\u2064\uFEFF]"; "")
+              | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
+              | gsub("sk-ant-[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")
+              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
+              | gsub("@"; "@​");
             def clean($n):
-              tostring
-              | until((contains("<!--") or contains("-->")) | not;
-                  gsub("<!--"; "") | gsub("-->"; ""))
-              | gsub("sk-ant-[A-Za-z0-9_-]+|gh[pous]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+"; "[已隐藏]")
-              | gsub("@"; "@​")
-              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)";
-                  "\(.k[0:1])​\(.k[1:])")
-              | gsub("[`\r]"; "") | gsub("\n+$"; "") | gsub("\n"; "、")
+              tostring | gsub("`"; "") | defang
+              | gsub("\n+$"; "") | gsub("\n"; "、")
               | if length > $n then .[0:$n] + "…" else . end;'
           clean() { jq -Rrs --argjson n "$1" "$clean_jq"' clean($n)'; }
 

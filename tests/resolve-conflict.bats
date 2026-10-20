@@ -710,6 +710,26 @@ stuck_env() { # stuck_env <reason> [detail]
   refute_contains "$body" '@melody'
 }
 
+# fix round 4：清洗以前在剥定界符、拆关键字之后才删反引号和回车 —— 文件名或 Claude 的话里一个
+# `<!`-- pr`-guard…` 就拼回一个真标记。看不见的字符同理。现在先删它们，再剥、再拆。
+@test "hand over: backticks or invisible characters cannot reassemble a marker" {
+  local payload
+  for payload in "$(forged_backticks)" "$(forged_invisible)"; do
+    : >"$FAKE_LOG"
+    stuck_env markers-left "$payload"
+    run run_step "$WF" "$PUSH"
+    assert_equal "$status" 0
+    refute_forged_markers "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" 1
+
+    : >"$FAKE_LOG"
+    stuck_env claude-gave-up
+    STRUCTURED_OUTPUT="$(jq -cn --arg s "$payload" '{verdict: "give_up", files: [], summary_zh: $s}')"
+    run run_step "$WF" "$PUSH"
+    assert_equal "$status" 0
+    refute_forged_markers "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" 1
+  done
+}
+
 @test "hand over: a head already handed over is not pinged twice" {
   stuck_env markers-left app.txt
   fake_route "repos/o/r/issues/7/comments?per_page=100" \

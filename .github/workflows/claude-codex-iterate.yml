@@ -297,10 +297,26 @@ jobs:
                   and ($ids | split(",") | map(select(. != "")) | all(. as $i | any($named[]; . == $i))))'
           }
 
-          declare -f pushover trusted_comments alert_once post_comment_retry carried_reviews findings_review_ids judged_already >"$RUNNER_TEMP/pr-guard.sh"
+          # defang_jq：打印 jq 定义 defang。外部能左右的文字（模型写的、审查方写的、PR 里的文件名和
+          # 标题）发进 github-actions[bot] 或主人署名的评论之前都过它：标记只认这两个账号写的。
+          # 顺序是要害：先删看不见的字符（零宽、双向控制、软连字符、回车），再剥 HTML 注释定界符直到
+          # 剥不动、打码令牌、拆开标记关键字、@ 后插零宽空格。以前删字符排在剥之后，`<!`--` 这样夹
+          # 一个反引号的定界符躲过了剥，反引号一删就拼回一个真标记（fix round 4，两个工作流里四处中招）。
+          # 所以 defang 之后不许再删任何字符；要删反引号的，在 defang 之前删。codex-approved-merge
+          # 拿不到本文件，那边两份逐字相同的副本由 tests/claude-verdict.bats 盯着。
+          defang_jq() {
+            printf '%s\n' 'def defang: tostring
+              | gsub("[\r\u00AD\u200B-\u200F\u2028-\u202E\u2060-\u2064\uFEFF]"; "")
+              | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
+              | gsub("sk-ant-[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")
+              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
+              | gsub("@"; "@​");'
+          }
+
+          declare -f pushover trusted_comments alert_once post_comment_retry carried_reviews findings_review_ids judged_already defang_jq >"$RUNNER_TEMP/pr-guard.sh"
           {
             echo 'script<<__PR_GUARD_HELPERS_EOF__'
-            declare -f pushover trusted_comments alert_once post_comment_retry carried_reviews findings_review_ids judged_already
+            declare -f pushover trusted_comments alert_once post_comment_retry carried_reviews findings_review_ids judged_already defang_jq
             echo '__PR_GUARD_HELPERS_EOF__'
           } >>"$GITHUB_OUTPUT"
 
@@ -2481,6 +2497,7 @@ jobs:
           EXEC_FILE: ${{ steps.fix.outputs.execution_file }}
           CLAUDE_MODEL: ${{ inputs.claude_model }}
           CLAUDE_EFFORT: ${{ inputs.claude_effort }}
+          PR_GUARD: ${{ steps.helpers.outputs.script }}
         run: |
           set -euo pipefail
 
@@ -2533,18 +2550,19 @@ jobs:
           fi
 
           # 这条评论署名 github-actions[bot]，而机器之间的标记认的正是它 —— 正文却是 Claude
-          # 读完外部意见后写的。所以 HTML 注释的定界符一律剥掉、标记关键字拆开，正文里拼
-          # 不出任何标记：少了这一刀，一段被意见带偏的总结就能写出 carried-findings-cleared，
-          # 把还没修的意见当成已处理，自动合并照常放行。
+          # 读完外部意见后写的。所以过一遍 defang（Define pr-guard helpers 交过来的）：看不见的
+          # 字符删掉、HTML 注释的定界符一律剥掉、令牌打码、标记关键字拆开、@ 不让它点名，正文里
+          # 拼不出任何标记：少了这一刀，一段被意见带偏的总结就能写出 carried-findings-cleared，
+          # 把还没修的意见当成已处理，自动合并照常放行。反引号留着：总结是 markdown，defang 之后
+          # 也没人删它，拼不回标记。清洗没拿到就不发这条评论（同上面找不到 jq）。
+          eval "${PR_GUARD:-}"
+          if ! declare -F defang_jq >/dev/null; then
+            echo '::warning::the pr-guard helpers did not arrive from the Define step; skipping the PR comment'
+            exit 0
+          fi
           summary=''
           if [ -n "${STRUCTURED:-}" ]; then
-            summary="$(jq -r 'if (.summary | type) == "string" then .summary else "" end
-              | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
-              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
-              | gsub("sk-ant-[A-Za-z0-9_-]+"; "[已隐藏]")
-              | gsub("github_pat_[A-Za-z0-9_]+"; "[已隐藏]")
-              | gsub("gh[pousr]_[A-Za-z0-9_]{16,}"; "[已隐藏]")
-              | gsub("eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")' \
+            summary="$(jq -r "$(defang_jq)"'if (.summary | type) == "string" then .summary else "" end | defang' \
               <<<"$STRUCTURED" 2>/dev/null || true)"
           fi
           # 令牌也剥掉：修复员跑的时候 .git/config 里躺着 job 的令牌（action 写进 origin 的地址）。
@@ -2561,12 +2579,14 @@ jobs:
           # 正文先落进 run summary 再发：评论没发出去（gh 偶发失败，或者它不在写不动的
           # 目录里）时，总结至少还留在这一轮的运行页上，不至于连文本一起丢。
           # 哪个模型干的活写进评论：默认模型曾悄悄是 Sonnet，几周没人发现。名字从 SDK
-          # 执行记录的 init 消息里读（配置里抄的看不出默认值变了），读不到才退回配置值。
+          # 执行记录的 init 消息里读（配置里抄的看不出默认值变了），读不到才退回配置值。那个文件在
+          # $RUNNER_TEMP 下，退回 runner 用户跑的验证命令写得动，所以名字也过 defang、只留一行。
           model_used=''
           if [ -n "${EXEC_FILE:-}" ] && [ -r "$EXEC_FILE" ]; then
-            model_used="$(jq -r '
+            model_used="$(jq -r "$(defang_jq)"'
               (if type == "array" then . else [] end)
               | [.[] | select(.type == "system" and .subtype == "init") | (.model // "")][0] // ""
+              | defang | gsub("\n"; " ") | .[0:80]
             ' "$EXEC_FILE" 2>/dev/null || true)"
           fi
           [ -n "$model_used" ] || model_used="${CLAUDE_MODEL:-unknown}"
@@ -2706,11 +2726,14 @@ jobs:
           # 文件（.claude/、.husky/、.vscode/、.devcontainer/、.mcp.json、.gitmodules、
           # .pre-commit-config.yaml、pyrightconfig.json、bunfig.toml 这一类），碰了就记一笔拒绝。推上去的
           # 那一轮照常召唤复审、只打一条 warning；在那一边红会把已经推上去的修复晾着、复审不召、链条停住。
-          # 工作区两种写法都认（$GITHUB_WORKSPACE 和它的 pwd -P）：CLI 报的是真实路径。带 .. 的路径一律
-          # 不算工作区内。被拒的路径是修复员（模型）给的，要进 PR 评论，所以同其它发出去的模型文字一样
-          # 先清洗：剥 HTML 注释定界符、拆开标记关键字、@ 不让它点名，只留工作区内的相对路径。
-          # read_fixer_record 交出 fixer_record_problem（读不出来时的原因，读得出来是空）和
-          # denied_in_ws（一行一条）。
+          # 工作区两种写法都认（$GITHUB_WORKSPACE 和它的 pwd -P）：CLI 报的是真实路径。带 .. 的路径、
+          # ~ 开头的（家目录，fix round 4）一律不算工作区内。被拒的路径是修复员（模型）给的，要进 PR
+          # 评论，所以只留工作区内的相对路径，字符只留一张白名单（字母、数字、._/+-），别的一律换成 _：
+          # 拼不出 <、!、>、冒号、空格和 @，就拼不出标记和 @ 提及。以前是剥定界符、拆关键字之后再删
+          # 反引号，`<!`--` 躲过了剥、反引号一删就拼回一个真标记（fix round 4）；路径用不着别的字符。
+          # 只取前 5 条、在 jq 里截：几百条拒绝时 printf | head 会在 pipefail 下被 SIGPIPE 打断，
+          # 整步在发告警之前就退了。read_fixer_record 交出 fixer_record_problem（读不出来时的原因，
+          # 读得出来是空）和 denied_in_ws（一行一条）。
           read_fixer_record() {
             local ws ws_real
             fixer_record_problem=''
@@ -2725,17 +2748,14 @@ jobs:
                 | if . == null then error("no result entry") else . end
                 | (.permission_denials // [])
                 | if type != "array" then error("permission_denials is not an array") else . end
-                | .[] | select(type == "object")
-                | select(.tool_name == "Edit" or .tool_name == "Write" or .tool_name == "MultiEdit")
-                | (.tool_input.file_path? // empty) | strings
-                | select(test("(^|/)\\.\\.(/|$)") | not)
-                | if startswith("/") then (rel($ws) // rel($wr) // empty) else . end
-                | select(test("(^|/)\\.git(/|$)") | not)
-                | gsub("[\r\n]+"; " ")
-                | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
-                | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
-                | gsub("@"; "@​") | gsub("`"; "")
-                | if length > 120 then .[0:120] + "…" else . end' "$EXEC_FILE" 2>/dev/null)"
+                | limit(5; .[] | select(type == "object")
+                  | select(.tool_name == "Edit" or .tool_name == "Write" or .tool_name == "MultiEdit")
+                  | (.tool_input.file_path? // empty) | strings
+                  | select(test("(^|/)\\.\\.(/|$)") | not)
+                  | if startswith("/") then (rel($ws) // rel($wr) // empty) elif startswith("~") then empty else . end
+                  | select(test("(^|/)\\.git(/|$)") | not)
+                  | gsub("[^A-Za-z0-9._/+-]"; "_")
+                  | if length > 120 then .[0:120] + "…" else . end)' "$EXEC_FILE" 2>/dev/null)"
             then
               denied_in_ws=''
               fixer_record_problem='its execution record is missing, unreadable or not in the format claude-code-action v1.0.241 writes'
@@ -2767,7 +2787,7 @@ jobs:
             # 收掉的东西。这里再发一条就是重复计数的那条评论。
             read_fixer_record
             if [ -n "$denied_in_ws" ]; then
-              echo "::warning::the fix was pushed, but the fixer was also denied writes inside the workspace ($(printf '%s\n' "$denied_in_ws" | head -n 5 | tr '\n' ' ')); Claude Code refuses to edit some config files, or the write rule failed"
+              echo "::warning::the fix was pushed, but the fixer was also denied writes inside the workspace (${denied_in_ws//$'\n'/ }); Claude Code refuses to edit some config files, or the write rule failed"
             elif [ -n "$fixer_record_problem" ]; then
               echo "::warning::the fix was pushed, but $fixer_record_problem"
             fi
@@ -2780,8 +2800,7 @@ jobs:
           read_fixer_record
           if [ -n "$fixer_record_problem" ] || [ -n "$denied_in_ws" ]; then
             if [ -n "$denied_in_ws" ]; then
-              shown="$(printf '%s\n' "$denied_in_ws" | head -n 5 | tr '\n' ' ')"
-              shown="${shown% }"
+              shown="${denied_in_ws//$'\n'/ }"
               echo "::error::nothing was pushed and the fixer was denied writes inside the workspace ($shown); these may be config files Claude Code refuses to edit, or the write rule failing. Failing this round instead of reading it as nothing-to-change"
               fuse_msg="Claude 修复员这一轮什么都没推上去，而它改工作区里这些文件被拒了：$shown。可能是 Claude Code 本来就不许改的配置文件（.claude/、.vscode/、.husky/ 之类），也可能是改文件的权限规则失效了，所以这一轮不算「看完觉得不用改」。请看 Actions 日志。"
             else
@@ -3905,7 +3924,7 @@ jobs:
           # 告警函数从 Define pr-guard helpers 的 output 取，不读 $RUNNER_TEMP 里那份文件：
           # 那个文件验证命令写得动，往里塞一行就在这一步里、带着令牌跑起来。没拿到就红着停下。
           eval "${PR_GUARD:-}"
-          declare -F pushover trusted_comments alert_once >/dev/null || {
+          declare -F pushover trusted_comments alert_once defang_jq >/dev/null || {
             echo '::error::the pr-guard helpers did not arrive from the Define step; cannot post this alert'
             exit 1
           }
@@ -3914,16 +3933,15 @@ jobs:
           if [ "$reason" = findings-carried ]; then
             if [[ "${REVIEW_ID:-}" =~ ^[0-9]+$ ]]; then
               # 意见原文是外部输入，而这条评论署名 github-actions[bot]、标记认的正是它：
-              # 剥掉 HTML 注释定界符、拆开标记关键字、@ 不让它点名，免得一行标题伪造出
-              # 标记（比如把还没修的意见写成已关掉）或者召唤谁。每条只留一行，最多点名 3 条：
-              # 同一段话也是手机推送的正文，Pushover 超过 1024 字整条发不出去。
+              # 过一遍 defang（看不见的字符、HTML 注释定界符、令牌、标记关键字、@），免得一行
+              # 标题伪造出标记（比如把还没修的意见写成已关掉）或者召唤谁。反引号在 defang 之前
+              # 删（路径要套进行内代码）：以前排在剥定界符之后，`<!`--` 就拼回了一个真标记
+              # （fix round 4）。每条只留一行，最多点名 3 条：同一段话也是手机推送的正文，
+              # Pushover 超过 1024 字整条发不出去。
               # shellcheck disable=SC2016  # jq 程序
               named="$(gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments?per_page=100" |
-                jq -r '
-                  def clean($n): tostring
-                    | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
-                    | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
-                    | gsub("@"; "@​") | gsub("`"; "") | gsub("[\r\n]+"; " ")
+                jq -r "$(defang_jq)"'
+                  def clean($n): tostring | gsub("`"; "") | defang | gsub("\n+"; " ")
                     | if length > $n then .[0:$n] + "…" else . end;
                   [add // [] | .[]
                     | ((.body // "") | capture("!\\[(?<p>P[0-3]) Badge\\]").p // "") as $p
@@ -4222,7 +4240,7 @@ jobs:
           set -euo pipefail
 
           eval "${PR_GUARD:-}"
-          declare -F alert_once >/dev/null || {
+          declare -F alert_once defang_jq >/dev/null || {
             echo '::error::the pr-guard helpers did not arrive from the iterate job'
             exit 1
           }
@@ -4294,20 +4312,12 @@ jobs:
             exit 0
           fi
 
-          # 清洗 Claude 写的每一段文字（同 codex-approved-merge 的 Post Claude verdict）：去掉 HTML
-          # 注释符号（防伪造标记）、@ 后插零宽空格（防 @ 人和 @codex）、打码令牌、拆开标记关键字、限长。
+          # 清洗 Claude 写的每一段文字（同 codex-approved-merge 的 Post Claude verdict）：过一遍 defang
+          # （先删看不见的字符，再去掉 HTML 注释符号防伪造标记、打码令牌、拆开标记关键字、@ 后插零宽
+          # 空格防 @ 人和 @codex），再限长。defang 从 Define pr-guard helpers 交过来，见那里的注释。
           # shellcheck disable=SC2016  # jq 程序，$n 是 jq 变量
-          sanitize='
-            def clean($n):
-              tostring
-              | until((contains("<!--") or contains("-->")) | not;
-                  gsub("<!--"; "") | gsub("-->"; ""))
-              | gsub("sk-ant-[A-Za-z0-9_-]+|gh[pous]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+";
-                  "[已隐藏]")
-              | gsub("@"; "@​")
-              | gsub("(?<k>claude-review|claude-judge|codex-review-head|fix-retry|fix-round|pr-guard)";
-                  "\(.k[0:1])​\(.k[1:])")
-              | if length > $n then .[0:$n] + "…" else . end;
+          sanitize="$(defang_jq)"'
+            def clean($n): defang | if length > $n then .[0:$n] + "…" else . end;
             def line1: gsub("[\r\n]+"; " ");
             def item: "- **\(.severity)** " + (.id | clean(10)) + " " + (.title | clean(120) | line1) + "：" + (.reason | clean(400) | line1);
           '

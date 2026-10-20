@@ -320,6 +320,22 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
   assert_equal "${body##*$'\n'}" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
 }
 
+# fix round 4：清洗用 Define pr-guard helpers 里那一份 defang —— 先删看不见的字符（零宽、双向
+# 控制、软连字符、回车），再剥定界符、拆关键字。反引号原样留着：剥完之后没人删它，拼不回标记。
+@test "sanitize: backticks or invisible characters cannot reassemble a marker in the verdict" {
+  local payload
+  for payload in "$(forged_backticks)" "$(forged_invisible)"; do
+    : >"$FAKE_LOG"
+    : >"$GITHUB_OUTPUT"
+    use_verdict "$(verdict merge "$payload" "$(item P2 "$payload" "$payload")")"
+    run run_block "$WF" "$POST"
+    assert_equal "$status" 0
+    body="$(m8_post)"
+    assert_equal "${body##*$'\n'}" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
+    refute_forged_markers "$body" 1
+  done
+}
+
 @test "without the pr-guard helpers the step goes red instead of skipping the alert" {
   use_verdict "$(verdict stop 'bug' "$(item P1 'bug')")"
   export PR_GUARD=''

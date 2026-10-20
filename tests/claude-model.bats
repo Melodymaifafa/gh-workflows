@@ -24,6 +24,10 @@ setup() {
   setup_fake_env
   export RUNNER_TEMP="$BATS_TEST_TMPDIR/runner-temp"
   mkdir -p "$RUNNER_TEMP"
+  # 总结那一步的清洗（defang）从 Define pr-guard helpers 的 output 取（真跑时由 env: 接过去）。
+  run_block "$ITERATE_WORKFLOW" "Define pr-guard helpers" >/dev/null
+  export PR_GUARD; PR_GUARD="$(step_output script)"
+  : >"$GITHUB_OUTPUT"
 }
 
 # ---------- 默认值：Opus 及以上，xhigh ----------
