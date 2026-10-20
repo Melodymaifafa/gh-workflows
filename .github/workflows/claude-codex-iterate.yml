@@ -2477,10 +2477,6 @@ jobs:
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
           PR_GUARD: ${{ steps.helpers.outputs.script }}
-          # 调用方那份工作流文件的路径，和它该跟哪个分支上的版本一致 —— 认出
-          # claude-code-action 把自己整步跳过的那种结局（见下面 stale_caller_workflow）。
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
@@ -2535,34 +2531,6 @@ jobs:
 
           H="$HEAD_SHA"
           live_head() { gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha; }
-
-          # claude-code-action 还有一种结局是「整步跳过」：PR 分支上的调用桩跟默认分支
-          # 上的那份不一样时它一个字都不改，只在日志里留一句 Workflow validation failed。
-          # 跳过的长相跟「跑过、但什么都没落地」一模一样（没有结构化结果、没有执行记录），
-          # 于是两种都只换来一条笼统的「自动修复没跑成」，主人看不出该去点 Update branch。
-          # 判据故意不去读那句日志：同一份日志里原样带着 Codex 的 review 正文（外部输入），
-          # 照抄那句报错就能骗出一条错的告警（同 classify-claude-failure.sh 开头那条规矩）。
-          # 改成直接比它比的那两份文件 —— 这是伪造不了的，而且用不着 actions 读日志的权限。
-          # 修复员 2026-10-20 起传 job 自己的令牌，action 不再做这道校验，修复员这一步已经
-          # 走不到这种结局；判据留着，哪天换回 App token 还用得上。
-          no_claude_record() {
-            [ -z "${STRUCTURED:-}" ] || return 1
-            [ -z "${EXEC_FILE:-}" ] || [ ! -f "$EXEC_FILE" ]
-          }
-          # github.workflow_ref 在被调用的工作流里指的是调用方那份文件，形如
-          # owner/repo/.github/workflows/x.yml@refs/pull/10/merge。
-          stale_caller_workflow() {
-            local path remote
-            path="${WORKFLOW_REF:-}"
-            path="${path%@*}"
-            path="${path#*/*/}"
-            [ -n "${DEFAULT_BRANCH:-}" ] || return 1
-            case "$path" in .github/workflows/*) ;; *) return 1 ;; esac
-            [ -f "$path" ] || return 1
-            remote="$(gh api -H 'Accept: application/vnd.github.raw' \
-              "repos/$REPO/contents/$path?ref=$DEFAULT_BRANCH" 2>/dev/null)" || return 1
-            [ "$remote" != "$(<"$path")" ]
-          }
 
           pushed=""
           if [ "$FIX_OUTCOME" = success ] && [ -n "$STRUCTURED" ]; then
@@ -2644,12 +2612,6 @@ jobs:
           # 空串跟 fix-failed 是同一件事，在这里一次补齐，别让后面每个判据各自兜一遍。
           [ -n "$reason" ] || { reason=fix-failed; until=-; }
 
-          # 没留下任何「Claude 跑过」的痕迹时，先问一句是不是上面那种整步跳过。
-          if [ "$reason" = fix-failed ] && no_claude_record && stale_caller_workflow; then
-            reason=stale-workflow
-            echo 'the fixer step was skipped by the action: the caller workflow file differs from the default branch'
-          fi
-
           # review_fixer 允许换人时，结论不在这里下：Decide the takeover 才是这条链
           # 的裁决点，它用 classify-claude-failure.sh 分清 provider 侧失败还是业务
           # 失败，该换 Codex 就换、该红就红。这里先把 SDK 认定的原因交出去，也先
@@ -2671,9 +2633,6 @@ jobs:
               ;;
             auth)
               alert_once "$H" auth - "Claude 令牌失效，自动修复停了；请重新生成 CLAUDE_CODE_OAUTH_TOKEN 并更新仓库 secret。"
-              ;;
-            stale-workflow)
-              alert_once "$H" stale-workflow - "PR 分支落后于默认分支上的流水线文件，自动修复那一步被整个跳过了；在 PR 页点 Update branch，之后巡检会自动再审一次。"
               ;;
             *)
               alert_once "$H" fix-failed - "Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。"
@@ -2789,14 +2748,6 @@ jobs:
             # 推了、或看完觉得都不用改 —— 两种结局都由 Check the fix outcome 处理完了。
             fixer=claude
             why='Claude finished this round'
-          elif [ "${OUTCOME_REASON:-}" = stale-workflow ]; then
-            # action 把自己整步跳过了（PR 分支上的调用桩落后于默认分支）。换谁上都一样
-            # 跳过，所以不走分类器、不换人：说清要点 Update branch，然后红着停下。
-            fixer=claude
-            why='claude-code-action skipped itself: the caller workflow file on the PR branch differs from the default branch'
-            fatal="$why"
-            alert_reason=stale-workflow
-            alert='PR 分支落后于默认分支上的流水线文件，自动修复那一步被整个跳过了；在 PR 页点 Update branch，之后巡检会自动再审一次。'
           else
             # 只把「这次运行的终态字段」喂给分类器，绝不喂整份对话记录：记录里
             # 原样带着 Codex 的 review 正文（外部输入），照抄一句额度报错就能骗
