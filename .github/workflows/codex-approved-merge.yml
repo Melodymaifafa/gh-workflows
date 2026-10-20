@@ -1521,6 +1521,7 @@ jobs:
           # 合并检查是被 Codex 的「没问题」评论叫醒时，触发者是 Codex bot。
           allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"
           show_full_output: false
+          # 禁读清单跟代审一字不差，只多一条不许改 pr/.git（.git 两条：action 把令牌写进 origin 的地址）。
           settings: |
             {
               "disableAllHooks": true,
@@ -1531,6 +1532,8 @@ jobs:
                   "Read(//etc/**)",
                   "Read(//home/runner/work/_temp/**)",
                   "Read(~/.claude/**)",
+                  "Read(//**/.git)",
+                  "Read(//**/.git/**)",
                   "Edit(pr/.git/**)"
                 ]
               }

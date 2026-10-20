@@ -114,7 +114,14 @@ claude_prompt() {
   reviewer_deny="$(with_block settings <<<"$reviewer" | jq -c .permissions.deny)"
   # 代审那份取不到时，两边都是空，下面那条相等就空转了。
   assert_contains "$reviewer_deny" '"Read(//proc/**)"'
+  assert_contains "$reviewer_deny" '"Read(//**/.git/**)"'
   assert_equal "$(jq -c .permissions.deny <<<"$settings")" "$reviewer_deny"
+
+  # 解冲突那一步用同一份禁读清单，只多一条：它能改 pr/ 下的文件，pr/.git 不许改。
+  resolver="$(awk '$0 == "      - name: Claude resolves the conflicts" { f = 1; next } f && /^      - name:/ { exit } f' \
+    "$REPO_ROOT/.github/workflows/codex-approved-merge.yml")"
+  assert_equal "$(with_block settings <<<"$resolver" | jq -c .permissions.deny)" \
+    "$(jq -c '. + ["Edit(pr/.git/**)"]' <<<"$reviewer_deny")"
 }
 
 # action 在 Claude 开跑前就把 job 自己的令牌写进了 origin 的地址（git-config.ts）。修复员读得到

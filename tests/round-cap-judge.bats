@@ -881,9 +881,18 @@ prepare_repo() {
   assert_contains "$job" 'continue-on-error: true'
   assert_contains "$job" 'github_token: ${{ github.token }}'
   assert_contains "$job" '"disableAllHooks": true'
-  for rule in '//proc/**' '//sys/**' '//etc/**' '//home/runner/work/_temp/**' '~/.claude/**'; do
+  for rule in '//proc/**' '//sys/**' '//etc/**' '//home/runner/work/_temp/**' '~/.claude/**' '//**/.git' '//**/.git/**'; do
     assert_contains "$job" "\"Read($rule)\""
   done
+  # 禁读清单跟代审逐字一致：action 把令牌写进 origin 的地址，.git 两条在两边都要有。
+  deny_of() {
+    awk '$0 == "          settings: |" { f = 1; next } f && $0 != "" && substr($0, 1, 11) != "           " { exit } f' |
+      jq -c .permissions.deny
+  }
+  reviewer_deny="$(awk '$0 == "      - name: Claude review" { f = 1; next } f && /^      - name:/ { exit } f' \
+    "$REPO_ROOT/.github/workflows/codex-approved-merge.yml" | deny_of)"
+  assert_contains "$reviewer_deny" '"Read(//**/.git/**)"'
+  assert_equal "$(awk '/- name: Claude judges the leftover findings/{f=1} f&&/^      - name:/&&!/Claude judges/{exit} f' <<<"$job" | deny_of)" "$reviewer_deny"
   assert_contains "$job" '--add-dir pr'
   # 工具那三行跟代审逐字一致（白名单、放行、禁用）：代审那边改了，这里跟着红。
   tool_lines() { grep -E '^ +--(tools|allowedTools|disallowedTools) '; }
