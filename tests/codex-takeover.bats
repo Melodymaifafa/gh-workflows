@@ -12,6 +12,8 @@ load test_helper/common
 load test_helper/step_gate
 
 WF=.github/workflows/claude-codex-iterate.yml
+# 修复员那一步没有 name:，门禁模型按 `uses:` 那一行认它。
+CLAUDE_FIXER_STEP='uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241'
 H=1a7e81f6b5f27f0a1dbc33c6fafda1bb86f1483d
 CODEX='chatgpt-codex-connector[bot]'
 
@@ -2451,7 +2453,7 @@ codex_mode_context() {
   codex_mode_context
   gate_trace "$WF"
 
-  gate_skipped 'uses: anthropics/claude-code-action@v1'
+  gate_skipped "$CLAUDE_FIXER_STEP"
   gate_skipped 'Check the fix outcome'
   gate_ran 'Decide the takeover'
   gate_ran 'Hand the round over to Codex'
@@ -2504,10 +2506,10 @@ codex_mode_context() {
     gate_set steps.gate.outputs.run true
     gate_set steps.select.outputs.first claude
     # Claude 那一步带 continue-on-error，撞额度也不许把后面的判定一起拖红
-    gate_fails 'uses: anthropics/claude-code-action@v1'
+    gate_fails "$CLAUDE_FIXER_STEP"
     gate_trace "$WF"
 
-    gate_ran 'uses: anthropics/claude-code-action@v1'
+    gate_ran "$CLAUDE_FIXER_STEP"
     gate_ran 'Check the fix outcome'
     gate_ran 'Decide the takeover'
   done
@@ -2521,7 +2523,7 @@ codex_mode_context() {
   gate_trace "$WF"
 
   gate_skipped 'Select the review fixer'
-  gate_skipped 'uses: anthropics/claude-code-action@v1'
+  gate_skipped "$CLAUDE_FIXER_STEP"
   gate_skipped 'Check the fix outcome'
   gate_skipped 'Decide the takeover'
   gate_skipped 'Ask Codex for the fix as a patch'

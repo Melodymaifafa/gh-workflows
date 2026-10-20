@@ -34,7 +34,7 @@ setup() {
   refute_contains "$model" sonnet
   refute_contains "$model" haiku
   assert_equal "$(input_default "$WF" claude_effort)" xhigh
-  step="$(awk '/^      - uses: anthropics\/claude-code-action@v1/{f=1} f&&/^      - name:/{exit} f' "$REPO_ROOT/$WF")"
+  step="$(awk '/^      - uses: anthropics\/claude-code-action@/{f=1} f&&/^      - name:/{exit} f' "$REPO_ROOT/$WF")"
   assert_contains "$step" '--model ${{ inputs.claude_model }}'
   assert_contains "$step" '--effort ${{ inputs.claude_effort }}'
 }

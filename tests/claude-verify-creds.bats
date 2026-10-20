@@ -15,6 +15,8 @@ load test_helper/common
 load test_helper/step_gate
 
 WF=.github/workflows/claude-codex-iterate.yml
+# 修复员那一步没有 name:，门禁模型按 `uses:` 那一行认它。
+CLAUDE_FIXER_STEP='uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241'
 
 setup() {
   setup_fake_env
@@ -44,8 +46,17 @@ setup() {
 # ---------- 结构：Claude 那一步拿到的工具和提示词 ----------
 
 claude_step_block() {
-  awk '/^      - uses: anthropics\/claude-code-action@v1/{f=1} f&&/^      - name:/{exit} f' \
+  awk '/^      - uses: anthropics\/claude-code-action@/{f=1} f&&/^      - name:/{exit} f' \
     "$REPO_ROOT/$WF"
+}
+
+# with_block <key>：从 stdin 的步骤文本里取出 `with:` 下某个 `key: |` 的正文，去掉缩进。
+with_block() {
+  awk -v k="          $1: |" '
+    $0 == k { f = 1; next }
+    f && $0 != "" && substr($0, 1, 11) != "           " { exit }
+    f { print substr($0, 13) }
+  '
 }
 
 claude_prompt() {
@@ -80,6 +91,26 @@ claude_prompt() {
            'Bash(git pull' 'Bash(gh pr comment'; do
     refute_contains "$tools" "$t"
   done
+}
+
+# 这一步的工作目录是被审 PR 的 checkout，手上有 Claude 令牌和 action 的写权限令牌。
+# action 默认加载 user / project / local 三处设置，工作目录里的 .claude/settings.json
+# 钩子和 CLAUDE.md 都会生效（action 只在 PR 事件上先换回 base 版，不靠它）。
+# 只留 user 级（settings 输入就写在那里），再照代审关掉钩子、禁读同一份清单。
+@test "fixer: the Claude fixer loads no project settings and no hooks" {
+  step="$(claude_step_block)"
+  args="$(with_block claude_args <<<"$step")"
+  assert_contains $'\n'"$args"$'\n' $'\n--setting-sources user\n'
+
+  settings="$(with_block settings <<<"$step")"
+  assert_equal "$(jq -r .disableAllHooks <<<"$settings")" true
+
+  reviewer="$(awk '$0 == "      - name: Claude review" { f = 1; next } f && /^      - name:/ { exit } f' \
+    "$REPO_ROOT/.github/workflows/codex-approved-merge.yml")"
+  reviewer_deny="$(with_block settings <<<"$reviewer" | jq -c .permissions.deny)"
+  # 代审那份取不到时，两边都是空，下面那条相等就空转了。
+  assert_contains "$reviewer_deny" '"Read(//proc/**)"'
+  assert_equal "$(jq -c .permissions.deny <<<"$settings")" "$reviewer_deny"
 }
 
 # 验证命令只能出现在不带凭据的那一步的 env: 里，不能再写进提示词让 Claude 自己跑。
@@ -1580,7 +1611,7 @@ claude_mode_context() {
   claude_mode_context
   gate_trace "$WF"
 
-  gate_ran 'uses: anthropics/claude-code-action@v1'
+  gate_ran "$CLAUDE_FIXER_STEP"
   gate_ran 'Verify the Claude fix'
   gate_ran 'Commit and push the Claude fix'
   gate_ran 'Post the Claude summary comment'
@@ -1591,7 +1622,7 @@ claude_mode_context() {
 # 判定这一轮的 Check the fix outcome 反过来必须照跑，否则失败再没人分类、没人告警。
 @test "gating: a provider failure never reaches the verify or push step" {
   claude_mode_context
-  gate_fails 'uses: anthropics/claude-code-action@v1'
+  gate_fails "$CLAUDE_FIXER_STEP"
   gate_trace "$WF"
 
   gate_skipped 'Verify the Claude fix'

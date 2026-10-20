@@ -1983,7 +1983,16 @@ jobs:
           } >>"$GITHUB_ENV"
 
       # 失败不立刻中断 job：下一步要先按 SDK 字段分类、发告警，再决定打红
-      - uses: anthropics/claude-code-action@v1
+      # 这一步的工作目录是被审 PR 的 checkout，手上有 Claude 令牌和 action 的写权限令牌。
+      # action 不传 --setting-sources 时默认加载 user / project / local 三处设置
+      # （base-action/src/parse-sdk-options.ts:340），工作目录里的 .claude/settings.json 钩子
+      # 和 CLAUDE.md 都会生效。action 在 PR 事件上会先把它们换回 base 版
+      # （src/github/operations/restore-config.ts），但那一层只在 PR 事件上跑、随 action
+      # 版本变，这里不靠它：只留 user。settings 输入写进的是 ~/.claude/settings.json
+      # （user 级，setup-claude-code-settings.ts:10），关钩子和禁读清单不会跟着丢。
+      # settings 照抄代审（codex-approved-merge.yml 的 Claude review）。
+      # 版本跟代审、round-cap-judge 钉同一个提交（tests/round-cap-judge.bats 盯着几处一致）。
+      - uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
         id: fix
         # gate 说这轮不修，或 review_fixer=codex 指定跳过 Claude，都不跑。
         if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude'
@@ -1996,6 +2005,19 @@ jobs:
           allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"
           # 全量输出进日志，否则只有 init/result 两行，排障全靠猜；公开仓库日志人人可看，只在私有仓库开
           show_full_output: ${{ github.event.repository.private }}
+          settings: |
+            {
+              "disableAllHooks": true,
+              "permissions": {
+                "deny": [
+                  "Read(//proc/**)",
+                  "Read(//sys/**)",
+                  "Read(//etc/**)",
+                  "Read(//home/runner/work/_temp/**)",
+                  "Read(~/.claude/**)"
+                ]
+              }
+            }
           # runner 里 Bash 默认被禁；按需放行，不用宽泛的 git:* / gh pr:*
           # （review 内容属于外部输入，配合 write 权限的 token 需收窄注入面）
           # 注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件
@@ -2011,6 +2033,7 @@ jobs:
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
+            --setting-sources user
             --max-turns 80
             --allowedTools "Edit,MultiEdit,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git status),Bash(git diff:*),Bash(git log:*)"
             --json-schema '{"type":"object","properties":{"pushed":{"type":"boolean"},"fixed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["pushed","fixed","skipped"],"additionalProperties":false}'

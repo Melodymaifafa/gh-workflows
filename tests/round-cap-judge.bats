@@ -846,11 +846,15 @@ prepare_repo() {
   while [[ "$s" == *'persist-credentials: false'* ]]; do s="${s#*'persist-credentials: false'}"; n=$((n + 1)); done
   assert_equal "$n" 2
   assert_contains "$job" 'uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea'
-  # 和代审钉同一个版本：旧版本认不得默认模型时两处一起坏，升级也一起升。
+  # 和代审、修复员钉同一个版本：旧版本认不得默认模型时几处一起坏，升级也一起升。
   # 合并工作流里代审和解冲突各一处，钉的是同一个（tests/resolve-conflict.bats 守着），去重后比。
-  reviewer_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' "$REPO_ROOT/.github/workflows/codex-approved-merge.yml" | sort -u)"
-  judge_pin="$(grep -E '^ +uses: anthropics/claude-code-action@' <<<"$job")"
+  # 修复员那一步以 `- uses:` 开头，先把 `- ` 去掉再比。
+  pin_of() { sed -nE 's/^ +(- )?(uses: anthropics\/claude-code-action@.*)$/\2/p' | sort -u; }
+  reviewer_pin="$(pin_of <"$REPO_ROOT/.github/workflows/codex-approved-merge.yml")"
+  judge_pin="$(pin_of <<<"$job")"
+  fixer_pin="$(awk '/^  iterate:/{on=1} /^  round-cap-judge:/{exit} on' "$REPO_ROOT/$WF" | pin_of)"
   assert_equal "$judge_pin" "$reviewer_pin"
+  assert_equal "$fixer_pin" "$reviewer_pin"
   # 主路径的触发者是 Codex bot：不放行它，Claude 一次都不跑。
   assert_contains "$job" 'allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"'
   assert_contains "$job" 'continue-on-error: true'
