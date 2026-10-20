@@ -482,7 +482,8 @@ $markers" 'src/`x`.sh' 5)" \
   assert_contains "$job" 'github_token: ${{ github.token }}'
   assert_contains "$job" 'show_full_output: false'
   assert_contains "$job" '"disableAllHooks": true'
-  for rule in '//proc/**' '//sys/**' '//etc/**' '//home/runner/work/_temp/**' '~/.claude/**'; do
+  # .git 两条跟修复员一致（tests/claude-verify-creds.bats 要求两份清单一字不差）。
+  for rule in '//proc/**' '//sys/**' '//etc/**' '//home/runner/work/_temp/**' '~/.claude/**' '//**/.git' '//**/.git/**'; do
     assert_contains "$job" "\"Read($rule)\""
   done
   assert_contains "$job" '--max-turns 30'

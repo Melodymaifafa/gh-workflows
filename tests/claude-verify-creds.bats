@@ -117,6 +117,23 @@ claude_prompt() {
   assert_equal "$(jq -c .permissions.deny <<<"$settings")" "$reviewer_deny"
 }
 
+# action 在 Claude 开跑前就把 job 自己的令牌写进了 origin 的地址（git-config.ts），修复员一读
+# .git/config 就看得见，再被意见带偏写进总结，后面那一步就把它发到 PR 上。所以修复员读不了
+# .git（规则从文件系统根起算，跟工作区在哪个路径无关：GitHub 托管机和 ghwf-local 不一样），
+# 也没有能把 .git/config 打出来的本地 git 命令（git diff --no-index 就能），PR 的 diff 走 gh pr diff。
+@test "fixer: the Claude fixer cannot read .git or run a local git diff or log" {
+  step="$(claude_step_block)"
+  settings="$(with_block settings <<<"$step")"
+  deny="$(jq -c .permissions.deny <<<"$settings")"
+  assert_contains "$deny" '"Read(//**/.git)"'
+  assert_contains "$deny" '"Read(//**/.git/**)"'
+
+  tools="$(sed -nE 's/^ *--allowedTools "(.*)"$/\1/p' <<<"$step")"
+  [ -n "$tools" ] || { echo 'no --allowedTools found on the Claude step' >&2; return 1; }
+  bash_tools="$(tr ',' '\n' <<<"$tools" | grep '^Bash(' | LC_ALL=C sort | tr '\n' ' ')"
+  assert_equal "$bash_tools" 'Bash(gh pr diff:*) Bash(gh pr view:*) Bash(git status) '
+}
+
 # job 带着 id-token: write 时，每个 run: 步骤的环境里都有 ACTIONS_ID_TOKEN_REQUEST_TOKEN / _URL
 # （2026-10-20 实测），跑被审 PR 验证命令的那一步也有：它拿去换一个 OIDC JWT，再换成有写权限的
 # Claude App 令牌。iterate 有自己的 permissions: 就看那一块，没有就看工作流顶层那一块。
@@ -1538,6 +1555,42 @@ origin_git() { "$REAL_GIT" --git-dir="$BATS_TEST_TMPDIR/origin.git" "$@"; }
   refute_contains "$body" 'pr-guard:'
   # 接到别人的新提交之后才推上去的，评论要说实话：合起来那一版交给 CI
   assert_contains "$body" '合起来的这一版由 CI 再验一遍'
+}
+
+# 总结是 Claude 读完外部意见后写的，而它跑的时候 .git/config 里躺着 job 的令牌。读不到 .git
+# 是第一道；万一抄出来了，发之前也剥掉：这一步自己手上那份令牌按原样比对，加上几种令牌 / JWT
+# 的样子。M7 评论、单发的评论、运行页的 summary 用的都是同一份正文。
+@test "claude: the summary never posts a token, whatever the fixer writes" {
+  trust_fake_bin
+  own='job-tok-Qw7Zp2Lm9Xc4Rt8'
+  leaks=(
+    "$own"
+    'sk-ant-oat01-AbCdEf123456_-xyzXYZ'
+    "ghp_$(printf 'a%.0s' {1..36})"
+    "gho_$(printf 'b%.0s' {1..36})"
+    "ghu_$(printf 'c%.0s' {1..36})"
+    "ghs_$(printf 'd%.0s' {1..36})"
+    "ghr_$(printf 'e%.0s' {1..36})"
+    'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP'
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlLXZhbHVl'
+  )
+  text='修了 1 条：'
+  for t in "${leaks[@]}"; do text="$text 前 $t 后"; done
+  export STRUCTURED; STRUCTURED="$(jq -cn --arg s "$text" '{pushed: false, summary: $s}')"
+  export PUSHED='' REPO=o/r PR_NUMBER=7 GH_TOKEN="$own"
+
+  run run_step "$WF" "Post the Claude summary comment"
+
+  assert_equal "$status" 0
+  posted="$(fake_last_body 'gh pr comment')"
+  summary="$(cat "$GITHUB_STEP_SUMMARY")"
+  for t in "${leaks[@]}"; do
+    refute_contains "$posted" "$t"
+    refute_contains "$summary" "$t"
+    refute_contains "$output" "$t"
+  done
+  assert_contains "$posted" '修了 1 条：'
+  assert_equal "$(grep -o '前 \[已隐藏\] 后' <<<"$posted" | wc -l | tr -d ' ')" "${#leaks[@]}"
 }
 
 # 一轮一条评论：推上去了，总结写进这一轮的 M7 评论（标记行原样留在最后），不另发。

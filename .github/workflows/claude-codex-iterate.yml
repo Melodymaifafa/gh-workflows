@@ -2020,6 +2020,10 @@ jobs:
           allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"
           # 全量输出进日志，否则只有 init/result 两行，排障全靠猜；公开仓库日志人人可看，只在私有仓库开
           show_full_output: ${{ github.event.repository.private }}
+          # 读不了 .git：action 在 Claude 开跑前就把令牌写进了 origin 的地址，读到就可能被意见
+          # 带偏、抄进总结发出去。// 开头从文件系统根起算，GitHub 托管机和 ghwf-local 的工作区
+          # 路径不同也一样管用；这一条同时挡住 Grep / Glob 搜 .git（2026-10-21 用 Claude Code
+          # 2.1.300 实测：不加时 Read 和 Grep 都读出了令牌，加了一个都读不到）。
           settings: |
             {
               "disableAllHooks": true,
@@ -2029,7 +2033,9 @@ jobs:
                   "Read(//sys/**)",
                   "Read(//etc/**)",
                   "Read(//home/runner/work/_temp/**)",
-                  "Read(~/.claude/**)"
+                  "Read(~/.claude/**)",
+                  "Read(//**/.git)",
+                  "Read(//**/.git/**)"
                 ]
               }
             }
@@ -2045,13 +2051,18 @@ jobs:
           # 「跑 PR 自带命令的那一步手上什么凭据都没有」（README「凭据在 step 的
           # env: 里」那条）。所以验证、commit、push、发评论全部挪到后面的独立步骤
           # （MEL-254）。不许为了省事把工具链或 Bash(git:*) 放回来。
+          # 也没有 git diff / git log：git diff --no-index 能把 .git/config 原样打出来（上面那条
+          # 禁读管不到 Bash 里的 git）。PR 的 diff 用 gh pr diff，走 API，不碰本地配置。
+          # 还没收住的：Claude Code 自带免批的只读命令不看 --allowedTools，git remote -v、
+          # git config --get remote.origin.url 照样能把地址连令牌一起打出来（2026-10-21 实测）。
+          # 收住它要整个去掉 Bash，或者禁掉 Bash(git *)；总结发出去前那道剥令牌是兜底。
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
             --setting-sources user
             --strict-mcp-config
             --max-turns 80
-            --allowedTools "Edit,MultiEdit,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git status),Bash(git diff:*),Bash(git log:*)"
+            --allowedTools "Edit,MultiEdit,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git status)"
             --json-schema '{"type":"object","properties":{"pushed":{"type":"boolean"},"fixed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["pushed","fixed","skipped"],"additionalProperties":false}'
           prompt: |
             ${{ steps.gate.outputs.reviewer }} 刚刚 review 了 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }}。
@@ -2391,8 +2402,18 @@ jobs:
           if [ -n "${STRUCTURED:-}" ]; then
             summary="$(jq -r 'if (.summary | type) == "string" then .summary else "" end
               | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
-              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")' \
+              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
+              | gsub("sk-ant-[A-Za-z0-9_-]+"; "[已隐藏]")
+              | gsub("github_pat_[A-Za-z0-9_]+"; "[已隐藏]")
+              | gsub("gh[pousr]_[A-Za-z0-9_]{16,}"; "[已隐藏]")
+              | gsub("eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")' \
               <<<"$STRUCTURED" 2>/dev/null || true)"
+          fi
+          # 令牌也剥掉：修复员跑的时候 .git/config 里躺着 job 的令牌（action 写进 origin 的地址）。
+          # 读 .git 已经禁了，这里是第二道：上面按几种令牌 / JWT 的样子剥，这里再把这一步自己手上
+          # 那份按原样比对剥掉（只比对，不打印）。剥不掉编码过的，所以第一道才是主防线。
+          if [ -n "${GH_TOKEN:-}" ]; then
+            summary="${summary//"$GH_TOKEN"/[已隐藏]}"
           fi
           if [ -z "${summary//[[:space:]]/}" ]; then
             echo '::warning::Claude returned no summary; skipping the PR comment'

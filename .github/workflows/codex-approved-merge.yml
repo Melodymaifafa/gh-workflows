@@ -984,6 +984,8 @@ jobs:
           # 只读的 GITHUB_TOKEN：action 不再换 App token，Claude 也发不了任何东西。
           github_token: ${{ github.token }}
           show_full_output: false
+          # 禁读清单跟修复员一字不差（tests/claude-verify-creds.bats 盯着），含 .git 两条：action
+          # 把令牌写进 origin 的地址，这里那份虽然只读，也不让它读到、抄进意见里发出去。
           settings: |
             {
               "disableAllHooks": true,
@@ -993,7 +995,9 @@ jobs:
                   "Read(//sys/**)",
                   "Read(//etc/**)",
                   "Read(//home/runner/work/_temp/**)",
-                  "Read(~/.claude/**)"
+                  "Read(~/.claude/**)",
+                  "Read(//**/.git)",
+                  "Read(//**/.git/**)"
                 ]
               }
             }
