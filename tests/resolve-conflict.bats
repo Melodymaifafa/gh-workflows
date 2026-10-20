@@ -509,6 +509,17 @@ old_head_at_round_2() {
     "@codex review"$'\n\n'"<!-- codex-review-head: $NEW -->"$'\n'"<!-- fix-round: 2 -->"
 }
 
+# 连着两次自动合冲突：旧 head 本身就是上一次合并出来的，上面没有 M7，轮数只写在上一条请审（M1）里。
+@test "resolve-conflict: a round carried only on the previous review request is kept" {
+  resolved_and_committed
+  fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
+    "$(gh_comment 1 Melodymaifafa OWNER "$(m1_body "$HEAD_SHA" 3)")")"
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  assert_equal "$(nth_body 2 'gh api POST repos/o/r/issues/7/comments')" \
+    "@codex review"$'\n\n'"<!-- codex-review-head: $NEW -->"$'\n'"<!-- fix-round: 3 -->"
+}
+
 @test "resolve-conflict: a head with no fix rounds gets no fix-round marker" {
   resolved_and_committed
   fake_route "repos/o/r/issues/7/comments?per_page=100" "$(json_array \
