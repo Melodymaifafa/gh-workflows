@@ -3896,13 +3896,17 @@ jobs:
                 ]
               }
             }
+          # 工具按白名单给（--tools），会跑命令的一样都没有：只禁 Bash 时 Monitor 工具照样能跑 Claude Code
+          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21 实测）。
+          # Bash 和 Monitor 在 --disallowedTools 里再禁一次，白名单哪天没递进去也还有这一道。
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
             --max-turns 30
             --add-dir pr
+            --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --disallowedTools "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"
+            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","findings","summary_zh"],"properties":{"verdict":{"type":"string","enum":["merge","stop"]},"summary_zh":{"type":"string","maxLength":400},"findings":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"object","additionalProperties":false,"required":["id","severity","later","title","reason"],"properties":{"id":{"type":"string","pattern":"^F[0-9]+$"},"severity":{"type":"string","enum":["P0","P1","P2"]},"later":{"type":"boolean"},"title":{"type":"string","maxLength":120},"reason":{"type":"string","maxLength":400}}}}}}'
           prompt: |
             你在给 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }} 做收尾判断。

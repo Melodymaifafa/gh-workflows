@@ -885,8 +885,12 @@ prepare_repo() {
     assert_contains "$job" "\"Read($rule)\""
   done
   assert_contains "$job" '--add-dir pr'
-  assert_contains "$job" '--allowedTools "Read,Glob,Grep"'
-  assert_contains "$job" '--disallowedTools "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"'
+  # 工具那三行跟代审逐字一致（白名单、放行、禁用）：代审那边改了，这里跟着红。
+  tool_lines() { grep -E '^ +--(tools|allowedTools|disallowedTools) '; }
+  reviewer_tools="$(awk '$0 == "      - name: Claude review" { f = 1; next } f && /^      - name:/ { exit } f' \
+    "$REPO_ROOT/.github/workflows/codex-approved-merge.yml" | tool_lines)"
+  assert_contains "$reviewer_tools" '--tools "Read,Glob,Grep"'
+  assert_equal "$(tool_lines <<<"$job")" "$reviewer_tools"
   # 主人的 PAT 只在发结论那一步。
   post="$(awk '/- name: Post the round-cap verdict/{on=1} on' <<<"$job")"
   assert_contains "$post" 'GH_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}'

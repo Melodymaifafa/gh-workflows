@@ -488,8 +488,10 @@ $markers" 'src/`x`.sh' 5)" \
   done
   assert_contains "$job" '--max-turns 30'
   assert_contains "$job" '--add-dir pr'
+  # 工具按白名单给，会跑命令的一样都没有；Bash 和 Monitor 另外再禁一次（Monitor 也跑命令）。
+  assert_contains "$job" '--tools "Read,Glob,Grep"'
   assert_contains "$job" '--allowedTools "Read,Glob,Grep"'
-  assert_contains "$job" '--disallowedTools "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"'
+  assert_contains "$job" '--disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"'
   # CODEX_TRIGGER_TOKEN 只出现在 verdict step 里。
   assert_equal "$(count_of "$job" 'secrets.CODEX_TRIGGER_TOKEN')" 1
   verdict_step="$(awk '/- name: Post Claude verdict/{on=1} on' <<<"$job")"

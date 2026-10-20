@@ -142,6 +142,35 @@ claude_prompt() {
   assert_contains "$deny" '"Read(//**/.git/**)"'
 }
 
+# 同一个缺口不只在修复员身上：只靠 --disallowedTools 去掉 Bash 时，Monitor 照样能跑免批的
+# 只读命令。所以两个工作流里每一个 claude-code-action 步骤都要有一行 --tools 白名单，里面只有
+# 读文件 / 改文件的工具，Bash 和 Monitor 另外再禁一次。步骤数也数一遍，免得判定空转。
+@test "every Claude step runs with a tool whitelist that holds no command-running tool" {
+  allowed=' Read Glob Grep Edit MultiEdit Write '
+  steps=0
+  for wf in .github/workflows/claude-codex-iterate.yml .github/workflows/codex-approved-merge.yml; do
+    blocks="$(awk '
+      /^  [a-zA-Z_-]+:$/ || /^      - / { if (s ~ /anthropics\/claude-code-action@/) printf "%s\036", s; s = "" }
+      { s = s $0 "\n" }
+      END { if (s ~ /anthropics\/claude-code-action@/) printf "%s\036", s }
+    ' "$REPO_ROOT/$wf")"
+    while IFS= read -r -d $'\036' block; do
+      steps=$((steps + 1))
+      assert_equal "$(grep -c '^ *--tools ' <<<"$block")" 1
+      tools="$(sed -nE 's/^ *--tools "(.*)"$/\1/p' <<<"$block")"
+      [ -n "$tools" ] || { echo "a Claude step in $wf has an empty --tools line" >&2; return 1; }
+      for t in $(tr ',' ' ' <<<"$tools"); do
+        assert_contains "$allowed" " $t "
+      done
+      disallowed="$(sed -nE 's/^ *--disallowedTools "(.*)"$/\1/p' <<<"$block")"
+      assert_contains ",$disallowed," ',Bash,'
+      assert_contains ",$disallowed," ',Monitor,'
+    done <<<"$blocks"
+  done
+  # 修复员、judge、代审、解冲突
+  assert_equal "$steps" 4
+}
+
 # job 带着 id-token: write 时，每个 run: 步骤的环境里都有 ACTIONS_ID_TOKEN_REQUEST_TOKEN / _URL
 # （2026-10-20 实测），跑被审 PR 验证命令的那一步也有：它拿去换一个 OIDC JWT，再换成有写权限的
 # Claude App 令牌。iterate 有自己的 permissions: 就看那一块，没有就看工作流顶层那一块。

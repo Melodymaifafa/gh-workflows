@@ -759,8 +759,9 @@ stuck_env() { # stuck_env <reason> [detail]
 @test "wiring: Claude starts from the trusted base and may only edit files under pr/" {
   claude="$(step_text 'Claude resolves the conflicts')"
   assert_contains "$claude" '--add-dir pr'
+  assert_contains "$claude" '--tools "Read,Glob,Grep,Edit"'
   assert_contains "$claude" '--allowedTools "Read,Glob,Grep,Edit(pr/**)"'
-  assert_contains "$claude" '--disallowedTools "Bash,Write,'
+  assert_contains "$claude" '--disallowedTools "Bash,Monitor,Write,NotebookEdit,WebFetch,WebSearch,Task"'
   assert_contains "$claude" '"Edit(pr/.git/**)"'
   assert_contains "$claude" '"disableAllHooks": true'
   assert_contains "$claude" 'github_token: ${{ github.token }}'
