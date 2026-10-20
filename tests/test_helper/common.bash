@@ -338,6 +338,14 @@ fix_guard_body() { # fix_guard_body <verify_the_fix|commit_and_push_the_fix>
     commit_and_push_the_fix) step='Define the fix push guard' ;;
     *) echo "fix_guard_body: no step owns $1" >&2; return 1 ;;
   esac
+  # 验证正文里专用账号那一组函数（as_root、ps_by_uid、separate_the_verify_user…）拆到了
+  # Define the fix verify isolation 那一步（块大小，R43），真跑时由验证正文那一步的 output
+  # 一起交出去。结构判定把它们当成正文的一部分，所以这里先把那一步的函数定义接在前面：
+  # 顶格的 `name() {`、体缩进两格，跟原来嵌在 verify_the_fix 里抽出来的样子一模一样。
+  if [ "$1" = verify_the_fix ]; then
+    extract_run_block "$ITERATE_WORKFLOW" 'Define the fix verify isolation' |
+      awk '/^[a-z_]+\(\) \{/ { f = 1 } f { print } f && $0 == "}" { f = 0 }'
+  fi
   extract_run_block "$ITERATE_WORKFLOW" "$step" |
     awk -v fn="$1() {" '$0 == fn { f = 1; next } f && $0 == "}" { exit } f { sub(/^  /, ""); print }'
 }

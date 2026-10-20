@@ -26,6 +26,9 @@ setup() {
   # 噪声重跑时要用的 git：在测试往 PATH 上种任何东西之前先认下来
   REAL_GIT="$(command -v git)"
   export REAL_GIT
+  # 专用账号那一组函数在单独一步定义（块大小，R43），验证正文那一步把它们并进自己的 output。
+  run_block "$WF" "Define the fix verify isolation" >/dev/null
+  export FIX_VERIFY_ISOLATION; FIX_VERIFY_ISOLATION="$(step_output isolation)"
   run_block "$WF" "Define the fix verify guard" >/dev/null
   run_block "$WF" "Define the fix push guard" >/dev/null
   # 两条路的验证 / 推送跑的是同一段正文，由这两步的 output 交出来（真跑时由 env: 接
@@ -1365,6 +1368,56 @@ EOS
   assert_equal "$status" 1
   assert_contains "$output" 'verify guard did not arrive'
   assert_equal "$(git rev-parse HEAD)" "$(git rev-parse origin/topic)"
+}
+
+# 按进程组收不干净（TERM、KILL 之后组里还有活进程）也是「验证留了活进程」：跟清点抓到残留
+# 杀不掉同一个处置 —— 先把文件命令通道清掉（它可能已经往 GITHUB_ENV 写了 BASH_ENV），再交出
+# contained=false，让 Decide / Say why 这两步也跳过（fix round 3）。同一个用户的进程扛不住
+# SIGKILL，真跑造不出这种残留，所以按结构钉：清通道、交 contained=false、再退出，顺序不能乱。
+@test "split: a process group that outlives TERM and KILL scrubs the channels and gates the failure steps" {
+  branch="$(fix_guard_body verify_the_fix | awk '/^if ! reap_verify_group; then$/{f=1} f{print} f&&/^fi$/{exit}')"
+  [ -n "$branch" ] || { echo 'reap-failure branch not found' >&2; return 1; }
+  scrub="$(grep -n '^  scrub_file_commands' <<<"$branch" | head -n 1 | cut -d: -f1)"
+  gate="$(grep -nF "echo 'contained=false' >>\"\$GITHUB_OUTPUT\"" <<<"$branch" | head -n 1 | cut -d: -f1)"
+  quit="$(grep -n '^  exit 1$' <<<"$branch" | head -n 1 | cut -d: -f1)"
+  [ -n "$scrub" ] && [ -n "$gate" ] && [ -n "$quit" ] ||
+    { echo "missing scrub ($scrub), contained=false ($gate) or exit ($quit) in: $branch" >&2; return 1; }
+  [ "$scrub" -lt "$gate" ] && [ "$gate" -lt "$quit" ] ||
+    { echo "wrong order: scrub $scrub, contained=false $gate, exit $quit" >&2; return 1; }
+}
+
+# 验证正文拆成了两步定义（专用账号那一组函数单独一步，块大小，R43）。缺了那一组，
+# separate_the_verify_user 会以「命令找不到」失败、悄悄退回同一个用户跑 —— 少一层防线还不红。
+# 所以验证正文那一步拿不到它们就当场红，不交出一份残缺的正文。
+@test "split: the verify guard refuses to define itself without the dedicated-account functions" {
+  export FIX_VERIFY_ISOLATION=''
+  : >"$GITHUB_OUTPUT"
+
+  run run_block "$WF" "Define the fix verify guard"
+
+  assert_equal "$status" 1
+  assert_contains "$output" 'did not arrive from Define the fix verify isolation'
+  refute_contains "$(cat "$GITHUB_OUTPUT")" 'verify_the_fix'
+}
+
+# 两步之间的函数清单只能有一份口径：那一步定义了哪些、它 declare -f 交出哪些、验证正文那一步
+# 点名检查哪些，三者必须一样，否则多出来的那个要么交不出去、要么没人检查。交出去的那份 output
+# 里，这些函数和 verify_the_fix 一个不少。
+@test "split: the dedicated-account functions are defined, handed over and checked as one list" {
+  iso="$(extract_run_block "$ITERATE_WORKFLOW" 'Define the fix verify isolation')"
+  defined="$(sed -nE 's/^([a-z_]+)\(\) \{.*/\1/p' <<<"$iso" | tr '\n' ' ')"
+  handed="$(awk '/^  declare -f /{f=1} f{print} f&&!/\\$/{exit}' <<<"$iso" |
+    sed -e 's/declare -f//' -e 's/\\//' | tr -s ' \n' ' ')"
+  checked="$(sed -nE "s/^isolation_fns='(.*)'$/\1/p" <<<"$(extract_run_block "$ITERATE_WORKFLOW" 'Define the fix verify guard')")"
+  assert_equal "$(tr ' ' '\n' <<<"$defined" | grep . | sort)" "$(tr ' ' '\n' <<<"$checked" | grep . | sort)"
+  assert_equal "$(tr ' ' '\n' <<<"$handed" | grep . | sort)" "$(tr ' ' '\n' <<<"$checked" | grep . | sort)"
+  # 真交出去的那份正文（setup 里已经跑过两步）：每个函数都定义上了
+  (
+    eval "$FIX_VERIFY_GUARD"
+    for fn in $checked verify_the_fix; do
+      declare -F "$fn" >/dev/null || { echo "missing from the handed-over guard: $fn" >&2; exit 1; }
+    done
+  )
 }
 
 # 推送那一步同理：手上有写权限令牌，正文没递过来一个 git 命令都不许跑。
