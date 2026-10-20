@@ -2025,6 +2025,12 @@ jobs:
           # 路径不同也一样管用；这一条同时挡住 Grep / Glob 搜 .git（2026-10-21 用 Claude Code
           # 2.1.300 实测，不是钉住的 action 自带的 2.1.289：不加时 Read 和 Grep 都读出了令牌，
           # 加了一个都读不到）。
+          # 也改不了 .git 和全局 git 配置（~/.gitconfig、~/.config/git/）：禁读管不住改文件的工具，
+          # 被意见带偏往里写一条 core.fsmonitor（或在 .git 里新建个 commondir 指到 PR 自带的目录），
+          # Put back the PR's own config files 那句 git restore 就把它当命令跑起来，跑在 runner 这个
+          # 用户下；验证那一步的清扫只扫跑验证的那个用户（默认是专用用户），它能一直等到后面拿凭据的
+          # 步骤（Codex review 5590142944 的 P1）。Claude Code 文档写着 Edit(...) 规则管所有改文件的
+          # 内置工具，Write、MultiEdit 也算。
           settings: |
             {
               "disableAllHooks": true,
@@ -2036,7 +2042,11 @@ jobs:
                   "Read(//home/runner/work/_temp/**)",
                   "Read(~/.claude/**)",
                   "Read(//**/.git)",
-                  "Read(//**/.git/**)"
+                  "Read(//**/.git/**)",
+                  "Edit(//**/.git)",
+                  "Edit(//**/.git/**)",
+                  "Edit(~/.gitconfig)",
+                  "Edit(~/.config/git/**)"
                 ]
               }
             }
@@ -2056,7 +2066,7 @@ jobs:
           #   自带的 2.1.289）。Monitor 工具也跑命令，只禁 Bash 时它照样跑得了 git remote -v
           #   （同日同版本实测）。所以按白名单给工具：会跑命令的一样都不在里面。
           # 修复员于是不能自己调 gh / git：意见由 Gate 预取到 .review/findings.md，PR 的文件直接用
-          # Read / Glob / Grep 读。.git 读不到（上面 settings 的禁读），总结发出去前还剥一遍令牌。
+          # Read / Glob / Grep 读。.git 读不到也改不了（上面 settings 的禁读、禁写），总结发出去前还剥一遍令牌。
           # 不许为了省事把任何 Bash(...) 放回来。
           claude_args: |
             --model ${{ inputs.claude_model }}

@@ -115,7 +115,9 @@ claude_prompt() {
   # 代审那份取不到时，两边都是空，下面那条相等就空转了。
   assert_contains "$reviewer_deny" '"Read(//proc/**)"'
   assert_contains "$reviewer_deny" '"Read(//**/.git/**)"'
-  assert_equal "$(jq -c .permissions.deny <<<"$settings")" "$reviewer_deny"
+  # 修复员能改文件，只多几条禁写：.git 和全局 git 配置（见下一个测试）。
+  assert_equal "$(jq -c .permissions.deny <<<"$settings")" \
+    "$(jq -c '. + ["Edit(//**/.git)", "Edit(//**/.git/**)", "Edit(~/.gitconfig)", "Edit(~/.config/git/**)"]' <<<"$reviewer_deny")"
 
   # 解冲突那一步用同一份禁读清单，只多一条：它能改 pr/ 下的文件，pr/.git 不许改。
   resolver="$(awk '$0 == "      - name: Claude resolves the conflicts" { f = 1; next } f && /^      - name:/ { exit } f' \
@@ -133,7 +135,9 @@ claude_prompt() {
 # 只有读文件和改文件的那几样，会跑命令、会派子代理的工具另外再点名禁一次（钉住的 2.1.289 里
 # 白名单管不住开跑后才注册的内置工具和旧工具名，2.1.295 才修）；
 # 读文件的工具碰不到 .git（规则从文件系统根起算，GitHub 托管机和 ghwf-local 都管用）。
-@test "fixer: the Claude fixer has no Bash tool at all and cannot read .git" {
+# 改文件的工具也碰不到 .git 和全局 git 配置：禁读管不住它们，往里写一条 core.fsmonitor，
+# Put back the PR's own config files 那句 git restore 就把它当命令跑（Codex review 5590142944 的 P1）。
+@test "fixer: the Claude fixer has no Bash tool at all and cannot read or write .git" {
   step="$(claude_step_block)"
   args="$(with_block claude_args <<<"$step")"
   assert_equal "$(sed -nE 's/^--tools "(.*)"$/\1/p' <<<"$args")" 'Read,Glob,Grep,Edit,MultiEdit,Write'
@@ -149,6 +153,9 @@ claude_prompt() {
   deny="$(jq -c .permissions.deny <<<"$settings")"
   assert_contains "$deny" '"Read(//**/.git)"'
   assert_contains "$deny" '"Read(//**/.git/**)"'
+  for rule in '//**/.git' '//**/.git/**' '~/.gitconfig' '~/.config/git/**'; do
+    assert_contains "$deny" "\"Edit($rule)\""
+  done
 }
 
 # 同一个缺口不只在修复员身上：只靠 --disallowedTools 去掉 Bash 时，Monitor 照样能跑免批的
