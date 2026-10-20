@@ -1585,7 +1585,7 @@ origin_git() { "$REAL_GIT" --git-dir="$BATS_TEST_TMPDIR/origin.git" "$@"; }
 }
 
 # 跑验证那两步的块里多一行 verify_path="$PATH"（原样那份要留给验证命令自己用），
-# 所以整块比不了；能比的是判定本身 —— 十步都得是同一个 path_is_protected。
+# 所以整块比不了；能比的是判定本身 —— 清单里每一步都得是同一个 path_is_protected。
 # 少了这一条，新加一步时照抄漏一行（比如漏掉「相对项不认」那句）没人拦。
 @test "claude: all eleven credentialed steps run one and the same path guard" {
   guard=''

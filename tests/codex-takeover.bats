@@ -2092,7 +2092,7 @@ resolve_ref() { # resolve_ref <referenced_workflows 的 JSON>
   assert_equal "$(step_output ref)" "$sha"
 }
 
-# 这一步排在 Gate 之后、被审 PR 的代码跑起来之前，所以它不在那十步里。守住位置本身：
+# 这一步排在 Gate 之后、被审 PR 的代码跑起来之前，所以它不在 claude-verify-creds.bats 列的那批带凭据的步骤里。守住位置本身：
 # 它必须排在取脚本那次 checkout 之前，否则 checkout 又拿不到 ref 了。
 @test "scripts-ref: the resolver runs before the checkout that uses it" {
   order="$(awk '/^      - name: Resolve which version of the shared fixer scripts to take$/{print "resolver"}
