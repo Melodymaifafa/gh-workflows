@@ -178,9 +178,9 @@ claude_prompt() {
 }
 
 # curl_calls <文件>…：每一处 curl 调用打一行 `ok|bad <文件>:<行号>: <原文>`。bad = curl 后面紧跟的
-# 不是 -q。认调用按词认：前面不是名字里的字符（curl_line、$curl、curl.exit 都不算），后面是空白或行尾，
-# 所以 `if ! curl`、`timeout 10 curl`、管道里、$( ) 里的都算。不算调用的只有注释行和
-# `for tool in … curl …` 那种命令清单。
+# 不是 -q。认调用按词认：前面是行首 / 空白 / | ; & ( ` / 或引号（curl_line、$curl、curl.exit 都不算），
+# curl 可带一段 /path/ 前缀、可裹一对双引号，后面是空白或行尾 —— 所以 `if ! curl`、`timeout 10 curl`、
+# 管道里、$( ) 里、`/usr/bin/curl`、`"curl"` 都算。不算调用的只有注释行和 `for tool in … curl …` 清单。
 curl_calls() {
   awk '
     {
@@ -188,7 +188,7 @@ curl_calls() {
       sub(/^[[:space:]]+/, "", line)
       if (line ~ /^#/ || line ~ /^for tool in /) next
       rest = line
-      while (match(rest, /(^|[^A-Za-z0-9_$.\/-])curl([[:space:]]|$)/)) {
+      while (match(rest, /(^|[^[:alnum:]_$.-])["]?curl["]?([[:space:]]|$)/)) {
         after = substr(rest, RSTART + RLENGTH)
         print ((after ~ /^[[:space:]]*-q([[:space:]]|$)/) ? "ok" : "bad") " " FILENAME ":" FNR ": " line
         rest = after
@@ -197,8 +197,8 @@ curl_calls() {
   ' "$@"
 }
 
-# 判定本身先验一遍：上一版只认「行首 / 管道符之后的 curl -q」，`if ! curl …`、`timeout 10 curl …`
-# 一条都看不见（PR #74 复审）。
+# 判定本身先验一遍：上一版只认「行首 / 管道符之后的 curl -q」，`if ! curl …`、`timeout 10 curl …`、
+# `/usr/bin/curl …`、`"curl" …` 一条都看不见（PR #74 复审 + M2）。
 @test "curl_calls flags every curl not followed by -q, wherever it sits on the line" {
   printf '%s\n' \
     'if ! curl -sS https://x; then' \
@@ -206,15 +206,18 @@ curl_calls() {
     'v="$(curl -s https://x)"' \
     'a | curl -sf -X POST https://x' \
     'curl \' \
+    '/usr/bin/curl -sS https://x' \
+    '"curl" -s https://x' \
     'curl -q -sf https://x' \
     'if ! curl -q --fail https://x; then' \
+    '/usr/bin/curl -q -sS https://x' \
     '# curl -sf https://x' \
     'for tool in gh jq curl date; do' \
     'curl_line="$(grep -n x)"' \
     'echo 22 >"$FAKE_GH_DIR/curl.exit"' >"$BATS_TEST_TMPDIR/sample.sh"
   calls="$(curl_calls "$BATS_TEST_TMPDIR/sample.sh")"
-  assert_equal "$(grep -c '^bad ' <<<"$calls")" 5
-  assert_equal "$(grep -c '^ok ' <<<"$calls")" 2
+  assert_equal "$(grep -c '^bad ' <<<"$calls")" 7
+  assert_equal "$(grep -c '^ok ' <<<"$calls")" 3
 }
 
 # 修复员的改文件工具、退回 runner 用户跑的验证命令都写得动 $HOME：写一份 ~/.curlrc（insecure 加
@@ -222,10 +225,12 @@ curl_calls() {
 # 5590381303 的 P1）。带凭据的步骤现在从一个空 $HOME 跑起（下面那条判定），-q 是第二道：curl 只有
 # 第一个参数是 -q 才不读用户配置。别的工作流和脚本今天没有往 $HOME 写东西的外人，一样照办，免得
 # 哪天代码挪过去带着洞走。ci.yml 不查：它那几条 curl 是写给调用方 CI 的默认安装命令（字符串），
-# 跟被审 PR 自己的代码跑在一起，-q 管不到什么。
+# 跟被审 PR 自己的代码跑在一起，-q 管不到什么。runner/Dockerfile 也不查：构建镜像时跑，不碰
+# 修复轮的 $HOME。根目录的 newrepo.sh / onboard.sh 一并扫（M2），今天没 curl，有了也得 -q。
 @test "every curl in our workflows and scripts is followed by -q so it skips the user's curlrc" {
   files=()
-  for f in "$REPO_ROOT"/.github/workflows/*.yml "$REPO_ROOT"/scripts/*.sh; do
+  for f in "$REPO_ROOT"/.github/workflows/*.yml "$REPO_ROOT"/scripts/*.sh \
+           "$REPO_ROOT"/newrepo.sh "$REPO_ROOT"/onboard.sh; do
     [ "${f##*/}" = ci.yml ] || files+=("$f")
   done
   calls="$(curl_calls "${files[@]}")"
@@ -1838,6 +1843,18 @@ CREDENTIALED_AFTER_PR_CODE=(
 # 追，所以每一步在跑任何外部命令之前把 $HOME 换成自己现开的空目录，指回原来那个 $HOME 的配置目录
 # 变量一并清掉。PATH 过滤那段只用 shell 内建（上一条判定盯着它逐字节相同），所以「过滤之前只有
 # set -euo pipefail、过滤之后紧接着就是这三行」= 第一条外部命令就是现开空目录的那个 mktemp。
+# 这一步的 env: 里有没有「值里带 secrets. 或 github.token」的变量 —— 手里是不是真有凭据，看值
+# 不看名字（M1，Codex 2026-10-21）：变量叫 GH_TOKEN 还是别的都行，令牌真不真递进来只有值说了算。
+step_declares_credential() {
+  awk -v want="      - name: $1" '
+    $0 == want                 { s = 1; next }
+    s && $0 == "        env:"   { e = 1; next }
+    e && /^        [a-z]/       { exit }
+    s && /^      - /            { exit }
+    e && /secrets\.|github\.token/ { print "yes"; exit }
+  ' "$REPO_ROOT/$WF"
+}
+
 # 带凭据的步骤以后多一步，这一条也会红：修复员之后 env: 里带令牌的每一步都必须在清单里。
 @test "every credentialed step after the PR's code starts from a fresh, empty HOME" {
   # shellcheck disable=SC2016  # 比的就是这段源文本
@@ -1857,7 +1874,7 @@ unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GH_CONFIG_DIR 
     f && /^  [a-z][a-z-]*:$/ { exit } f && /^      - name: / { sub(/^      - name: /, ""); print }' "$REPO_ROOT/$WF")"
   checked=0
   while IFS= read -r step; do
-    grep -qE 'TOKEN|_PAT$' <<<"$(step_env_keys "$WF" "$step")" || continue
+    [ -n "$(step_declares_credential "$step")" ] || continue
     checked=$((checked + 1))
     case " $(printf '[%s] ' "${CREDENTIALED_AFTER_PR_CODE[@]}")" in
       *" [$step] "*) ;;
@@ -1975,6 +1992,31 @@ claude_mode_context() {
   gate_ran 'Decide the takeover'
   # 告警也照跑：以前这一整条链到这里就没人说话了，PR 上一个字都没有（MEL-293）
   gate_ran 'Say why this round pushed nothing'
+}
+
+# R41（Codex 2026-10-21 的 I1）：验证抓到残留、杀干净了（不交 contained=false）—— 这一轮照旧
+# 红着停下，但残留已经没了，Decide / Say why 可以安全地跑。它们俩手里有 GH_TOKEN，所以得证明
+# 它们确实没被 contained 这道门误伤。
+@test "gating: a killed leftover (contained unset) still lets the failure steps run" {
+  claude_mode_context
+  gate_fails 'Verify the Claude fix'
+  gate_trace "$WF"
+
+  gate_ran 'Decide the takeover'
+  gate_ran 'Say why this round pushed nothing'
+}
+
+# 验证抓到一个杀不掉的残留 → 交出 contained=false。这时候它还活着、同一个 uid，Decide / Say why
+# 一跑就被它从 /proc/<pid>/environ 读走 GH_TOKEN。所以这两步必须跳过，整个 job 彻底红，由 Mac
+# 上的巡检重试 / 告警。
+@test "gating: an uncontained leftover skips every failure step that holds a credential" {
+  claude_mode_context
+  gate_fails 'Verify the Claude fix'
+  gate_set steps.claude_verify.outputs.contained false
+  gate_trace "$WF"
+
+  gate_skipped 'Decide the takeover'
+  gate_skipped 'Say why this round pushed nothing'
 }
 
 # 推送被拒：同样一个字都没人说过，同样得有人说。

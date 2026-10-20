@@ -1534,6 +1534,54 @@ EOS
   [ "$contained" -lt "$passed" ] || { echo "containment proof at $contained is not before changed=true at $passed" >&2; return 1; }
 }
 
+# R41（Codex 2026-10-21 的 I1）：抓到残留不再只是红着停下、留着它 —— 先杀掉。留着的话
+# Decide the takeover / Say why 这两步在 job 红之后还跑、手里有 GH_TOKEN，同 uid 的残留
+# 从 /proc/<pid>/environ 就读走了。所以收尾时它应该已经死了，而不是还活着。
+@test "takeover: a leftover is killed, not left alive to read the credentials of the failure steps" {
+  escaped_probe
+  push_workspace "$ESCAPE_VERIFY"
+
+  run_chain
+  escaped_ran
+  pid="$(cat "$BATS_TEST_TMPDIR/escaped.pid")"
+  # 给杀掉之后进程表更新留一点时间
+  i=0
+  while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then reap_escaped; echo "leftover $pid still alive after the chain" >&2; return 1; fi
+  assert_equal "$status" 1
+  assert_contains "$output" 'outlived the verify command'
+  assert_contains "$output" 'was killed before the credentials returned'
+  # 照旧红着停下、不推
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+  refute_called "gh pr comment"
+}
+
+# BASH_ENV 竞态（Codex 2026-10-21 的 C1）：验证命令的子孙在「紧接 wait 那次清空」之后、被
+# 收干净之前，往本步真的 GITHUB_ENV 写一行 BASH_ENV —— runner 收尾时应用到后面每个步骤，
+# bash 一启动就加载它，--noprofile --norc 也拦不住，抢在 PATH 过滤和换 HOME 之前拿到 GH_TOKEN。
+# 守的是：清点证明没活进程之后再清一次文件命令通道，所以 BASH_ENV 到不了后面的步骤。
+# 两条子进程各打一个时点：收到 TERM 才补写的（活到被收那一刻），和 leader 退出后晚一瞬的短命的。
+@test "takeover: a TERM-trapping child's BASH_ENV written after the truncation never survives" {
+  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
+  : >"$GITHUB_PATH"
+  export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV"
+  push_workspace '( trap "printf \"BASH_ENV=/tmp/evil-bash-env\n\" >>\"\$REAL_ENV_FILE\"; exit 0" TERM; while :; do sleep 0.05; done ) &
+true'
+  run_verify
+  refute_contains "$(cat "$GITHUB_ENV")" 'BASH_ENV'
+  [ -z "${GITHUB_PATH:-}" ] || refute_contains "$(cat "$GITHUB_PATH")" '/tmp'
+}
+
+@test "takeover: a short-lived child's BASH_ENV written just after the leader exits never survives" {
+  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
+  : >"$GITHUB_PATH"
+  export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV"
+  push_workspace '( sleep 0.02; printf "BASH_ENV=/tmp/evil-bash-env\n" >>"$REAL_ENV_FILE" ) &
+true'
+  run_verify
+  refute_contains "$(cat "$GITHUB_ENV")" 'BASH_ENV'
+}
+
 # ---------- 按需拉起来的服务进基线，清点那一边一点不放宽 ----------
 #
 # 上面那一道按运行用户正面清点，连「验证命令跑的时候才被按需拉起来的系统服务」一起记一
@@ -1895,6 +1943,39 @@ outcome() { # outcome <FALLBACK_ALLOWED> <exec fixture>
   outcome false exec-429-weekly-limit.json
   assert_equal "$status" 1
   assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-quota'
+}
+
+# 保险丝（Codex 2026-10-21 的 I2）：钉住的 CLI 要是哪天把工作区里的合法改动也拒了，修复员
+# 就一个文件没改，这一轮本会被读成「看完觉得都不用改」静悄悄放过。执行记录里有「工作区内、
+# 不在 .git 下」的 Edit/Write 被拒 → 这不是「不用改」，红着停下让结局告警响。
+outcome_denials() { # outcome_denials <permission_denials JSON 数组>
+  git init -q .
+  git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
+  export GITHUB_WORKSPACE="$PWD"
+  export HEAD_SHA="$H" ROUND=3 FIX_OUTCOME=success FALLBACK_ALLOWED='' REVIEWER=Codex HAS_PAT=''
+  export STRUCTURED='{"pushed":false,"fixed":0,"skipped":1}'
+  export EXEC_FILE="$BATS_TEST_TMPDIR/exec.json"
+  jq -n --argjson d "$1" '[{type:"result",subtype:"success",is_error:false,permission_denials:$d}]' >"$EXEC_FILE"
+  fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$H\"}}"
+  trust_fake_bin
+  run run_block "$WF" "Check the fix outcome"
+}
+
+@test "outcome: an in-workspace write the pinned CLI denied reds the round, not nothing-to-change" {
+  outcome_denials '[{"tool_name":"Edit","tool_input":{"file_path":"'"$BATS_TEST_TMPDIR/work"'/src/app.py"}}]'
+  assert_equal "$status" 1
+  assert_contains "$output" 'denied a write inside the workspace'
+  assert_contains "$output" 'src/app.py'
+}
+
+@test "outcome: a denied write to HOME, /tmp, outside or .git is not an in-workspace regression" {
+  outcome_denials '[
+    {"tool_name":"Write","tool_input":{"file_path":"/home/other/.jq"}},
+    {"tool_name":"Write","tool_input":{"file_path":"/tmp/x"}},
+    {"tool_name":"Write","tool_input":{"file_path":"../outside"}},
+    {"tool_name":"Edit","tool_input":{"file_path":"'"$BATS_TEST_TMPDIR/work"'/.git/config"}}]'
+  # 这些本来就该拒，不算 CLI 坏了 —— 走「看完觉得不用改」的正常分支，不红
+  refute_contains "$output" 'denied a write inside the workspace'
 }
 
 decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [api_error_status]

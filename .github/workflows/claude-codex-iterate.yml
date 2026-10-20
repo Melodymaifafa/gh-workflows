@@ -180,8 +180,9 @@ jobs:
           # curl 的第一个参数必须是 -q：不带它，curl 先读 $HOME 下的用户配置（~/.curlrc 那类）。
           # 修复员的改文件工具、退回 runner 用户跑的验证命令都写得动 $HOME，往里写一份 insecure
           # 加 resolve，后面手上有 PUSHOVER_TOKEN 的步骤一跑这条 POST，令牌就送到别人的机器上
-          # （Codex review 5590381303 的 P1）。-q 不在第一个就不作数。本仓库每一条 curl 都这样
-          # （tests/claude-verify-creds.bats 盯着）；后面带凭据的步骤另外还从一个空 $HOME 跑起。
+          # （Codex review 5590381303 的 P1）。-q 不在第一个就不作数。本仓库工作流和脚本里每一条
+          # curl 都这样（ci.yml 的安装串和 runner/Dockerfile 除外；tests/claude-verify-creds.bats
+          # 盯着）；后面带凭据的步骤另外还从一个空 $HOME 跑起。
           pushover() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
               curl -q -sf -X POST https://api.pushover.net/1/messages.json \
@@ -383,11 +384,13 @@ jobs:
             # 空钩子目录只能是真目录（core.hooksPath 得指到一个存在的目录），所以
             # 仍然 mktemp 现开；但验证命令跑完之后会换一个它从没见过的新目录，见
             # 下面收完进程组那一段。
+            # attributesFile / excludesFile 默认在 ~/.config/git 下、不受 GIT_CONFIG_* 作废，回退路径 $HOME 没换，也指 /dev/null（M5）。
             empty_hooks="$(mktemp -d "$RUNNER_TEMP/no-hooks-XXXXXX")"
             sealed_git() {
               GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
                 git -c "core.hooksPath=$empty_hooks" \
                     -c protocol.ext.allow=never \
+                    -c core.attributesFile=/dev/null -c core.excludesFile=/dev/null \
                     -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
             }
 
@@ -1060,9 +1063,16 @@ jobs:
             verify_status=0
             wait "$verify_pgid" || verify_status=$?
 
-            : >"$GITHUB_ENV"
-            : >"$GITHUB_OUTPUT"
-            [ -z "${GITHUB_PATH:-}" ] || : >"$GITHUB_PATH"
+            # 会应用到后面步骤的那几个文件命令通道（同 Put back 清的集合，不含只渲染的 step summary）。
+            # 子孙直接写真文件 —— GITHUB_ENV 一行 BASH_ENV 抢在 PATH 过滤 / 换 HOME 之前跑；PATH/OUTPUT/STATE 同理。
+            scrub_file_commands() {
+              local fc
+              for fc in "${GITHUB_ENV:-}" "${GITHUB_OUTPUT:-}" "${GITHUB_PATH:-}" "${GITHUB_STATE:-}"; do
+                [ -z "$fc" ] || : >"$fc"
+              done
+            }
+            # 紧接 wait 先清一次；退出后、收干净前补写的那一笔盖不住，下面清点证明没活进程后再清（C1）。
+            scrub_file_commands
 
             # 组里还活着的进程。僵尸不算：它已经死了，只是还没被收尸。
             verify_survivors() {
@@ -1159,8 +1169,6 @@ jobs:
             # 起来也会被记一笔（本机跑测试时尤其常见）。反复清点、拿第一个干净的瞬间
             # 当证据 —— 那一刻它名下一个进程都没有，就再也回不来了。5 秒内一直不干净
             # 就红着停下；这个数只是给调度和噪声留余量，定太短会 19 个仓库一起误红。
-            # 不干净的那些**不杀**：我们分不清那是逃逸的后代还是机器上别人的进程，误杀
-            # 比红着停下糟得多 —— 而红着停下之后，带凭据的那一步压根不会开始。
             verify_tree_is_contained() {
               local waited=0
               while :; do
@@ -1175,19 +1183,61 @@ jobs:
               done
             }
 
+            # 抓到残留就杀（R41）：只杀 unexplained_procs 报的那些（不在基线、不在我们这棵树上；
+            # 专用账号那条路是它名下全部）。先 SIGSTOP 冻住再 SIGKILL，反复几轮到不冒新的。
+            # 为什么杀：这一轮照旧红着停下、不 push，但 Decide / Say why 在 job 红后还跑、手里有
+            # GH_TOKEN，同 uid 的残留读得走它们的 environ。杀掉才安全。
+            kill_unexplained() {
+              local round=0 line pid pids sig
+              while [ "$round" -lt 5 ]; do
+                pids=''
+                while IFS= read -r line; do
+                  pid="${line%% *}"
+                  case "$pid" in ''|*[!0-9]*) continue ;; esac
+                  pids="$pids $pid"
+                done <<<"$verify_leftovers"
+                [ -n "$pids" ] || return 0
+                # shellcheck disable=SC2086  # 要按空格拆成多个 pid
+                for sig in STOP KILL; do verify_kill -"$sig" $pids 2>/dev/null || true; done
+                sleep 0.2
+                verify_leftovers="$(unexplained_procs)" || { verify_sweep_unanswerable=1; return 1; }
+                [ -n "$verify_leftovers" ] || return 0
+                round=$((round + 1))
+              done
+              [ -z "$verify_leftovers" ]
+            }
+
             if ! verify_tree_is_contained; then
-              # 「问不出来」和「真有残留」要分开报：前者是这道门自己坏了（没有 sudo、
-              # ps 不在写不动的 PATH 上），后者是它抓到了东西。两种都红，但诊断不一样。
+              verify_leftovers_seen="$verify_leftovers"
+              # 「问不出来」= 门自己坏了（没 sudo / ps）：枚举不了就杀不了，fail closed（contained=false）。
               if [ -n "$verify_sweep_unanswerable" ]; then
+                scrub_file_commands
+                echo 'contained=false' >>"$GITHUB_OUTPUT"
                 echo '- verification: **rejected**, the leftover-process sweep could not be answered' >>"$GITHUB_STEP_SUMMARY"
                 echo "::error::cannot list the processes owned by uid $verify_uid after the verify command${verify_user:+ (the dedicated account $verify_user)}; refusing to read an unanswerable sweep as containment"
                 exit 1
               fi
-              echo '- verification: **rejected**, a process it started outlived it' >>"$GITHUB_STEP_SUMMARY"
-              echo "::error::a process owned by uid $verify_uid (the user the verify command ran as${verify_user:+, the dedicated account $verify_user}) outlived the verify command ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); refusing to trust the post-verify tree"
-              echo "::error::nothing is exempt from this gate; each leftover's cgroup, to tell an on-demand service the pre-warm missed (runner-user path only) from a real escapee: $(leftover_origins | tr '\n' ';')"
+              # 报信同今天：每条落在哪棵 cgroup（没预热到的按需服务 / 真逃出去的后代）。
+              # 杀会清空 verify_leftovers，所以杀之前先记原始清单。
+              origins="$(leftover_origins | tr '\n' ';')"
+              killed_clean=0
+              kill_unexplained || killed_clean=$?
+              scrub_file_commands   # 杀的过程中残留可能又补写了一笔，清掉再往下
+              if [ "$killed_clean" -ne 0 ] || [ -n "$verify_sweep_unanswerable" ]; then
+                # 杀不干净：fail closed，gate 掉后面每一步。
+                echo 'contained=false' >>"$GITHUB_OUTPUT"
+                echo '- verification: **rejected**, a process survived the kill' >>"$GITHUB_STEP_SUMMARY"
+                echo "::error::a process owned by uid $verify_uid${verify_user:+ (account $verify_user)} outlived the verify command and could not be killed ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); failing the whole job so no credentialed step starts; cgroups: $origins"
+                exit 1
+              fi
+              # 杀干净了：照旧红着停下、不 push，但 Decide / Say why 可安全跑，不交 contained=false。
+              echo '- verification: **rejected**, a process it started outlived it (since killed)' >>"$GITHUB_STEP_SUMMARY"
+              echo "::error::a process owned by uid $verify_uid${verify_user:+ (account $verify_user)} outlived the verify command and was killed before the credentials returned ($verify_leftovers_seen); cgroups: $origins"
               exit 1
             fi
+
+            # 清点干净：补写的那一笔这里再清一次（C1），排在指纹 / 树 / changed 和各 reject 分支之前。
+            scrub_file_commands
 
             # 清点证明「此刻它名下没人」之后，立刻把写工作区的能力也收回：把账号从工作区
             # 那个组里摘出去。这一道专治「过后有人来」—— 一个排好的 cron 任务起来时
@@ -1298,6 +1348,8 @@ jobs:
             # 的 .venv / node_modules / __pycache__ 仍然进不来：它们从没进过索引。
             sealed_git add -u
 
+            # 写 changed 之前再清最后一次（C1）：清点和这里之间又补一笔的短命子进程这下盖掉。
+            scrub_file_commands
             echo 'changed=true' >>"$GITHUB_OUTPUT"
           }
 
@@ -1403,6 +1455,7 @@ jobs:
               GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
                 git -c "core.hooksPath=$empty_hooks" \
                     -c protocol.ext.allow=never \
+                    -c core.attributesFile=/dev/null -c core.excludesFile=/dev/null \
                     -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
             }
 
@@ -2601,6 +2654,32 @@ jobs:
             exit 1
           }
 
+          # 保险丝（Codex 2026-10-21 的 I2）：万一钉住的 CLI 哪天把「工作区里的合法改动」也
+          # 拒了（--allowedTools "Edit(./**)" 解析变了之类），修复员就一个文件都没改，这一轮
+          # 会被读成「看完觉得都不用改」静悄悄放过。所以先看执行记录里的 permission_denials：
+          # 有 Edit/Write/MultiEdit 被拒、被拒的路径又在工作区里（且不在 .git 下），那不是
+          # 「不用改」，是白名单把自己卡死了 —— 红着停下，让下面的结局告警响。日志里只留
+          # 工作区内的相对路径（基线做法同下面 offenders），不打印 $HOME / /tmp 那些本就该拒的。
+          if [ -n "${EXEC_FILE:-}" ] && [ -r "$EXEC_FILE" ]; then
+            ws="${GITHUB_WORKSPACE:-$PWD}"
+            denied_in_ws="$(jq -r --arg ws "$ws" '
+              (if type == "array" then . else [] end)
+              | [.[] | select(.type == "result")] | last
+              | (.permission_denials // [])
+              | map(select(.tool_name == "Edit" or .tool_name == "Write" or .tool_name == "MultiEdit"))
+              | map(.tool_input.file_path // empty)
+              | map(select(
+                  (startswith("/") and startswith($ws + "/"))
+                  or ((startswith("/") | not) and (startswith("../") | not) and (. != ".."))))
+              | map(select((test("(^|/)\\.git(/|$)")) | not))
+              | map(if startswith("/") then .[($ws | length) + 1:] else . end)
+              | .[]' "$EXEC_FILE" 2>/dev/null || true)"
+            if [ -n "$denied_in_ws" ]; then
+              echo "::error::the fixer was denied a write inside the workspace ($(printf '%s' "$denied_in_ws" | tr '\n' ' ')); the pinned CLI may be refusing in-workspace edits. Failing this round instead of reading it as nothing-to-change"
+              exit 1
+            fi
+          fi
+
           H="$HEAD_SHA"
           live_head() { gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha; }
 
@@ -2720,7 +2799,12 @@ jobs:
       # 也好、代码没修好也好，都不许留下一个绿勾。
       - name: Decide the takeover
         id: decide
-        if: ${{ !cancelled() && steps.gate.outputs.run == 'true' && steps.select.outcome == 'success' }}
+        # contained != 'false'：Claude 验证抓到一个杀不掉的残留时交出 contained=false
+        # （Ruling R41）。这一步用 !cancelled()，验证红了它照样跑、手里有 GH_TOKEN 和
+        # Pushover 密钥 —— 残留从 /proc/<pid>/environ 读得到。杀不掉就连这一步一起跳过，
+        # job 彻底红，由 Mac 上的巡检重试。只认 claude_verify：Codex 验证排在这一步之后，
+        # 那条路的 contained 由排在最后的 Say why 把门。
+        if: ${{ !cancelled() && steps.gate.outputs.run == 'true' && steps.select.outcome == 'success' && steps.claude_verify.outputs.contained != 'false' }}
         env:
           REVIEW_FIXER: ${{ inputs.review_fixer }}
           FIRST: ${{ steps.select.outputs.first }}
@@ -3252,6 +3336,7 @@ jobs:
             GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
               git -c "core.hooksPath=$empty_hooks" \
                   -c protocol.ext.allow=never \
+                  -c core.attributesFile=/dev/null -c core.excludesFile=/dev/null \
                   -c "safe.directory=${GITHUB_WORKSPACE:-$PWD}" "$@"
           }
 
@@ -3616,8 +3701,10 @@ jobs:
       # 跑不通（wechat-mimic-finetune，2026-10-01），以及这个仓库自己「改好了但推不上去」
       # （令牌不许改 workflow 文件，2026-10-04 四条红 run，PR 上全程没有一个字）。
       # 本步只补说明，不再额外打红：job 早已经红了。同一个 head 同一原因只发一次。
+      # contained != 'false'：同 Decide the takeover —— 验证抓到杀不掉的残留时它也手握
+      # GH_TOKEN / Pushover，一起跳过（巡检重试 / 告警，Ruling R41）。
       - name: Say why this round pushed nothing
-        if: ${{ failure() }}
+        if: ${{ failure() && steps.claude_verify.outputs.contained != 'false' && steps.codex_verify.outputs.contained != 'false' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
