@@ -158,6 +158,21 @@ claude_prompt() {
   done
 }
 
+# 修复员的改文件工具、退回 runner 用户跑的验证命令都写得动 $HOME：写一份 ~/.curlrc（insecure 加
+# resolve），后面手上有 PUSHOVER_TOKEN 的步骤一跑 curl，令牌就送到别人的机器上（Codex review
+# 5590381303 的 P1）。curl 只有第一个参数是 -q 才不读用户配置，所以 iterate 这个 job 里每一条
+# curl 都得 -q 打头，以后新加的也一样。for tool in … curl … 那种清单不算调用。
+@test "every curl in the iterate job starts with -q so it skips the user's curlrc" {
+  job="$(awk '/^  iterate:/{on=1} /^  round-cap-judge:/{exit} on' "$REPO_ROOT/$WF")"
+  calls="$(grep -vE '^[[:space:]]*#' <<<"$job" | grep -E '(^|[|;&(`])[[:space:]]*curl([[:space:]]|$)' || true)"
+  # pushover、push_alert，加上装 shell 工具链的两条；一条都没认出来就是判定空转了。
+  [ "$(grep -c . <<<"$calls")" -ge 4 ] || { echo "found too few curl calls in the iterate job: $calls" >&2; return 1; }
+  if bad="$(grep -vE '(^|[|;&(`])[[:space:]]*curl -q ' <<<"$calls")"; then
+    echo "curl without a leading -q in the iterate job: $bad" >&2
+    return 1
+  fi
+}
+
 # 同一个缺口不只在修复员身上：只靠 --disallowedTools 去掉 Bash 时，Monitor 照样能跑免批的
 # 只读命令。所以两个工作流里每一个 claude-code-action 步骤都要有一行 --tools 白名单，里面只有
 # 读文件 / 改文件的工具；会跑命令、会派子代理的工具另外再一个个点名禁掉：钉住的 2.1.289 里

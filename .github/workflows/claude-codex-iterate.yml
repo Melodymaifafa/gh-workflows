@@ -177,9 +177,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # curl 的第一个参数必须是 -q：不带它，curl 先读 $HOME 下的用户配置（~/.curlrc 那类）。
+          # 修复员的改文件工具、退回 runner 用户跑的验证命令都写得动 $HOME，往里写一份 insecure
+          # 加 resolve，后面手上有 PUSHOVER_TOKEN 的步骤一跑这条 POST，令牌就送到别人的机器上
+          # （Codex review 5590381303 的 P1）。-q 不在第一个就不作数。本 job 每一条 curl 都这样
+          # （tests/claude-verify-creds.bats 盯着）。
           pushover() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-              curl -sf -X POST https://api.pushover.net/1/messages.json \
+              curl -q -sf -X POST https://api.pushover.net/1/messages.json \
                 --form-string "token=$PUSHOVER_TOKEN" \
                 --form-string "user=$PUSHOVER_USER" \
                 --form-string "title=$1" \
@@ -1895,14 +1900,15 @@ jobs:
 
       # shell runtime（本仓库自己修自己的 PR）：版本钉死，同 ci.yml。
       # 装到 /usr/local，不落进被修的工作区。shellcheck runner 自带。
+      # curl 照本 job 的规矩 -q 打头（见 Define pr-guard helpers 的 pushover）。
       - name: Install shell tooling
         if: inputs.runtime == 'shell'
         run: |
           set -euo pipefail
           arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"  # 本机 runner 是 arm64
-          curl -sSfL "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_${arch}.tar.gz" | tar xz -C /tmp actionlint
+          curl -q -sSfL "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_${arch}.tar.gz" | tar xz -C /tmp actionlint
           sudo install /tmp/actionlint /usr/local/bin/actionlint
-          curl -sSfL https://github.com/bats-core/bats-core/archive/refs/tags/v1.14.0.tar.gz | tar xz -C /tmp
+          curl -q -sSfL https://github.com/bats-core/bats-core/archive/refs/tags/v1.14.0.tar.gz | tar xz -C /tmp
           sudo /tmp/bats-core-1.14.0/install.sh /usr/local
       - name: Select the review fixer
         id: select
@@ -3373,9 +3379,10 @@ jobs:
 
           # 链路断点告警：静默失败过一次就没人知道流水线停了（同 adb 看门狗的
           # 教训），每个终态失败路径都推一条 Pushover；每次 run 至多一条，不重复。
+          # -q 打头不读 $HOME 下的 curl 配置，理由同 Define pr-guard helpers 的 pushover。
           push_alert() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-              curl -sf -X POST https://api.pushover.net/1/messages.json \
+              curl -q -sf -X POST https://api.pushover.net/1/messages.json \
                 --form-string "token=$PUSHOVER_TOKEN" \
                 --form-string "user=$PUSHOVER_USER" \
                 --form-string "title=$1" \
