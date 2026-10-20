@@ -114,7 +114,118 @@ claude_prompt() {
   reviewer_deny="$(with_block settings <<<"$reviewer" | jq -c .permissions.deny)"
   # 代审那份取不到时，两边都是空，下面那条相等就空转了。
   assert_contains "$reviewer_deny" '"Read(//proc/**)"'
-  assert_equal "$(jq -c .permissions.deny <<<"$settings")" "$reviewer_deny"
+  assert_contains "$reviewer_deny" '"Read(//**/.git/**)"'
+  # 修复员能改文件，只多几条禁写：.git 和全局 git 配置（见下一个测试）。
+  assert_equal "$(jq -c .permissions.deny <<<"$settings")" \
+    "$(jq -c '. + ["Edit(//**/.git)", "Edit(//**/.git/**)", "Edit(~/.gitconfig)", "Edit(~/.config/git/**)"]' <<<"$reviewer_deny")"
+
+  # 解冲突那一步用同一份禁读清单，只多一条：它能改 pr/ 下的文件，pr/.git 不许改。
+  resolver="$(awk '$0 == "      - name: Claude resolves the conflicts" { f = 1; next } f && /^      - name:/ { exit } f' \
+    "$REPO_ROOT/.github/workflows/codex-approved-merge.yml")"
+  assert_equal "$(with_block settings <<<"$resolver" | jq -c .permissions.deny)" \
+    "$(jq -c '. + ["Edit(pr/.git/**)"]' <<<"$reviewer_deny")"
+}
+
+# action 在 Claude 开跑前就把 job 自己的令牌写进了 origin 的地址（git-config.ts）。修复员读得到
+# 它，再被意见带偏写进总结，后面那一步就把它发到 PR 上。Claude Code 自带一批免批的只读命令
+# （git remote -v、git config --get …），不看 --allowedTools，放一条 Bash(...) 就等于全放
+# （2026-10-21 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。光在
+# --disallowedTools 里去掉 Bash 还不够：Monitor 工具也跑命令，同一批免批命令照样能跑
+# （同日同版本实测，git remote -v 又打出了令牌）。所以工具按白名单给（--tools），
+# 只有读文件和改文件的那几样，会跑命令、会派子代理的工具另外再点名禁一次（钉住的 2.1.289 里
+# 白名单管不住开跑后才注册的内置工具和旧工具名，2.1.295 才修）；
+# 读文件的工具碰不到 .git（规则从文件系统根起算，GitHub 托管机和 ghwf-local 都管用）。
+# 改文件的工具也碰不到 .git 和全局 git 配置：禁读管不住它们，往里写一条 core.fsmonitor，
+# Put back the PR's own config files 那句 git restore 就把它当命令跑（Codex review 5590142944 的 P1）。
+@test "fixer: the Claude fixer has no Bash tool at all and cannot read or write .git" {
+  step="$(claude_step_block)"
+  args="$(with_block claude_args <<<"$step")"
+  assert_equal "$(sed -nE 's/^--tools "(.*)"$/\1/p' <<<"$args")" 'Read,Glob,Grep,Edit,MultiEdit,Write'
+  assert_equal "$(grep -c '^--tools ' <<<"$args")" 1
+  disallowed="$(sed -nE 's/^--disallowedTools "(.*)"$/\1/p' <<<"$args")"
+  assert_equal "$disallowed" 'Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell'
+  assert_equal "$(grep -c '^--disallowedTools' <<<"$args")" 1
+  tools="$(sed -nE 's/^--allowedTools "(.*)"$/\1/p' <<<"$args")"
+  assert_equal "$tools" 'Edit,MultiEdit,Write'
+  refute_contains "$args" 'Bash('
+
+  settings="$(with_block settings <<<"$step")"
+  deny="$(jq -c .permissions.deny <<<"$settings")"
+  assert_contains "$deny" '"Read(//**/.git)"'
+  assert_contains "$deny" '"Read(//**/.git/**)"'
+  for rule in '//**/.git' '//**/.git/**' '~/.gitconfig' '~/.config/git/**'; do
+    assert_contains "$deny" "\"Edit($rule)\""
+  done
+}
+
+# 修复员的改文件工具、退回 runner 用户跑的验证命令都写得动 $HOME：写一份 ~/.curlrc（insecure 加
+# resolve），后面手上有 PUSHOVER_TOKEN 的步骤一跑 curl，令牌就送到别人的机器上（Codex review
+# 5590381303 的 P1）。curl 只有第一个参数是 -q 才不读用户配置，所以 iterate 这个 job 里每一条
+# curl 都得 -q 打头，以后新加的也一样。for tool in … curl … 那种清单不算调用。
+@test "every curl in the iterate job starts with -q so it skips the user's curlrc" {
+  job="$(awk '/^  iterate:/{on=1} /^  round-cap-judge:/{exit} on' "$REPO_ROOT/$WF")"
+  calls="$(grep -vE '^[[:space:]]*#' <<<"$job" | grep -E '(^|[|;&(`])[[:space:]]*curl([[:space:]]|$)' || true)"
+  # pushover、push_alert，加上装 shell 工具链的两条；一条都没认出来就是判定空转了。
+  [ "$(grep -c . <<<"$calls")" -ge 4 ] || { echo "found too few curl calls in the iterate job: $calls" >&2; return 1; }
+  if bad="$(grep -vE '(^|[|;&(`])[[:space:]]*curl -q ' <<<"$calls")"; then
+    echo "curl without a leading -q in the iterate job: $bad" >&2
+    return 1
+  fi
+}
+
+# 同一个缺口不只在修复员身上：只靠 --disallowedTools 去掉 Bash 时，Monitor 照样能跑免批的
+# 只读命令。所以两个工作流里每一个 claude-code-action 步骤都要有一行 --tools 白名单，里面只有
+# 读文件 / 改文件的工具；会跑命令、会派子代理的工具另外再一个个点名禁掉：钉住的 2.1.289 里
+# --tools 管不住开跑后才注册的内置工具，旧工具名（Task）也摸得到白名单外的工具（2.1.295 才修）。
+# 步骤数也数一遍，免得判定空转。
+@test "every Claude step runs with a tool whitelist that holds no command-running tool" {
+  allowed=' Read Glob Grep Edit MultiEdit Write '
+  steps=0
+  for wf in .github/workflows/claude-codex-iterate.yml .github/workflows/codex-approved-merge.yml; do
+    blocks="$(awk '
+      /^  [a-zA-Z_-]+:$/ || /^      - / { if (s ~ /anthropics\/claude-code-action@/) printf "%s\036", s; s = "" }
+      { s = s $0 "\n" }
+      END { if (s ~ /anthropics\/claude-code-action@/) printf "%s\036", s }
+    ' "$REPO_ROOT/$wf")"
+    while IFS= read -r -d $'\036' block; do
+      steps=$((steps + 1))
+      assert_equal "$(grep -c '^ *--tools ' <<<"$block")" 1
+      tools="$(sed -nE 's/^ *--tools "(.*)"$/\1/p' <<<"$block")"
+      [ -n "$tools" ] || { echo "a Claude step in $wf has an empty --tools line" >&2; return 1; }
+      for t in $(tr ',' ' ' <<<"$tools"); do
+        assert_contains "$allowed" " $t "
+      done
+      disallowed="$(sed -nE 's/^ *--disallowedTools "(.*)"$/\1/p' <<<"$block")"
+      for t in Bash Monitor PowerShell Agent Task Skill Workflow SendMessage RemoteTrigger; do
+        assert_contains ",$disallowed," ",$t,"
+      done
+    done <<<"$blocks"
+  done
+  # 修复员、judge、代审、解冲突
+  assert_equal "$steps" 4
+}
+
+# job 带着 id-token: write 时，每个 run: 步骤的环境里都有 ACTIONS_ID_TOKEN_REQUEST_TOKEN / _URL
+# （2026-10-20 实测），跑被审 PR 验证命令的那一步也有：它拿去换一个 OIDC JWT，再换成有写权限的
+# Claude App 令牌。iterate 有自己的 permissions: 就看那一块，没有就看工作流顶层那一块。
+@test "iterate: the job asks for no OIDC token" {
+  job="$(awk '/^  iterate:$/ { f = 1; next } f && /^  [a-z][a-z-]*:$/ { exit } f' "$REPO_ROOT/$WF")"
+  [ -n "$job" ] || { echo 'no iterate job found' >&2; return 1; }
+  perms="$(awk '/^    permissions:/ { f = 1; print; next } f && !/^      / { exit } f' <<<"$job")"
+  if [ -z "$perms" ]; then
+    perms="$(awk '/^permissions:/ { f = 1; print; next } f && !/^  / { exit } f' "$REPO_ROOT/$WF")"
+  fi
+  # 取到的确实是那一块权限，下面那条 refute 才不是在空字符串上空转
+  assert_contains "$perms" 'contents: write'
+  refute_contains "$perms" 'id-token'
+}
+
+# 传了 github_token，action 就直接用它，不去要 OIDC、不换 App 令牌（v1.0.241 的
+# src/github/token.ts setupGitHubToken）。只许一行：写两行时生效的是哪一行全看解析器。
+@test "fixer: passes the job token so the action never mints an App token" {
+  step="$(claude_step_block)"
+  assert_equal "$(grep -c '^          github_token:' <<<"$step")" 1
+  assert_contains "$step" $'\n          github_token: ${{ github.token }}\n'
 }
 
 # 验证命令只能出现在不带凭据的那一步的 env: 里，不能再写进提示词让 Claude 自己跑。
@@ -385,11 +496,15 @@ chmod +x .git/hooks/post-index-change'
   cp -R .git "$BATS_TEST_TMPDIR/git-pristine"
 
   # 换 base 版这一下也得在重跑里重做，否则重跑那次压根没东西要放回、空转着绿
+  # 放回那一步要认得出 runner 的文件命令目录（它要清空前面各步的那些文件），给它一个真样子的。
+  cmd_dir="$BATS_TEST_TMPDIR/runner-temp/_runner_file_commands"
+  mkdir -p "$cmd_dir"
   swap_then_push() {
     printf 'base-version\n' >CLAUDE.md
     mkdir -p .claude-pr
     printf 'pr-version\n' >.claude-pr/CLAUDE.md
-    run_block "$WF" "Put back the PR's own config files" && verify_and_push
+    GITHUB_OUTPUT="$cmd_dir/set_output_0f0f0f0f-1111-2222-3333-444444444444" \
+      run_block "$WF" "Put back the PR's own config files" && verify_and_push
   }
   tries=0
   run swap_then_push
@@ -1511,6 +1626,42 @@ origin_git() { "$REAL_GIT" --git-dir="$BATS_TEST_TMPDIR/origin.git" "$@"; }
   refute_contains "$body" 'pr-guard:'
   # 接到别人的新提交之后才推上去的，评论要说实话：合起来那一版交给 CI
   assert_contains "$body" '合起来的这一版由 CI 再验一遍'
+}
+
+# 总结是 Claude 读完外部意见后写的，而它跑的时候 .git/config 里躺着 job 的令牌。读不到 .git
+# 是第一道；万一抄出来了，发之前也剥掉：这一步自己手上那份令牌按原样比对，加上几种令牌 / JWT
+# 的样子。M7 评论、单发的评论、运行页的 summary 用的都是同一份正文。
+@test "claude: the summary never posts a token, whatever the fixer writes" {
+  trust_fake_bin
+  own='job-tok-Qw7Zp2Lm9Xc4Rt8'
+  leaks=(
+    "$own"
+    'sk-ant-oat01-AbCdEf123456_-xyzXYZ'
+    "ghp_$(printf 'a%.0s' {1..36})"
+    "gho_$(printf 'b%.0s' {1..36})"
+    "ghu_$(printf 'c%.0s' {1..36})"
+    "ghs_$(printf 'd%.0s' {1..36})"
+    "ghr_$(printf 'e%.0s' {1..36})"
+    'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP'
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlLXZhbHVl'
+  )
+  text='修了 1 条：'
+  for t in "${leaks[@]}"; do text="$text 前 $t 后"; done
+  export STRUCTURED; STRUCTURED="$(jq -cn --arg s "$text" '{pushed: false, summary: $s}')"
+  export PUSHED='' REPO=o/r PR_NUMBER=7 GH_TOKEN="$own"
+
+  run run_step "$WF" "Post the Claude summary comment"
+
+  assert_equal "$status" 0
+  posted="$(fake_last_body 'gh pr comment')"
+  summary="$(cat "$GITHUB_STEP_SUMMARY")"
+  for t in "${leaks[@]}"; do
+    refute_contains "$posted" "$t"
+    refute_contains "$summary" "$t"
+    refute_contains "$output" "$t"
+  done
+  assert_contains "$posted" '修了 1 条：'
+  assert_equal "$(grep -o '前 \[已隐藏\] 后' <<<"$posted" | wc -l | tr -d ' ')" "${#leaks[@]}"
 }
 
 # 一轮一条评论：推上去了，总结写进这一轮的 M7 评论（标记行原样留在最后），不另发。

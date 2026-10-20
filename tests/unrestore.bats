@@ -20,6 +20,27 @@ setup() {
   git init -q -b topic .
   git config user.email t@e
   git config user.name t
+  # CI 上跑 bats 时这个变量是本仓库自己的名字，这里盖掉，判定才不跟着跑在哪儿变。
+  export GITHUB_REPOSITORY=o/r
+  # runner 的文件命令目录照真的样子摆：每一步一组 <前缀><同一个 GUID>，这一步自己的那组
+  # 由 GITHUB_OUTPUT 那几个变量指着（actions/runner FileCommandManager）。
+  CMD_DIR="$BATS_TEST_TMPDIR/runner-temp/_runner_file_commands"
+  OWN=0f0f0f0f-1111-2222-3333-444444444444
+  mkdir -p "$CMD_DIR"
+  export GITHUB_OUTPUT="$CMD_DIR/set_output_$OWN" GITHUB_ENV="$CMD_DIR/set_env_$OWN"
+  export GITHUB_STATE="$CMD_DIR/save_state_$OWN" GITHUB_PATH="$CMD_DIR/add_path_$OWN"
+  export GITHUB_STEP_SUMMARY="$CMD_DIR/step_summary_$OWN"
+  : >"$GITHUB_OUTPUT"; : >"$GITHUB_ENV"; : >"$GITHUB_STATE"; : >"$GITHUB_PATH"; : >"$GITHUB_STEP_SUMMARY"
+}
+
+# 一个改不动的 git：命中 $1（一段 case 模式）的调用都失败，别的照常。
+stuck_git() {
+  local real_git
+  real_git="$(command -v git)"
+  mkdir -p "$BATS_TEST_TMPDIR/stuck-git"
+  printf '#!/bin/sh\ncase " $* " in\n  %s) echo "error: could not lock config file" >&2; exit 255 ;;\nesac\nexec "%s" "$@"\n' \
+    "$1" "$real_git" >"$BATS_TEST_TMPDIR/stuck-git/git"
+  chmod +x "$BATS_TEST_TMPDIR/stuck-git/git"
 }
 
 # 被审 PR 的 HEAD：它自己的 CLAUDE.md 和 .claude/settings.json，外加一个普通源文件。
@@ -167,8 +188,186 @@ step_text() {
   assert_equal "$(cat "$BATS_TEST_TMPDIR/hook-ran" 2>/dev/null)" ''
 }
 
+# action 在 agent 模式下把手上的令牌写进 origin 的地址（v1.0.241 的
+# src/github/operations/git-config.ts），跑完不收回；修复员传的是 job 自己的令牌，整个 job
+# 都有效。验证那一步跑被审 PR 自己的命令，读个文件就拿走了。这一步把它抹掉。
+@test "unrestore: the token the action wrote into a remote's URL is gone before verify" {
+  pr_commit
+  git remote add origin 'https://x-access-token:abc@github.com/o/r.git'
+  git remote add upstream 'https://user:pw@example.com/up.git'
+  git remote add mirror "$BATS_TEST_TMPDIR/mirror.git"
+
+  run_block "$WF" "$STEP"
+
+  assert_equal "$(git config --local --get remote.origin.url)" 'https://github.com/o/r.git'
+  assert_equal "$(git config --local --get remote.upstream.url)" 'https://example.com/up.git'
+  # 不带凭据的地址原样留着：真跑那条链的测试里 origin 就是一个本地裸仓库
+  assert_equal "$(git config --local --get remote.mirror.url)" "$BATS_TEST_TMPDIR/mirror.git"
+  refute_contains "$(cat .git/config)" 'abc'
+  refute_contains "$(cat .git/config)" 'pw@'
+}
+
+# actions/checkout 的 extraheader（本 job 关了持久化，这里仍然种一份）、任何一种 credential
+# 配置（helper 是「! 开头就是 shell」的那种，也可能直接吐出密码）都不许留到验证。
+@test "unrestore: an extraheader and a credential helper in .git/config are removed" {
+  pr_commit
+  git config --local http.https://github.com/.extraheader 'AUTHORIZATION: basic c2VjcmV0'
+  git config --local --add http.https://github.com/.extraheader 'AUTHORIZATION: basic second'
+  git config --local http.extraheader 'AUTHORIZATION: bearer third'
+  git config --local credential.helper '!f() { echo password=secret; }; f'
+  git config --local credential.https://github.com.username x-access-token
+
+  run_block "$WF" "$STEP"
+
+  cfg="$(git config --local --list)"
+  refute_contains "$cfg" 'extraheader'
+  refute_contains "$cfg" 'credential.'
+  refute_contains "$cfg" 'secret'
+  refute_contains "$cfg" 'c2VjcmV0'
+  # 别的配置照旧
+  assert_equal "$(git config --local --get user.name)" t
+}
+
+# 抹不掉就不许往下走：宁可这一轮红，也不让验证命令带着一份凭据开跑。报的是键名，不是值。
+@test "unrestore: a credential the step cannot remove turns the step red" {
+  pr_commit
+  git remote add origin 'https://x-access-token:abc@github.com/o/r.git'
+  git config --local http.https://github.com/.extraheader 'AUTHORIZATION: basic c2VjcmV0'
+  # 写配置的那几下都失败
+  stuck_git '*" set-url "*|*" --unset-all "*|*" --add "*|*" --replace-all "*'
+
+  PATH="$BATS_TEST_TMPDIR/stuck-git:$PATH" run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$output" '::error::'
+  assert_contains "$output" 'remote.origin.url'
+  assert_contains "$output" 'http.https://github.com/.extraheader'
+  refute_contains "$output" 'abc'
+  refute_contains "$output" 'c2VjcmV0'
+}
+
+# 凭据也可能在 .git/config 用 include.path 引进来的另一个文件里（actions/checkout v4.3.1 起
+# 持久化就写在那儿）。这一步只改 .git/config 自己，所以那一份抹不掉 —— 照样红。
+@test "unrestore: a credential pulled in through include.path also turns the step red" {
+  pr_commit
+  printf '[http "https://github.com/"]\n\textraheader = AUTHORIZATION: basic c2VjcmV0\n' \
+    >"$BATS_TEST_TMPDIR/included.cfg"
+  git config --local include.path "$BATS_TEST_TMPDIR/included.cfg"
+
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$output" '::error::'
+  assert_contains "$output" 'http.https://github.com/.extraheader'
+}
+
+# 凭据不只会在 remote 地址里：url.<带 user:pass@ 的地址>.insteadOf / pushInsteadOf 把凭据写在
+# 键名里，submodule.*.url 写在值里。键名带凭据的整条删，值带凭据的去掉那一段。
+@test "unrestore: userinfo in insteadOf keys and submodule URLs is removed too" {
+  pr_commit
+  git config --local url.https://x-access-token:abc@github.com/.insteadOf https://github.com/
+  git config --local url.https://u:pw@github.com/.pushInsteadOf https://github.com/
+  git config --local url.https://mirror.example.com/.insteadOf https://github.com/
+  git config --local submodule.lib.url https://tok@github.com/o/lib.git
+
+  run_block "$WF" "$STEP"
+
+  cfg="$(git config --local --list)"
+  refute_contains "$cfg" 'abc'
+  refute_contains "$cfg" 'pw@'
+  refute_contains "$cfg" 'tok@'
+  assert_equal "$(git config --local --get submodule.lib.url)" 'https://github.com/o/lib.git'
+  # 不带凭据的 insteadOf 原样留着
+  assert_equal "$(git config --local --get url.https://mirror.example.com/.insteadof)" 'https://github.com/'
+}
+
+# extensions.worktreeConfig 打开时，git 还读 .git/config.worktree —— 那一份同样要抹干净。
+@test "unrestore: the worktree-scoped config is scrubbed as well" {
+  pr_commit
+  git config --local core.repositoryformatversion 1
+  git config --local extensions.worktreeConfig true
+  git config --worktree credential.helper '!echo password=secret'
+  git config --worktree remote.origin.pushurl 'https://x-access-token:abc@github.com/o/r.git'
+
+  run_block "$WF" "$STEP"
+
+  wt="$(git config --worktree --list)"
+  refute_contains "$wt" 'credential.'
+  refute_contains "$wt" 'abc'
+  assert_equal "$(git config --worktree --get remote.origin.pushurl)" 'https://github.com/o/r.git'
+}
+
+# 连配置都列不出来，就说不清有没有凭据：照样红着停下，而且要说一句为什么。
+@test "unrestore: a git config that cannot be listed turns the step red with an error" {
+  pr_commit
+  stuck_git '*" --name-only --list "*'
+
+  PATH="$BATS_TEST_TMPDIR/stuck-git:$PATH" run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$output" '::error::'
+}
+
+# action 把令牌也写进了它那一步的 output 文件（core.setOutput github_token，run.ts）。runner
+# 到 job 结束才删前面各步的文件命令文件，0644，验证命令读得到 —— 2026-10-20 在 ghwf-local
+# 上实测过（run 39458080241）。前面各步的那些文件这时早已处理完，清空不影响任何东西；
+# 这一步自己那组（同一个 GUID）runner 还要读，step_summary_* 的副本 runner 稍后还要上传，都不动。
+@test "unrestore: earlier steps' runner file commands are emptied, this step's own and the summaries are not" {
+  pr_commit
+  old=9a9a9a9a-bbbb-cccc-dddd-eeeeeeeeeeee
+  printf 'github_token<<ghadelimiter_1\nghs_livejobtoken\nghadelimiter_1\n' >"$CMD_DIR/set_output_$old"
+  for f in set_env save_state add_path artifacts artifacts_list some_new_command; do
+    printf 'x=1\n' >"$CMD_DIR/${f}_$old"
+  done
+  printf '# summary\n' >"$CMD_DIR/step_summary_$old"
+  printf '# summary\n' >"$CMD_DIR/step_summary_$old-scrubbed"
+  printf 'mine=1\n' >"$GITHUB_OUTPUT"
+  printf 'MINE=1\n' >"$GITHUB_ENV"
+
+  run_block "$WF" "$STEP"
+
+  for f in set_output set_env save_state add_path artifacts artifacts_list some_new_command; do
+    [ -f "$CMD_DIR/${f}_$old" ] || { echo "${f}_$old is gone" >&2; return 1; }
+    assert_equal "$(wc -c <"$CMD_DIR/${f}_$old" | tr -d ' ')" 0
+  done
+  assert_equal "$(cat "$GITHUB_OUTPUT")" 'mine=1'
+  assert_equal "$(cat "$GITHUB_ENV")" 'MINE=1'
+  assert_equal "$(cat "$CMD_DIR/step_summary_$old")" '# summary'
+  assert_equal "$(cat "$CMD_DIR/step_summary_$old-scrubbed")" '# summary'
+}
+
+@test "unrestore: an earlier runner file the step cannot empty turns it red" {
+  [ "$(id -u)" != 0 ] || skip 'root can write a read-only file'
+  pr_commit
+  old=9a9a9a9a-bbbb-cccc-dddd-eeeeeeeeeeee
+  printf 'github_token<<ghadelimiter_1\nghs_livejobtoken\nghadelimiter_1\n' >"$CMD_DIR/set_output_$old"
+  chmod 0444 "$CMD_DIR/set_output_$old"
+
+  run run_block "$WF" "$STEP"
+
+  assert_equal "$status" 1
+  assert_contains "$output" '::error::'
+  assert_contains "$output" "set_output_$old"
+  refute_contains "$output" 'ghs_livejobtoken'
+}
+
+# 认不出 runner 的文件命令目录、或者认不出这一步自己那组，就分不清哪些能清 —— 红，不猜。
+@test "unrestore: an output file outside the runner's file-command directory turns it red" {
+  pr_commit
+  export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/github_output"
+  : >"$GITHUB_OUTPUT"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 1
+  assert_contains "$output" '::error::'
+
+  export GITHUB_OUTPUT="$CMD_DIR/set_output_"
+  run run_block "$WF" "$STEP"
+  assert_equal "$status" 1
+  assert_contains "$output" '::error::'
+}
+
 # 它放在验证前紧挨着的那一步：排在它后面的 Claude 步骤会再换一次 base 版。它不碰凭据：
-# 只动工作区和索引。
+# 只动工作区、索引和 .git/config。
 @test "unrestore: the step runs right before the first verify step and holds no credentials" {
   before_verify="$(step_names | awk '$0 == "Verify the Claude fix" { print prev; exit } { prev = $0 }')"
   assert_equal "$before_verify" "$STEP"

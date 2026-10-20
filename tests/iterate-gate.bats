@@ -779,53 +779,25 @@ outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
   assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
 }
 
-# claude-code-action 的第三种结局：它把自己整步跳过了（PR 分支上的调用桩跟默认分支上
-# 的那份不一样）。跳过的长相跟「跑过但什么都没落地」一模一样，以前两种都只换来一条
-# 笼统的「自动修复没跑成」，看不出该去点 Update branch（MEL-293）。
-stale_env() { # stale_env <默认分支上那份文件的内容>
+# 修复员以前会因为「PR 分支上的调用桩跟默认分支不一样」被 action 整步跳过，那时这里专门
+# 认一次、发「点 Update branch」（MEL-293）。2026-10-20 起修复员传 job 自己的令牌，action
+# 不再做这道校验，那种结局没了；判据还留着的话，别的原因没留下执行记录的失败，碰上调用桩
+# 不一样的 PR（正好是钉别的 ref 演练的那种）就被错认成它：发一条错的告警，还挡住 Codex 接手。
+# 所以判据删了：没有执行记录的失败一律是普通的 fix-failed，也不再去比那两份文件。
+@test "outcome: a fixer that left no record on a PR whose caller stub differs is a plain fix-failed" {
+  outcome_env success ''
+  live_head "$H"
   export WORKFLOW_REF='o/r/.github/workflows/claude-codex-iterate.yml@refs/pull/7/merge'
   export DEFAULT_BRANCH=develop
   mkdir -p .github/workflows
   printf 'uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1\n' \
     >.github/workflows/claude-codex-iterate.yml
-  fake_route 'repos/o/r/contents/.github/workflows/claude-codex-iterate.yml?ref=develop' "$1"
-}
-
-@test "outcome: the action skipped itself -> the alert says to click Update branch" {
-  outcome_env success ''
-  live_head "$H"
-  stale_env 'uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1 还多一行'
+  fake_route 'repos/o/r/contents/.github/workflows/claude-codex-iterate.yml?ref=develop' '跟 PR 分支上那份完全不一样的内容'
   outcome
   assert_equal "$status" 1
-  assert_equal "$(fake_last_body "gh pr comment")" "PR 分支落后于默认分支上的流水线文件，自动修复那一步被整个跳过了；在 PR 页点 Update branch，之后巡检会自动再审一次。
-
-<!-- pr-guard: alert head=$H reason=stale-workflow until=- -->"
-}
-
-@test "outcome: a caller workflow file that already matches keeps the plain fix-failed alert" {
-  outcome_env success ''
-  live_head "$H"
-  stale_env 'uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1'
-  outcome
-  assert_equal "$status" 1
-  assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
-}
-
-# 判据是那两份文件，不是日志里那句 `Workflow validation failed`：同一份日志原样带着
-# Codex 的 review 正文（外部输入），照抄那句报错就能骗出一条错的告警。有执行记录就说明
-# Claude 真跑过，这次连文件都不比。
-@test "outcome: a result text quoting the validation error buys no Update-branch alert" {
-  exec_file="$BATS_TEST_TMPDIR/exec-quoted.json"
-  jq -n '[{type:"result",subtype:"error",is_error:true,
-           result:"Workflow validation failed. The workflow file must exist and have identical content to the version on the default branch."}]' \
-    >"$exec_file"
-  outcome_env failure ''
-  export EXEC_FILE="$exec_file"
-  live_head "$H"
-  stale_env '跟 PR 分支上那份完全不一样的内容'
-  outcome
-  assert_equal "$status" 1
-  assert_contains "$(fake_last_body "gh pr comment")" "reason=fix-failed until=- -->"
+  body="$(fake_last_body "gh pr comment")"
+  assert_contains "$body" "reason=fix-failed until=- -->"
+  refute_contains "$body" 'Update branch'
   refute_called 'contents/.github/workflows'
 }
 

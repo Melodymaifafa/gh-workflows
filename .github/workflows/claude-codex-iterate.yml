@@ -92,11 +92,15 @@ on:
         type: string
         default: MEL
 
+# 不要 id-token: write：有了它，每个 run: 步骤的环境里都有 ACTIONS_ID_TOKEN_REQUEST_TOKEN / _URL
+# （2026-10-20 实测），跑被审 PR 验证命令的那一步也有 —— 它拿去换一个 OIDC JWT，再换成有写
+# 权限的 Claude App 令牌（MEL-254 要防的正是这个）。修复员改传 job 自己的令牌，action 就不再
+# 要 OIDC（见修复员那一步的 github_token）。这一块只管 iterate：round-cap-judge 和 round-cap-park
+# 各有自己的 permissions:。调用桩照旧给 id-token: write 也没关系，被调用的工作流只能比调用方要得少。
 permissions:
   contents: write
   pull-requests: write
   issues: write
-  id-token: write
   actions: read
 
 jobs:
@@ -173,9 +177,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # curl 的第一个参数必须是 -q：不带它，curl 先读 $HOME 下的用户配置（~/.curlrc 那类）。
+          # 修复员的改文件工具、退回 runner 用户跑的验证命令都写得动 $HOME，往里写一份 insecure
+          # 加 resolve，后面手上有 PUSHOVER_TOKEN 的步骤一跑这条 POST，令牌就送到别人的机器上
+          # （Codex review 5590381303 的 P1）。-q 不在第一个就不作数。本 job 每一条 curl 都这样
+          # （tests/claude-verify-creds.bats 盯着）。
           pushover() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-              curl -sf -X POST https://api.pushover.net/1/messages.json \
+              curl -q -sf -X POST https://api.pushover.net/1/messages.json \
                 --form-string "token=$PUSHOVER_TOKEN" \
                 --form-string "user=$PUSHOVER_USER" \
                 --form-string "title=$1" \
@@ -1891,14 +1900,15 @@ jobs:
 
       # shell runtime（本仓库自己修自己的 PR）：版本钉死，同 ci.yml。
       # 装到 /usr/local，不落进被修的工作区。shellcheck runner 自带。
+      # curl 照本 job 的规矩 -q 打头（见 Define pr-guard helpers 的 pushover）。
       - name: Install shell tooling
         if: inputs.runtime == 'shell'
         run: |
           set -euo pipefail
           arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"  # 本机 runner 是 arm64
-          curl -sSfL "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_${arch}.tar.gz" | tar xz -C /tmp actionlint
+          curl -q -sSfL "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_${arch}.tar.gz" | tar xz -C /tmp actionlint
           sudo install /tmp/actionlint /usr/local/bin/actionlint
-          curl -sSfL https://github.com/bats-core/bats-core/archive/refs/tags/v1.14.0.tar.gz | tar xz -C /tmp
+          curl -q -sSfL https://github.com/bats-core/bats-core/archive/refs/tags/v1.14.0.tar.gz | tar xz -C /tmp
           sudo /tmp/bats-core-1.14.0/install.sh /usr/local
       - name: Select the review fixer
         id: select
@@ -2008,10 +2018,25 @@ jobs:
         continue-on-error: true
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # job 自己的 GITHUB_TOKEN：action 不再用 OIDC 换 App token（不要 OIDC、不做工作流校验、
+          # 也不吊销），所以本工作流不要 id-token: write。写权限在工作流顶层的 permissions: 里。
+          # action 会把它写进 origin 的地址、跑完不收回 —— Put back the PR's own config files 抹掉它。
+          github_token: ${{ github.token }}
           # action 默认无视 bot 发起的触发（防循环）；本工作流的触发者恰恰是 Codex bot
           allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"
           # 全量输出进日志，否则只有 init/result 两行，排障全靠猜；公开仓库日志人人可看，只在私有仓库开
           show_full_output: ${{ github.event.repository.private }}
+          # 读不了 .git：action 在 Claude 开跑前就把令牌写进了 origin 的地址，读到就可能被意见
+          # 带偏、抄进总结发出去。// 开头从文件系统根起算，GitHub 托管机和 ghwf-local 的工作区
+          # 路径不同也一样管用；这一条同时挡住 Grep / Glob 搜 .git（2026-10-21 用 Claude Code
+          # 2.1.300 实测，不是钉住的 action 自带的 2.1.289：不加时 Read 和 Grep 都读出了令牌，
+          # 加了一个都读不到）。
+          # 也改不了 .git 和全局 git 配置（~/.gitconfig、~/.config/git/）：禁读管不住改文件的工具，
+          # 被意见带偏往里写一条 core.fsmonitor（或在 .git 里新建个 commondir 指到 PR 自带的目录），
+          # Put back the PR's own config files 那句 git restore 就把它当命令跑起来，跑在 runner 这个
+          # 用户下；验证那一步的清扫只扫跑验证的那个用户（默认是专用用户），它能一直等到后面拿凭据的
+          # 步骤（Codex review 5590142944 的 P1）。Claude Code 文档写着 Edit(...) 规则管所有改文件的
+          # 内置工具，Write、MultiEdit 也算。
           settings: |
             {
               "disableAllHooks": true,
@@ -2021,29 +2046,43 @@ jobs:
                   "Read(//sys/**)",
                   "Read(//etc/**)",
                   "Read(//home/runner/work/_temp/**)",
-                  "Read(~/.claude/**)"
+                  "Read(~/.claude/**)",
+                  "Read(//**/.git)",
+                  "Read(//**/.git/**)",
+                  "Edit(//**/.git)",
+                  "Edit(//**/.git/**)",
+                  "Edit(~/.gitconfig)",
+                  "Edit(~/.config/git/**)"
                 ]
               }
             }
-          # runner 里 Bash 默认被禁；按需放行，不用宽泛的 git:* / gh pr:*
-          # （review 内容属于外部输入，配合 write 权限的 token 需收窄注入面）
-          # 注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件
-          # 没有 gh api：意见已由 Gate 预取到 .review/findings.md
-          # 清单里一样「会执行仓库里的代码」的东西都没有：没有 runtime 工具链
-          # （inputs.extra_tools 不再展开成任何值）、没有 git add /
-          # commit / push、没有 gh pr comment。这一步必须有写权限令牌（action 自己
-          # 要用），而被审 PR 的代码一旦在这一步跑起来，它跟令牌同一个用户，
-          # /proc/<pid>/environ 就把令牌读回去 —— 令牌换个放法都没用，唯一的条件是
-          # 「跑 PR 自带命令的那一步手上什么凭据都没有」（README「凭据在 step 的
-          # env: 里」那条）。所以验证、commit、push、发评论全部挪到后面的独立步骤
-          # （MEL-254）。不许为了省事把工具链或 Bash(git:*) 放回来。
+          # 修复员没有 Bash：工具按白名单给（--tools），只有读文件的 Read / Glob / Grep 和改文件的
+          # Edit / MultiEdit / Write。会跑命令、会派子代理的工具在 --disallowedTools 里再一个个点名禁掉
+          # （Bash、Monitor、PowerShell、Agent 和它的旧名 Task、Skill、Workflow、SendMessage、RemoteTrigger）：
+          # 钉住的 action 自带的 Claude Code 2.1.289 里，--tools 管不住开跑后才注册的内置工具，旧工具名
+          # 也摸得到白名单外的工具（2.1.295 的 release notes 写着修了这两处），光靠白名单不够。
+          # 注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件。
+          # 为什么一条 Bash 都不留：
+          # · 这一步必须有写权限令牌（action 自己要用），被审 PR 的代码一旦在这一步跑起来，它跟令牌
+          #   同一个用户，/proc/<pid>/environ 就把令牌读回去。所以 runtime 工具链、git add / commit /
+          #   push、gh pr comment 早就不给了，验证、commit、push、发评论都在后面的独立步骤（MEL-254）。
+          # · action 在 Claude 开跑前把 job 的令牌写进了 origin 的地址。Claude Code 自带一批免批的只读
+          #   命令，不看 --allowedTools：只要还有 Bash，git remote -v、git config --get remote.origin.url
+          #   就能把它连令牌一起打出来（2026-10-21 用 Claude Code 2.1.300 实测，不是钉住的 action
+          #   自带的 2.1.289）。Monitor 工具也跑命令，只禁 Bash 时它照样跑得了 git remote -v
+          #   （同日同版本实测）。所以按白名单给工具：会跑命令的一样都不在里面。
+          # 修复员于是不能自己调 gh / git：意见由 Gate 预取到 .review/findings.md，PR 的文件直接用
+          # Read / Glob / Grep 读。.git 读不到也改不了（上面 settings 的禁读、禁写），总结发出去前还剥一遍令牌。
+          # 不许为了省事把任何 Bash(...) 放回来。
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
             --setting-sources user
             --strict-mcp-config
             --max-turns 80
-            --allowedTools "Edit,MultiEdit,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git status),Bash(git diff:*),Bash(git log:*)"
+            --tools "Read,Glob,Grep,Edit,MultiEdit,Write"
+            --allowedTools "Edit,MultiEdit,Write"
+            --disallowedTools "Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
             --json-schema '{"type":"object","properties":{"pushed":{"type":"boolean"},"fixed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["pushed","fixed","skipped"],"additionalProperties":false}'
           prompt: |
             ${{ steps.gate.outputs.reviewer }} 刚刚 review 了 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }}。
@@ -2090,7 +2129,22 @@ jobs:
       # 修复员看到的是 base 版，它在这几个路径里改的东西底子就是错的，一并丢掉。
       # 这一步必须是验证之前的最后一步：每跑一次 action 都会再换一次，排在它后面的 Claude
       # 步骤会把 base 版又换回来。以后加的 Claude 步骤（自审、第二遍）一律插在它前面。
-      # 不拿任何凭据：只动工作区和索引。git 关掉钩子：按路径 restore 也会触发 post-checkout。
+      # 第二件事：.git/config 里一份凭据都不留。action 在 agent 模式下把手上的令牌写进 origin
+      # 的地址（v1.0.241 的 src/github/operations/git-config.ts configureGitAuth），跑完不从那儿删。
+      # 它换来的 App token 靠 action 自己吊销，吊销失败也不报（action.yml 那句 curl 带 || true）；
+      # 传 job 自己的令牌时更没人吊销，整个 job 都有效。验证那一步跑被审 PR 自己的命令、就在这个
+      # checkout 里，读个文件就拿走了（MEL-254）。所以这里把 remote 地址里的凭据、extraheader、
+      # credential.*、insteadOf 键名里的凭据全抹掉（worktree 那一级也算），再验一遍：还剩一样
+      # 就红着停下，验证不开跑。push 不靠 origin 地址里的凭据：它把凭据只递给那一条 git push
+      # （见 commit_and_push_the_fix）。
+      # 第三件事：前面各步的 runner 文件命令文件（$RUNNER_TEMP/_runner_file_commands 下的
+      # set_output_* 之类）清空。action 把令牌当 output 写进了它那一步的文件（core.setOutput
+      # github_token，src/entrypoints/run.ts），runner 到 job 结束才删这些文件，0644，验证命令
+      # 读得到（2026-10-20 在 ghwf-local 上实测，run 39458080241）。它们在各自那一步结束时就
+      # 处理完了，清空不影响什么；这一步自己那组（同一个 GUID）runner 还没处理，step_summary_*
+      # 的副本 runner 稍后还要上传，都不动。
+      # 不拿任何凭据：只动工作区、索引、git 配置和 runner 的文件命令文件。git 关掉钩子：按路径
+      # restore 也会触发 post-checkout。
       - name: Put back the PR's own config files
         id: unrestore
         if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude' && (steps.fix.outcome == 'success' || steps.fix.outcome == 'failure')
@@ -2114,6 +2168,101 @@ jobs:
             fi
           done
           rm -rf .claude-pr
+
+          # 先抹凭据，再验。抹的那几下失败不算数，后面那次检查说了算。
+          # 日志里只留键名，键名里的 user:pass@ 也打成 ***。
+          mask() { sed -E 's#://[^/]*@#://***@#'; }
+          strip_userinfo() { sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@#\1#'; }
+          scopes=(local)
+          # 打开 extensions.worktreeConfig 时 git 还读 .git/config.worktree（--worktree 那一份）。
+          if [ "$(git config --local --bool --get extensions.worktreeConfig 2>/dev/null || true)" = true ]; then
+            scopes+=(worktree)
+          fi
+          for scope in "${scopes[@]}"; do
+            if ! keys="$(git config "--$scope" --name-only --list)"; then
+              echo "::error::could not list the $scope git config; refusing to start the verify command"
+              exit 1
+            fi
+            while IFS= read -r key; do
+              [ -n "$key" ] || continue
+              case "$key" in
+                # 整条就是凭据（extraheader、credential.*），或者键名里带着 user:pass@
+                # （url.<base>.insteadOf / pushInsteadOf）：整条删。
+                http.*extraheader | credential.* | *://*@*)
+                  if git -c core.hooksPath=/dev/null config "--$scope" --unset-all "$key"; then
+                    echo "removed $(printf '%s' "$key" | mask) ($scope)"
+                  fi
+                  continue
+                  ;;
+              esac
+              # 值里带 user:pass@ 的（remote 的 url / pushurl、submodule.*.url…）：origin 的 url
+              # 换回干净的地址，别的只去掉那一段。多值的键先整条删，再一个个加回去。
+              values="$(git config "--$scope" --get-all "$key" || true)"
+              case "$values" in *://*@*) ;; *) continue ;; esac
+              git -c core.hooksPath=/dev/null config "--$scope" --unset-all "$key" || continue
+              while IFS= read -r value; do
+                case "$key $value" in
+                  'remote.origin.url '*://*@*) value="https://github.com/$GITHUB_REPOSITORY.git" ;;
+                  *) value="$(printf '%s\n' "$value" | strip_userinfo)" ;;
+                esac
+                git -c core.hooksPath=/dev/null config "--$scope" --add "$key" "$value" || true
+              done <<<"$values"
+              echo "removed the credential from $key ($scope)"
+            done <<<"$(printf '%s\n' "$keys" | sort -u)"
+          done
+
+          # 再验：本仓库和 worktree 两级的配置（连同 include 进来的文件）里，不许还有 extraheader、
+          # credential.*、带 user:pass@ 的地址（键名或值都算），remote 的地址里也不许有 @。
+          if ! cfg="$(git config --list --show-scope --includes)"; then
+            echo '::error::could not read the git config; refusing to start the verify command'
+            exit 1
+          fi
+          left="$(printf '%s\n' "$cfg" |
+            awk -F'\t' '$1 == "local" || $1 == "worktree" { sub(/^[^\t]*\t/, ""); print }' |
+            grep -Ei '^(http\.([^=]*\.)?extraheader=|credential\.|remote\.[^=]*\.(url|pushurl)=.*@)|://[^/@]*@' |
+            cut -d= -f1 | mask | sort -u | tr '\n' ' ' || true)"
+          if [ -n "$left" ]; then
+            echo "::error::.git/config still holds a credential after the fixer (${left% }); refusing to start the verify command"
+            exit 1
+          fi
+
+          # 前面各步的 runner 文件命令文件清空，再验（理由见这一步上面的注释）。按「目录里除了
+          # 这一步自己那组和 step_summary_* 之外的每一个文件」清，不按前缀清单：runner 哪天多一种
+          # 文件命令也漏不过去。认不出目录或这一步自己那组，就分不清哪些能清 —— 红，不猜。
+          own_output="${GITHUB_OUTPUT:-}"
+          cmd_dir="${own_output%/*}"
+          own="${own_output##*_}"
+          case "$cmd_dir" in
+            */_runner_file_commands) ;;
+            *)
+              echo "::error::GITHUB_OUTPUT is not in the runner's _runner_file_commands directory; refusing to start the verify command"
+              exit 1
+              ;;
+          esac
+          case "$own" in
+            '' | *[!0-9A-Fa-f-]*)
+              echo "::error::cannot tell this step's own runner files apart (${own_output##*/}); refusing to start the verify command"
+              exit 1
+              ;;
+          esac
+          earlier_runner_files() {
+            local f
+            for f in "$cmd_dir"/* "$cmd_dir"/.[!.]*; do
+              [ -f "$f" ] || continue
+              case "${f##*/}" in step_summary_* | *"$own") continue ;; esac
+              printf '%s\n' "$f"
+            done
+          }
+          earlier_runner_files | while IFS= read -r f; do
+            { : >"$f"; } 2>/dev/null || true
+          done
+          left="$(earlier_runner_files | while IFS= read -r f; do
+            [ ! -s "$f" ] || printf '%s ' "${f##*/}"
+          done)"
+          if [ -n "$left" ]; then
+            echo "::error::an earlier step's runner file still has content (${left% }); refusing to start the verify command"
+            exit 1
+          fi
 
       # Claude 那一步只改文件；验证、commit、push 挪到下面三步，形状和判定跟
       # Codex 那条路一模一样。为什么必须挪：验证跑的是被审 PR 自己带的命令，它跟
@@ -2273,8 +2422,18 @@ jobs:
           if [ -n "${STRUCTURED:-}" ]; then
             summary="$(jq -r 'if (.summary | type) == "string" then .summary else "" end
               | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
-              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")' \
+              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
+              | gsub("sk-ant-[A-Za-z0-9_-]+"; "[已隐藏]")
+              | gsub("github_pat_[A-Za-z0-9_]+"; "[已隐藏]")
+              | gsub("gh[pousr]_[A-Za-z0-9_]{16,}"; "[已隐藏]")
+              | gsub("eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")' \
               <<<"$STRUCTURED" 2>/dev/null || true)"
+          fi
+          # 令牌也剥掉：修复员跑的时候 .git/config 里躺着 job 的令牌（action 写进 origin 的地址）。
+          # 修复员没有 Bash、读文件的工具也碰不到 .git，这里是兜底：上面按几种令牌 / JWT 的样子剥，
+          # 这里再把这一步自己手上那份按原样比对剥掉（只比对，不打印）。编码过的剥不掉，所以前两道才是主防线。
+          if [ -n "${GH_TOKEN:-}" ]; then
+            summary="${summary//"$GH_TOKEN"/[已隐藏]}"
           fi
           if [ -z "${summary//[[:space:]]/}" ]; then
             echo '::warning::Claude returned no summary; skipping the PR comment'
@@ -2359,10 +2518,6 @@ jobs:
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
           PR_GUARD: ${{ steps.helpers.outputs.script }}
-          # 调用方那份工作流文件的路径，和它该跟哪个分支上的版本一致 —— 认出
-          # claude-code-action 把自己整步跳过的那种结局（见下面 stale_caller_workflow）。
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
@@ -2417,32 +2572,6 @@ jobs:
 
           H="$HEAD_SHA"
           live_head() { gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha; }
-
-          # claude-code-action 还有一种结局是「整步跳过」：PR 分支上的调用桩跟默认分支
-          # 上的那份不一样时它一个字都不改，只在日志里留一句 Workflow validation failed。
-          # 跳过的长相跟「跑过、但什么都没落地」一模一样（没有结构化结果、没有执行记录），
-          # 于是两种都只换来一条笼统的「自动修复没跑成」，主人看不出该去点 Update branch。
-          # 判据故意不去读那句日志：同一份日志里原样带着 Codex 的 review 正文（外部输入），
-          # 照抄那句报错就能骗出一条错的告警（同 classify-claude-failure.sh 开头那条规矩）。
-          # 改成直接比它比的那两份文件 —— 这是伪造不了的，而且用不着 actions 读日志的权限。
-          no_claude_record() {
-            [ -z "${STRUCTURED:-}" ] || return 1
-            [ -z "${EXEC_FILE:-}" ] || [ ! -f "$EXEC_FILE" ]
-          }
-          # github.workflow_ref 在被调用的工作流里指的是调用方那份文件，形如
-          # owner/repo/.github/workflows/x.yml@refs/pull/10/merge。
-          stale_caller_workflow() {
-            local path remote
-            path="${WORKFLOW_REF:-}"
-            path="${path%@*}"
-            path="${path#*/*/}"
-            [ -n "${DEFAULT_BRANCH:-}" ] || return 1
-            case "$path" in .github/workflows/*) ;; *) return 1 ;; esac
-            [ -f "$path" ] || return 1
-            remote="$(gh api -H 'Accept: application/vnd.github.raw' \
-              "repos/$REPO/contents/$path?ref=$DEFAULT_BRANCH" 2>/dev/null)" || return 1
-            [ "$remote" != "$(<"$path")" ]
-          }
 
           pushed=""
           if [ "$FIX_OUTCOME" = success ] && [ -n "$STRUCTURED" ]; then
@@ -2524,12 +2653,6 @@ jobs:
           # 空串跟 fix-failed 是同一件事，在这里一次补齐，别让后面每个判据各自兜一遍。
           [ -n "$reason" ] || { reason=fix-failed; until=-; }
 
-          # 没留下任何「Claude 跑过」的痕迹时，先问一句是不是上面那种整步跳过。
-          if [ "$reason" = fix-failed ] && no_claude_record && stale_caller_workflow; then
-            reason=stale-workflow
-            echo 'the fixer step was skipped by the action: the caller workflow file differs from the default branch'
-          fi
-
           # review_fixer 允许换人时，结论不在这里下：Decide the takeover 才是这条链
           # 的裁决点，它用 classify-claude-failure.sh 分清 provider 侧失败还是业务
           # 失败，该换 Codex 就换、该红就红。这里先把 SDK 认定的原因交出去，也先
@@ -2551,9 +2674,6 @@ jobs:
               ;;
             auth)
               alert_once "$H" auth - "Claude 令牌失效，自动修复停了；请重新生成 CLAUDE_CODE_OAUTH_TOKEN 并更新仓库 secret。"
-              ;;
-            stale-workflow)
-              alert_once "$H" stale-workflow - "PR 分支落后于默认分支上的流水线文件，自动修复那一步被整个跳过了；在 PR 页点 Update branch，之后巡检会自动再审一次。"
               ;;
             *)
               alert_once "$H" fix-failed - "Claude 自动修复没跑成；请看 Actions 日志，巡检稍后会再修一次。"
@@ -2669,14 +2789,6 @@ jobs:
             # 推了、或看完觉得都不用改 —— 两种结局都由 Check the fix outcome 处理完了。
             fixer=claude
             why='Claude finished this round'
-          elif [ "${OUTCOME_REASON:-}" = stale-workflow ]; then
-            # action 把自己整步跳过了（PR 分支上的调用桩落后于默认分支）。换谁上都一样
-            # 跳过，所以不走分类器、不换人：说清要点 Update branch，然后红着停下。
-            fixer=claude
-            why='claude-code-action skipped itself: the caller workflow file on the PR branch differs from the default branch'
-            fatal="$why"
-            alert_reason=stale-workflow
-            alert='PR 分支落后于默认分支上的流水线文件，自动修复那一步被整个跳过了；在 PR 页点 Update branch，之后巡检会自动再审一次。'
           else
             # 只把「这次运行的终态字段」喂给分类器，绝不喂整份对话记录：记录里
             # 原样带着 Codex 的 review 正文（外部输入），照抄一句额度报错就能骗
@@ -3267,9 +3379,10 @@ jobs:
 
           # 链路断点告警：静默失败过一次就没人知道流水线停了（同 adb 看门狗的
           # 教训），每个终态失败路径都推一条 Pushover；每次 run 至多一条，不重复。
+          # -q 打头不读 $HOME 下的 curl 配置，理由同 Define pr-guard helpers 的 pushover。
           push_alert() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-              curl -sf -X POST https://api.pushover.net/1/messages.json \
+              curl -q -sf -X POST https://api.pushover.net/1/messages.json \
                 --form-string "token=$PUSHOVER_TOKEN" \
                 --form-string "user=$PUSHOVER_USER" \
                 --form-string "title=$1" \
@@ -3792,6 +3905,7 @@ jobs:
           # 只读的 GITHUB_TOKEN：action 不再换 App token，Claude 也发不了任何东西。
           github_token: ${{ github.token }}
           show_full_output: false
+          # 禁读清单跟代审一字不差（.git 两条：action 把令牌写进 origin 的地址，读到就可能抄进结论发出去）。
           settings: |
             {
               "disableAllHooks": true,
@@ -3801,17 +3915,25 @@ jobs:
                   "Read(//sys/**)",
                   "Read(//etc/**)",
                   "Read(//home/runner/work/_temp/**)",
-                  "Read(~/.claude/**)"
+                  "Read(~/.claude/**)",
+                  "Read(//**/.git)",
+                  "Read(//**/.git/**)"
                 ]
               }
             }
+          # 工具按白名单给（--tools），会跑命令的一样都没有：只禁 Bash 时 Monitor 工具照样能跑 Claude Code
+          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21
+          # 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。
+          # 会跑命令、会派子代理的工具在 --disallowedTools 里再一个个点名禁掉（点名的那几样同修复员）：
+          # 2.1.289 的 --tools 管不住开跑后才注册的内置工具，旧工具名也摸得到白名单外的工具（2.1.295 才修）。
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
             --max-turns 30
             --add-dir pr
+            --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --disallowedTools "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"
+            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","findings","summary_zh"],"properties":{"verdict":{"type":"string","enum":["merge","stop"]},"summary_zh":{"type":"string","maxLength":400},"findings":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"object","additionalProperties":false,"required":["id","severity","later","title","reason"],"properties":{"id":{"type":"string","pattern":"^F[0-9]+$"},"severity":{"type":"string","enum":["P0","P1","P2"]},"later":{"type":"boolean"},"title":{"type":"string","maxLength":120},"reason":{"type":"string","maxLength":400}}}}}}'
           prompt: |
             你在给 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }} 做收尾判断。

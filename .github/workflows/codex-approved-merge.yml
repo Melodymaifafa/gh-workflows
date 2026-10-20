@@ -984,6 +984,8 @@ jobs:
           # 只读的 GITHUB_TOKEN：action 不再换 App token，Claude 也发不了任何东西。
           github_token: ${{ github.token }}
           show_full_output: false
+          # 禁读清单跟修复员一字不差（修复员能改文件，另多几条禁写；tests/claude-verify-creds.bats 盯着），
+          # 含 .git 两条：action 把令牌写进 origin 的地址，这里那份虽然只读，也不让它读到、抄进意见里发出去。
           settings: |
             {
               "disableAllHooks": true,
@@ -993,17 +995,25 @@ jobs:
                   "Read(//sys/**)",
                   "Read(//etc/**)",
                   "Read(//home/runner/work/_temp/**)",
-                  "Read(~/.claude/**)"
+                  "Read(~/.claude/**)",
+                  "Read(//**/.git)",
+                  "Read(//**/.git/**)"
                 ]
               }
             }
+          # 工具按白名单给（--tools），会跑命令的一样都没有：只禁 Bash 时 Monitor 工具照样能跑 Claude Code
+          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21
+          # 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。
+          # 会跑命令、会派子代理的工具在 --disallowedTools 里再一个个点名禁掉（点名的那几样同修复员）：
+          # 2.1.289 的 --tools 管不住开跑后才注册的内置工具，旧工具名也摸得到白名单外的工具（2.1.295 才修）。
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
             --max-turns 30
             --add-dir pr
+            --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --disallowedTools "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"
+            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","findings","summary_zh"],"properties":{"verdict":{"type":"string","enum":["clean","findings"]},"summary_zh":{"type":"string","maxLength":400},"findings":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["path","line","severity","title","detail"],"properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":0},"severity":{"type":"string","enum":["P0","P1","P2"]},"title":{"type":"string","maxLength":120},"detail":{"type":"string","maxLength":800}}}}}}'
           prompt: |
             你在代替 Codex 审 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number || github.event.issue.number }}，只审 head 提交 ${{ needs.watch-and-merge.outputs.head }}。
@@ -1513,6 +1523,7 @@ jobs:
           # 合并检查是被 Codex 的「没问题」评论叫醒时，触发者是 Codex bot。
           allowed_bots: "chatgpt-codex-connector[bot],chatgpt-codex-connector"
           show_full_output: false
+          # 禁读清单跟代审一字不差，只多一条不许改 pr/.git（.git 两条：action 把令牌写进 origin 的地址）。
           settings: |
             {
               "disableAllHooks": true,
@@ -1523,18 +1534,26 @@ jobs:
                   "Read(//etc/**)",
                   "Read(//home/runner/work/_temp/**)",
                   "Read(~/.claude/**)",
+                  "Read(//**/.git)",
+                  "Read(//**/.git/**)",
                   "Edit(pr/.git/**)"
                 ]
               }
             }
           # 只许改 pr/ 下已有的文件：没有 Bash（不跑任何命令），没有 Write（不新建文件）。
+          # 工具按白名单给（--tools），会跑命令的一样都没有：只禁 Bash 时 Monitor 工具照样能跑 Claude Code
+          # 自带免批的只读命令（git remote -v 能把 action 写进 origin 地址的令牌打出来，2026-10-21
+          # 用 Claude Code 2.1.300 实测，不是钉住的 action 自带的 2.1.289）。
+          # 会跑命令、会派子代理的工具在 --disallowedTools 里再一个个点名禁掉（点名的那几样同修复员）：
+          # 2.1.289 的 --tools 管不住开跑后才注册的内置工具，旧工具名也摸得到白名单外的工具（2.1.295 才修）。
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
             --max-turns 60
             --add-dir pr
+            --tools "Read,Glob,Grep,Edit"
             --allowedTools "Read,Glob,Grep,Edit(pr/**)"
-            --disallowedTools "Bash,Write,NotebookEdit,WebFetch,WebSearch,Task"
+            --disallowedTools "Bash,Monitor,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","files","summary_zh"],"properties":{"verdict":{"type":"string","enum":["resolved","give_up"]},"summary_zh":{"type":"string","maxLength":400},"files":{"type":"array","maxItems":15,"items":{"type":"object","additionalProperties":false,"required":["path","how"],"properties":{"path":{"type":"string"},"how":{"type":"string","maxLength":200}}}}}}'
           prompt: |
             ${{ github.repository }} 的 PR #${{ github.event.pull_request.number || github.event.issue.number }} 跟 ${{ inputs.base_branch }} 有冲突。
