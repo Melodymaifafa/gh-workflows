@@ -101,6 +101,10 @@ claude_prompt() {
   step="$(claude_step_block)"
   args="$(with_block claude_args <<<"$step")"
   assert_contains $'\n'"$args"$'\n' $'\n--setting-sources user\n'
+  # 只许一行：action 解析 claude_args 时同名的取最后一个，再写一行就把上面那行盖掉。
+  assert_equal "$(grep -c '^--setting-sources' <<<"$args")" 1
+  # MCP 服务器只认 action 用 --mcp-config 递进来的那几个，工作目录里的 .mcp.json 不加载。
+  assert_equal "$(grep -cxF -- '--strict-mcp-config' <<<"$args")" 1
 
   settings="$(with_block settings <<<"$step")"
   assert_equal "$(jq -r .disableAllHooks <<<"$settings")" true

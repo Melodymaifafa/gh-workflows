@@ -1995,6 +1995,8 @@ jobs:
       # （src/github/operations/restore-config.ts），但那一层只在 PR 事件上跑、随 action
       # 版本变，这里不靠它：只留 user。settings 输入写进的是 ~/.claude/settings.json
       # （user 级，setup-claude-code-settings.ts:10），关钩子和禁读清单不会跟着丢。
+      # MCP 同理：--strict-mcp-config 只加载 action 用 --mcp-config 递进来的服务器，
+      # 工作目录里的 .mcp.json 一律不加载。
       # settings 照抄代审（codex-approved-merge.yml 的 Claude review）。
       # 版本跟代审、round-cap-judge 钉同一个提交（tests/round-cap-judge.bats 盯着几处一致）。
       - uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
@@ -2039,6 +2041,7 @@ jobs:
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
             --setting-sources user
+            --strict-mcp-config
             --max-turns 80
             --allowedTools "Edit,MultiEdit,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git status),Bash(git diff:*),Bash(git log:*)"
             --json-schema '{"type":"object","properties":{"pushed":{"type":"boolean"},"fixed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["pushed","fixed","skipped"],"additionalProperties":false}'
