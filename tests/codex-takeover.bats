@@ -1947,18 +1947,28 @@ outcome() { # outcome <FALLBACK_ALLOWED> <exec fixture>
 
 # 保险丝（Codex 2026-10-21 的 I2）：钉住的 CLI 要是哪天把工作区里的合法改动也拒了，修复员
 # 就一个文件没改，这一轮本会被读成「看完觉得都不用改」静悄悄放过。执行记录里有「工作区内、
-# 不在 .git 下」的 Edit/Write 被拒 → 这不是「不用改」，红着停下让结局告警响。
-outcome_denials() { # outcome_denials <permission_denials JSON 数组>
+# 不在 .git 下」的 Edit/Write 被拒 → 这不是「不用改」，红着停下、发告警。执行记录本身读不出来
+# （没有、读不动、不是 action v1.0.241 写的那个格式）也一样：那正是「action 升级改了格式」时
+# 这道保险丝静默失效的样子（fix round 2）。只有修复员那一步报成功才读，失败 / 撞额度那几条路不碰它。
+outcome_exec() { # outcome_exec <执行记录的路径（可以不存在）> [FIX_OUTCOME]
   git init -q .
   git -c user.email=t@e -c user.name=t commit -q --allow-empty -m base
-  export GITHUB_WORKSPACE="$PWD"
-  export HEAD_SHA="$H" ROUND=3 FIX_OUTCOME=success FALLBACK_ALLOWED='' REVIEWER=Codex HAS_PAT=''
+  export GITHUB_WORKSPACE="${GITHUB_WORKSPACE_OVERRIDE:-$PWD}"
+  export HEAD_SHA="$H" ROUND=3 FIX_OUTCOME="${2:-success}" FALLBACK_ALLOWED="${FALLBACK_ALLOWED_OVERRIDE:-}" REVIEWER=Codex HAS_PAT=''
   export STRUCTURED='{"pushed":false,"fixed":0,"skipped":1}'
-  export EXEC_FILE="$BATS_TEST_TMPDIR/exec.json"
-  jq -n --argjson d "$1" '[{type:"result",subtype:"success",is_error:false,permission_denials:$d}]' >"$EXEC_FILE"
+  export EXEC_FILE="$1"
   fake_route repos/o/r/pulls/7 "{\"head\":{\"sha\":\"$H\"}}"
   trust_fake_bin
   run run_block "$WF" "Check the fix outcome"
+}
+
+# 跟 action 写的一样：一个 SDK 消息数组，最后一条 type=result 带 permission_denials（v1.0.241 的
+# base-action/src/run-claude-sdk.ts 把每条消息 push 进数组、见到 result 就 break，再整个
+# JSON.stringify 写进 $RUNNER_TEMP/claude-execution-output.json）。
+outcome_denials() { # outcome_denials <permission_denials JSON 数组>
+  jq -n --argjson d "$1" '[{type:"system",subtype:"init"},{type:"result",subtype:"success",is_error:false,permission_denials:$d}]' \
+    >"$BATS_TEST_TMPDIR/exec.json"
+  outcome_exec "$BATS_TEST_TMPDIR/exec.json"
 }
 
 @test "outcome: an in-workspace write the pinned CLI denied reds the round, not nothing-to-change" {
@@ -1966,6 +1976,18 @@ outcome_denials() { # outcome_denials <permission_denials JSON 数组>
   assert_equal "$status" 1
   assert_contains "$output" 'denied a write inside the workspace'
   assert_contains "$output" 'src/app.py'
+  # 主人收得到：告警照发，不是只有 Actions 里一条红
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-failed'
+}
+
+# CLI 报的是真实路径（pwd -P），工作区却可能是经快捷方式到的那个路径：两种前缀都认（fix round 2）。
+@test "outcome: a denied write reported under the workspace's real path still counts" {
+  ln -s "$BATS_TEST_TMPDIR/work" "$BATS_TEST_TMPDIR/ws-link"
+  export GITHUB_WORKSPACE_OVERRIDE="$BATS_TEST_TMPDIR/ws-link"
+  real="$(cd "$BATS_TEST_TMPDIR/work" && pwd -P)"
+  outcome_denials '[{"tool_name":"Write","tool_input":{"file_path":"'"$real"'/src/new.py"}}]'
+  assert_equal "$status" 1
+  assert_contains "$output" 'denied a write inside the workspace (src/new.py'
 }
 
 @test "outcome: a denied write to HOME, /tmp, outside or .git is not an in-workspace regression" {
@@ -1973,9 +1995,49 @@ outcome_denials() { # outcome_denials <permission_denials JSON 数组>
     {"tool_name":"Write","tool_input":{"file_path":"/home/other/.jq"}},
     {"tool_name":"Write","tool_input":{"file_path":"/tmp/x"}},
     {"tool_name":"Write","tool_input":{"file_path":"../outside"}},
+    {"tool_name":"Write","tool_input":{"file_path":"'"$BATS_TEST_TMPDIR/work"'/a/../../outside"}},
     {"tool_name":"Edit","tool_input":{"file_path":"'"$BATS_TEST_TMPDIR/work"'/.git/config"}}]'
   # 这些本来就该拒，不算 CLI 坏了 —— 走「看完觉得不用改」的正常分支，不红
+  assert_equal "$status" 0
   refute_contains "$output" 'denied a write inside the workspace'
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=no-fix'
+}
+
+# 执行记录里没有拒绝：行为跟没有这道保险丝时一模一样（这里是「看完觉得不用改」那条路）。
+@test "outcome: an execution record with no denials leaves the round exactly as before" {
+  outcome_denials '[]'
+  assert_equal "$status" 0
+  refute_contains "$output" 'execution record'
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=no-fix'
+}
+
+@test "outcome: a fixer that succeeded but left no readable execution record reds the round" {
+  outcome_exec "$BATS_TEST_TMPDIR/missing.json"
+  assert_equal "$status" 1
+  assert_contains "$output" 'execution record'
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-failed'
+}
+
+@test "outcome: an execution record that is not the format the action writes reds the round" {
+  for body in 'not json {' '{"type":"result","permission_denials":[]}' '[{"type":"assistant"}]' \
+              '[{"type":"result","permission_denials":"none"}]'; do
+    printf '%s\n' "$body" >"$BATS_TEST_TMPDIR/exec.json"
+    : >"$FAKE_LOG"
+    outcome_exec "$BATS_TEST_TMPDIR/exec.json"
+    assert_equal "$status" 1 || { echo "not red for: $body" >&2; return 1; }
+    assert_contains "$output" 'execution record'
+  done
+}
+
+# 失败的那几条路一律不读它：撞额度要交给 Codex 接手（Decide the takeover），记录没了也不能挡着。
+@test "outcome: a fixer that failed is never judged on a missing execution record" {
+  export FALLBACK_ALLOWED_OVERRIDE=true
+  outcome_exec "$BATS_TEST_TMPDIR/missing.json" failure
+  # 照旧把结论让给 Decide the takeover，不因为记录没了而红
+  assert_equal "$status" 0
+  refute_contains "$output" 'execution record'
+  assert_equal "$(step_output failed)" true
+  assert_equal "$(step_output reason)" fix-failed
 }
 
 decide() { # decide <FIRST> <FALLBACK_ALLOWED> <OUTCOME_REASON> [result text] [api_error_status]

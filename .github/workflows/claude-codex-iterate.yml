@@ -2656,26 +2656,45 @@ jobs:
 
           # 保险丝（Codex 2026-10-21 的 I2）：万一钉住的 CLI 哪天把「工作区里的合法改动」也
           # 拒了（--allowedTools "Edit(./**)" 解析变了之类），修复员就一个文件都没改，这一轮
-          # 会被读成「看完觉得都不用改」静悄悄放过。所以先看执行记录里的 permission_denials：
-          # 有 Edit/Write/MultiEdit 被拒、被拒的路径又在工作区里（且不在 .git 下），那不是
-          # 「不用改」，是白名单把自己卡死了 —— 红着停下，让下面的结局告警响。日志里只留
-          # 工作区内的相对路径（基线做法同下面 offenders），不打印 $HOME / /tmp 那些本就该拒的。
-          if [ -n "${EXEC_FILE:-}" ] && [ -r "$EXEC_FILE" ]; then
+          # 会被读成「看完觉得都不用改」静悄悄放过。所以修复员那一步报成功时，先看执行记录里
+          # 最后一条 result 的 permission_denials：有 Edit/Write/MultiEdit 被拒、路径又在工作区里
+          # （且不在 .git 下），那不是「不用改」，是白名单把自己卡死了 —— 发告警、红着停下。
+          # 记录本身读不出来也一样红（fix round 2）：没有、读不动、或不是 action v1.0.241 写的那个
+          # 格式（一个 SDK 消息数组，最后一条 type=result；base-action/src/run-claude-sdk.ts 收集、
+          # execution-file.ts 写进 $RUNNER_TEMP/claude-execution-output.json），那正是 action 升级改了
+          # 格式时这道保险丝静默失效的样子。只在成功那条路上读：撞额度 / 没跑成要交给 Decide the
+          # takeover，记录缺了也不能挡着换人。
+          # 工作区两种写法都认（$GITHUB_WORKSPACE 和它的 pwd -P）：CLI 报的是真实路径。带 .. 的路径
+          # 一律不算工作区内（a/../../x 其实在外面）。日志里只留工作区内的相对路径。
+          if [ "${FIX_OUTCOME:-}" = success ] && [ -n "${EXEC_FILE:-}" ]; then
             ws="${GITHUB_WORKSPACE:-$PWD}"
-            denied_in_ws="$(jq -r --arg ws "$ws" '
-              (if type == "array" then . else [] end)
-              | [.[] | select(.type == "result")] | last
-              | (.permission_denials // [])
-              | map(select(.tool_name == "Edit" or .tool_name == "Write" or .tool_name == "MultiEdit"))
-              | map(.tool_input.file_path // empty)
-              | map(select(
-                  (startswith("/") and startswith($ws + "/"))
-                  or ((startswith("/") | not) and (startswith("../") | not) and (. != ".."))))
-              | map(select((test("(^|/)\\.git(/|$)")) | not))
-              | map(if startswith("/") then .[($ws | length) + 1:] else . end)
-              | .[]' "$EXEC_FILE" 2>/dev/null || true)"
-            if [ -n "$denied_in_ws" ]; then
-              echo "::error::the fixer was denied a write inside the workspace ($(printf '%s' "$denied_in_ws" | tr '\n' ' ')); the pinned CLI may be refusing in-workspace edits. Failing this round instead of reading it as nothing-to-change"
+            ws_real="$(cd "$ws" 2>/dev/null && pwd -P)" || ws_real="$ws"
+            record_ok=1
+            denied_in_ws=''
+            if [ ! -r "$EXEC_FILE" ] || ! denied_in_ws="$(jq -r --arg ws "$ws" --arg wr "$ws_real" '
+                def rel($p): if startswith($p + "/") then .[($p | length) + 1:] else null end;
+                if type != "array" then error("not an array") else . end
+                | ([.[] | select(type == "object" and .type == "result")] | last)
+                | if . == null then error("no result entry") else . end
+                | (.permission_denials // [])
+                | if type != "array" then error("permission_denials is not an array") else . end
+                | .[] | select(type == "object")
+                | select(.tool_name == "Edit" or .tool_name == "Write" or .tool_name == "MultiEdit")
+                | (.tool_input.file_path? // empty) | strings
+                | select(test("(^|/)\\.\\.(/|$)") | not)
+                | if startswith("/") then (rel($ws) // rel($wr) // empty) else . end
+                | select(test("(^|/)\\.git(/|$)") | not)' "$EXEC_FILE" 2>/dev/null)"
+            then
+              record_ok=''
+            fi
+            if [ -z "$record_ok" ] || [ -n "$denied_in_ws" ]; then
+              if [ -z "$record_ok" ]; then
+                why='its execution record is missing, unreadable or not in the format claude-code-action v1.0.241 writes'
+              else
+                why="it was denied a write inside the workspace ($(printf '%s' "$denied_in_ws" | tr '\n' ' '))"
+              fi
+              echo "::error::the fixer step succeeded but $why; failing this round instead of reading it as nothing-to-change"
+              alert_once "$HEAD_SHA" fix-failed - "Claude 修复员这一轮报成功，但改工作区里的文件被拒了（或它的执行记录读不出来），所以什么都没改成 —— 不是「看完觉得不用改」。请看 Actions 日志。" || true
               exit 1
             fi
           fi
