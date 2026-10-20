@@ -370,6 +370,41 @@ chmod +x .git/hooks/post-index-change'
   assert_equal "$(git show origin/topic:app.txt)" 'v2 fixed by claude'
 }
 
+# action 在 PR 事件上把 PR 自己的 CLAUDE.md 换成 base 版、PR 的原样快照进 .claude-pr/，
+# 跑完不换回来（restore-config.ts）。验证那一步 add -A，于是修一轮就把 PR 对它的改动
+# 悄悄撤销、连快照一起推上去。放回那一步跑过之后，推上去的只有修复员自己的改动。
+@test "unrestore: a fix round pushes the PR's own CLAUDE.md, never the base version the action swapped in" {
+  push_workspace 'true'
+  printf 'pr-version\n' >CLAUDE.md
+  git add CLAUDE.md
+  git commit -q -m 'pr: its own CLAUDE.md'
+  git push -q origin HEAD:topic
+  pr_head="$(git rev-parse HEAD)"
+  # 噪声重跑要退回的是带着这个提交的那一份 .git
+  mv "$BATS_TEST_TMPDIR/git-pristine" "$(mktemp -d "$BATS_TEST_TMPDIR/git-stale-XXXXXX")/git"
+  cp -R .git "$BATS_TEST_TMPDIR/git-pristine"
+
+  # 换 base 版这一下也得在重跑里重做，否则重跑那次压根没东西要放回、空转着绿
+  swap_then_push() {
+    printf 'base-version\n' >CLAUDE.md
+    mkdir -p .claude-pr
+    printf 'pr-version\n' >.claude-pr/CLAUDE.md
+    run_block "$WF" "Put back the PR's own config files" && verify_and_push
+  }
+  tries=0
+  run swap_then_push
+  while [ "$tries" -lt 3 ] && is_machine_noise; do
+    tries=$((tries + 1))
+    /bin/sleep 1
+    reset_workspace
+    run swap_then_push
+  done
+
+  assert_equal "$status" 0
+  assert_equal "$(git show origin/topic:CLAUDE.md)" 'pr-version'
+  assert_equal "$(git diff --name-only "$pr_head" origin/topic)" 'app.txt'
+}
+
 # ---------- 验证命令要能在自己名下装东西（MEL-322） ----------
 
 # 修复那一轮跑在一个专用的无权限账号下，而 `corepack enable` / `npm i -g` 默认都装到

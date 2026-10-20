@@ -2081,6 +2081,37 @@ jobs:
                  - 验证结果不用你写，后面的步骤会补。若本仓库有无法在 runner 上
                    验证的改动，最后一行注明还需要什么人工验证。
 
+      # action 在 PR 类事件上开跑前，把 PR 里的几个配置路径换成 base 分支的版本（PR 的原样
+      # 快照进 .claude-pr/），跑完不换回来；它自己的注释写着「往暂存区加文件的调用方必须
+      # 排掉这些，否则会把这次撤销提交回 PR 作者的分支」。验证那一步 add -A 入暂存区，于是
+      # 改过 CLAUDE.md / .claude/ / .husky / .gitmodules 的 PR 修一轮就被悄悄撤销了。修复员
+      # 撞额度失败时也一样：换进来的 base 版让工作区看着像「Claude 改了一半」，Decide the
+      # takeover 就不许 Codex 接手。所以修复员跑过（成功或失败）就把这几个路径照 HEAD 放回去。
+      # 修复员看到的是 base 版，它在这几个路径里改的东西底子就是错的，一并丢掉。
+      # 这一步必须是验证之前的最后一步：每跑一次 action 都会再换一次，排在它后面的 Claude
+      # 步骤会把 base 版又换回来。以后加的 Claude 步骤（自审、第二遍）一律插在它前面。
+      # 不拿任何凭据：只动工作区和索引。git 关掉钩子：按路径 restore 也会触发 post-checkout。
+      - name: Put back the PR's own config files
+        id: unrestore
+        if: steps.gate.outputs.run == 'true' && steps.select.outputs.first == 'claude' && (steps.fix.outcome == 'success' || steps.fix.outcome == 'failure')
+        run: |
+          set -euo pipefail
+
+          # 清单抄自 anthropics/claude-code-action v1.0.241（修复员钉的版本）
+          # src/github/operations/restore-config.ts 的 SENSITIVE_PATHS；升级 action 时对一遍。
+          paths=(.claude .mcp.json .claude.json .gitmodules .ripgreprc CLAUDE.md CLAUDE.local.md .husky)
+          for p in "${paths[@]}"; do
+            # 先整个删掉再从 HEAD 取：只 restore 删不掉 base 才有、HEAD 没有的文件。
+            rm -rf -- "$p"
+            if git cat-file -e "HEAD:$p" 2>/dev/null; then
+              git -c core.hooksPath=/dev/null restore --source=HEAD --staged --worktree -- "$p"
+              echo "put back $p from HEAD"
+            else
+              git -c core.hooksPath=/dev/null rm -r -q --cached --ignore-unmatch -- "$p"
+            fi
+          done
+          rm -rf .claude-pr
+
       # Claude 那一步只改文件；验证、commit、push 挪到下面三步，形状和判定跟
       # Codex 那条路一模一样。为什么必须挪：验证跑的是被审 PR 自己带的命令，它跟
       # 同一步里的写权限令牌是同一个用户，/proc/<pid>/environ 就把令牌读回去，而
