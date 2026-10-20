@@ -117,21 +117,29 @@ claude_prompt() {
   assert_equal "$(jq -c .permissions.deny <<<"$settings")" "$reviewer_deny"
 }
 
-# action 在 Claude 开跑前就把 job 自己的令牌写进了 origin 的地址（git-config.ts），修复员一读
-# .git/config 就看得见，再被意见带偏写进总结，后面那一步就把它发到 PR 上。所以修复员读不了
-# .git（规则从文件系统根起算，跟工作区在哪个路径无关：GitHub 托管机和 ghwf-local 不一样），
-# 也没有能把 .git/config 打出来的本地 git 命令（git diff --no-index 就能），PR 的 diff 走 gh pr diff。
-@test "fixer: the Claude fixer cannot read .git or run a local git diff or log" {
+# action 在 Claude 开跑前就把 job 自己的令牌写进了 origin 的地址（git-config.ts）。修复员读得到
+# 它，再被意见带偏写进总结，后面那一步就把它发到 PR 上。Claude Code 自带一批免批的只读命令
+# （git remote -v、git config --get …），不看 --allowedTools，放一条 Bash(...) 就等于全放
+# （2026-10-21 实测）。光在 --disallowedTools 里去掉 Bash 还不够：Monitor 工具也跑命令，同一批
+# 免批命令照样能跑（同日实测，git remote -v 又打出了令牌）。所以工具按白名单给（--tools），
+# 只有读文件和改文件的那几样，Bash 和 Monitor 另外再禁一次（白名单哪天没递进去也还有这一道）；
+# 读文件的工具碰不到 .git（规则从文件系统根起算，GitHub 托管机和 ghwf-local 都管用）。
+@test "fixer: the Claude fixer has no Bash tool at all and cannot read .git" {
   step="$(claude_step_block)"
+  args="$(with_block claude_args <<<"$step")"
+  assert_equal "$(sed -nE 's/^--tools "(.*)"$/\1/p' <<<"$args")" 'Read,Glob,Grep,Edit,MultiEdit,Write'
+  assert_equal "$(grep -c '^--tools ' <<<"$args")" 1
+  disallowed="$(sed -nE 's/^--disallowedTools "(.*)"$/\1/p' <<<"$args")"
+  assert_equal "$disallowed" 'Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task'
+  assert_equal "$(grep -c '^--disallowedTools' <<<"$args")" 1
+  tools="$(sed -nE 's/^--allowedTools "(.*)"$/\1/p' <<<"$args")"
+  assert_equal "$tools" 'Edit,MultiEdit,Write'
+  refute_contains "$args" 'Bash('
+
   settings="$(with_block settings <<<"$step")"
   deny="$(jq -c .permissions.deny <<<"$settings")"
   assert_contains "$deny" '"Read(//**/.git)"'
   assert_contains "$deny" '"Read(//**/.git/**)"'
-
-  tools="$(sed -nE 's/^ *--allowedTools "(.*)"$/\1/p' <<<"$step")"
-  [ -n "$tools" ] || { echo 'no --allowedTools found on the Claude step' >&2; return 1; }
-  bash_tools="$(tr ',' '\n' <<<"$tools" | grep '^Bash(' | LC_ALL=C sort | tr '\n' ' ')"
-  assert_equal "$bash_tools" 'Bash(gh pr diff:*) Bash(gh pr view:*) Bash(git status) '
 }
 
 # job 带着 id-token: write 时，每个 run: 步骤的环境里都有 ACTIONS_ID_TOKEN_REQUEST_TOKEN / _URL

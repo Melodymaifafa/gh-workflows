@@ -2039,30 +2039,29 @@ jobs:
                 ]
               }
             }
-          # runner 里 Bash 默认被禁；按需放行，不用宽泛的 git:* / gh pr:*
-          # （review 内容属于外部输入，配合 write 权限的 token 需收窄注入面）
-          # 注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件
-          # 没有 gh api：意见已由 Gate 预取到 .review/findings.md
-          # 清单里一样「会执行仓库里的代码」的东西都没有：没有 runtime 工具链
-          # （inputs.extra_tools 不再展开成任何值）、没有 git add /
-          # commit / push、没有 gh pr comment。这一步必须有写权限令牌（action 自己
-          # 要用），而被审 PR 的代码一旦在这一步跑起来，它跟令牌同一个用户，
-          # /proc/<pid>/environ 就把令牌读回去 —— 令牌换个放法都没用，唯一的条件是
-          # 「跑 PR 自带命令的那一步手上什么凭据都没有」（README「凭据在 step 的
-          # env: 里」那条）。所以验证、commit、push、发评论全部挪到后面的独立步骤
-          # （MEL-254）。不许为了省事把工具链或 Bash(git:*) 放回来。
-          # 也没有 git diff / git log：git diff --no-index 能把 .git/config 原样打出来（上面那条
-          # 禁读管不到 Bash 里的 git）。PR 的 diff 用 gh pr diff，走 API，不碰本地配置。
-          # 还没收住的：Claude Code 自带免批的只读命令不看 --allowedTools，git remote -v、
-          # git config --get remote.origin.url 照样能把地址连令牌一起打出来（2026-10-21 实测）。
-          # 收住它要整个去掉 Bash，或者禁掉 Bash(git *)；总结发出去前那道剥令牌是兜底。
+          # 修复员没有 Bash：工具按白名单给（--tools），只有读文件的 Read / Glob / Grep 和改文件的
+          # Edit / MultiEdit / Write；Bash 和 Monitor 在 --disallowedTools 里再禁一次，白名单哪天没递进去
+          # 也还有这一道。注意 --allowedTools 是全量清单：Edit/Write 不列出来就改不了文件。
+          # 为什么一条 Bash 都不留：
+          # · 这一步必须有写权限令牌（action 自己要用），被审 PR 的代码一旦在这一步跑起来，它跟令牌
+          #   同一个用户，/proc/<pid>/environ 就把令牌读回去。所以 runtime 工具链、git add / commit /
+          #   push、gh pr comment 早就不给了，验证、commit、push、发评论都在后面的独立步骤（MEL-254）。
+          # · action 在 Claude 开跑前把 job 的令牌写进了 origin 的地址。Claude Code 自带一批免批的只读
+          #   命令，不看 --allowedTools：只要还有 Bash，git remote -v、git config --get remote.origin.url
+          #   就能把它连令牌一起打出来（2026-10-21 实测）。Monitor 工具也跑命令，只禁 Bash 时它照样
+          #   跑得了 git remote -v（同日实测）。所以按白名单给工具：会跑命令的一样都不在里面。
+          # 修复员于是不能自己调 gh / git：意见由 Gate 预取到 .review/findings.md，PR 的文件直接用
+          # Read / Glob / Grep 读。.git 读不到（上面 settings 的禁读），总结发出去前还剥一遍令牌。
+          # 不许为了省事把任何 Bash(...) 放回来。
           claude_args: |
             --model ${{ inputs.claude_model }}
             --effort ${{ inputs.claude_effort }}
             --setting-sources user
             --strict-mcp-config
             --max-turns 80
-            --allowedTools "Edit,MultiEdit,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git status)"
+            --tools "Read,Glob,Grep,Edit,MultiEdit,Write"
+            --allowedTools "Edit,MultiEdit,Write"
+            --disallowedTools "Bash,Monitor,NotebookEdit,WebFetch,WebSearch,Task"
             --json-schema '{"type":"object","properties":{"pushed":{"type":"boolean"},"fixed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["pushed","fixed","skipped"],"additionalProperties":false}'
           prompt: |
             ${{ steps.gate.outputs.reviewer }} 刚刚 review 了 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number }}。
@@ -2410,8 +2409,8 @@ jobs:
               <<<"$STRUCTURED" 2>/dev/null || true)"
           fi
           # 令牌也剥掉：修复员跑的时候 .git/config 里躺着 job 的令牌（action 写进 origin 的地址）。
-          # 读 .git 已经禁了，这里是第二道：上面按几种令牌 / JWT 的样子剥，这里再把这一步自己手上
-          # 那份按原样比对剥掉（只比对，不打印）。剥不掉编码过的，所以第一道才是主防线。
+          # 修复员没有 Bash、读文件的工具也碰不到 .git，这里是兜底：上面按几种令牌 / JWT 的样子剥，
+          # 这里再把这一步自己手上那份按原样比对剥掉（只比对，不打印）。编码过的剥不掉，所以前两道才是主防线。
           if [ -n "${GH_TOKEN:-}" ]; then
             summary="${summary//"$GH_TOKEN"/[已隐藏]}"
           fi
