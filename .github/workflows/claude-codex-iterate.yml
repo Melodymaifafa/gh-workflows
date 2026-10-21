@@ -1136,15 +1136,15 @@ jobs:
             # 子孙直接写真文件 —— GITHUB_ENV 一行 BASH_ENV 抢在 PATH 过滤 / 换 HOME 之前跑；PATH/OUTPUT 同理。
             # STATE 没有下游（run: 步骤没有 post），一起清只为了一份写坏的 state 不把这一步弄红。
             # 文件归我们，所以总是我们赢（I2）：回退路径上验证命令能 chmod a-w 其中一个、或换成 symlink / 目录 /
-            # FIFO。这里先补回属主写权限（文件和所在目录），不是普通文件的换成空的普通文件，再截断。从不打断守卫
+            # FIFO，或把所在目录设成 000。这里先补回属主权限（目录 rwx、文件 w），不是普通文件的换成空的普通文件，再截断。从不打断守卫
             # （以前一次截断失败，set -e 就跳过了下面的收组）：哪个还不是空的普通文件就返回非零，由调用处决定。
             scrub_file_commands() {
               local fc bad=0
               for fc in "${GITHUB_ENV:-}" "${GITHUB_OUTPUT:-}" "${GITHUB_PATH:-}" "${GITHUB_STATE:-}"; do
                 [ -n "$fc" ] || continue
-                chmod u+w "${fc%/*}" 2>/dev/null || true
+                chmod u+rwx "${fc%/*}" 2>/dev/null || true
                 if [ -L "$fc" ] || { [ -e "$fc" ] && [ ! -f "$fc" ]; }; then
-                  [ -L "$fc" ] || [ ! -d "$fc" ] || chmod -R u+w "$fc" 2>/dev/null || true
+                  [ -L "$fc" ] || [ ! -d "$fc" ] || chmod -R u+rwx "$fc" 2>/dev/null || true
                   rm -rf "$fc" 2>/dev/null || true
                 fi
                 [ ! -f "$fc" ] || chmod u+w "$fc" 2>/dev/null || true
@@ -1289,24 +1289,33 @@ jobs:
             }
 
             # 正面信号（I2）：Decide / Say why 只认 contained=true。只写在这里和「验证命令起来之前就退出」那一处
-            # （contained_before_launch）：清点已经证明它名下没活进程，而且最后这一次清通道成功了。
+            # （contained_before_launch）：清点已经证明它名下没活进程（verify_settled），而且最后这一次清通道成功了。
+            # 证明之后的出口都走这里：正常退出直接调，中途被打断的由 verify_on_exit 代调。
             # 已知缺口（R42）：同一个 uid 下一个 SIGKILL 都停不了的残留，仍然伪造得了这一行。
             contained_exit() { # contained_exit <退出码> [先写进 GITHUB_OUTPUT 的行]...
               local rc="$1" line
               shift
+              verify_reported=1
               scrub_or_refuse
               for line in "$@"; do echo "$line" >>"$GITHUB_OUTPUT"; done
               echo 'contained=true' >>"$GITHUB_OUTPUT"
               exit "$rc"
             }
 
-            # 验证命令起来之后的任何出口，包括中途哪一笔写失败、被 set -e 打断（I2），都先尽力收组、清点、
-            # 杀残留、再清通道，一声不吭。这里不写 contained=true：中途退出的一律算没证明。
-            # 正常路径自己收过、证明过（verify_settled），这里就什么都不做，不改它的结果，也不重复报。
+            # 验证命令起来之后的任何出口，包括中途哪一笔写失败、被 set -e 打断（I2）：
+            #   · 还没证明（verify_settled 空）：尽力收组、清点、杀残留、再清通道，一声不吭，不交信号；
+            #   · 证明过、却在 contained_exit 之前被打断（summary 写不进、mktemp、add -u 失败……）：树已经
+            #     证明死了，照样走 contained_exit，清通道成功就交 contained=true，这一轮的告警不丢；
+            #   · 已经走过 contained_exit（verify_reported）：什么都不做，不改它的结果，也不重复报。
+            # 退出码一律保持原样。
             verify_on_exit() {
               local rc=$?
               set +e
-              if [ -z "$verify_settled" ]; then
+              if [ -n "$verify_reported" ]; then
+                :
+              elif [ -n "$verify_settled" ]; then
+                contained_exit "$rc"
+              else
                 {
                   reap_verify_group
                   if verify_leftovers="$(unexplained_procs)"; then kill_unexplained; fi
@@ -1319,12 +1328,16 @@ jobs:
             # 它造出来的文件和目录，我们回头也要写得动（验证跑完那次 add -u、下一轮交接
             # 前的 git clean -fdx）。目录 setgid 让组跟着工作区，umask 002 让那个组写得动
             # —— 那句 umask 设在 sudo 起的命令里面（上面写了为什么）。回退路径不改。
+            # 先摘掉「起来之前」那个 trap：起来之后一刻都不许它在一个活进程旁边交 contained=true。
+            # 从 & 到装上 verify_on_exit 之间没有 trap，那里退出就不交信号（fail closed）。
+            verify_settled=''
+            verify_reported=''
             set -m
+            trap - EXIT
             launch_the_verify_command </dev/null &
             verify_pgid=$!
             set +m
             # 从这一刻起被审 PR 的代码在跑：之后从哪儿退出，verify_on_exit 都先把它收掉。
-            verify_settled=''
             trap verify_on_exit EXIT
             verify_status=0
             wait "$verify_pgid" || verify_status=$?
@@ -2987,7 +3000,7 @@ jobs:
         id: decide
         # 正面门（R41 / I2）：Claude 验证没跑，或者它交出了 contained=true（清点证明名下没活进程）才跑。
         # 这一步用 !cancelled()，验证红了它照样跑、手里有 GH_TOKEN 和 Pushover 密钥 —— 残留从
-        # /proc/<pid>/environ 读得到。所以收不掉、杀不掉、守卫中途被打断，都没有那一行，这一步跟着
+        # /proc/<pid>/environ 读得到。所以收不掉、杀不掉、守卫在清点证明之前被打断，都没有那一行，这一步跟着
         # 跳过，job 彻底红，由 Mac 上的巡检重试。只认 claude_verify：Codex 验证排在这一步之后，
         # 那条路的 contained 由排在最后的 Say why 把门。
         if: ${{ !cancelled() && steps.gate.outputs.run == 'true' && steps.select.outcome == 'success' && (steps.claude_verify.outcome == 'skipped' || steps.claude_verify.outputs.contained == 'true') }}

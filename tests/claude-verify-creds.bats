@@ -1409,9 +1409,11 @@ EOS
 }
 
 # I2：守卫在验证命令起来之后从哪儿退出都先收组（EXIT trap），哪怕是中途一笔写失败被 set -e 打断。
-# 这里拿真的那几个函数，起一个真进程组，然后 set -e 之下一条 false：组必须被收掉，而且 trap 一声不吭、
-# 不改退出码。反过来，正常路径证明过之后（verify_settled）trap 什么都不做：不清通道、不改通过的结果。
-@test "split: an abort after the launch still reaps the verify group, and a settled exit is left alone" {
+# 这里拿真的那几个函数，起一个真进程组，然后 set -e 之下一条 false，分三种时点：
+#   · 证明之前：组必须被收掉、通道清空，trap 一声不吭、不交信号、不改退出码；
+#   · 证明之后（verify_settled）、contained_exit 之前：trap 代它清通道、交 contained=true，退出码照旧红；
+#   · 已经走过 contained_exit（verify_reported）：trap 什么都不做，不改通过的结果，也不重复写。
+@test "split: an abort after the launch still reaps the verify group; after the proof it still reports" {
   cat >"$BATS_TEST_TMPDIR/idle.sh" <<'EOS'
 #!/bin/sh
 i=0
@@ -1419,7 +1421,9 @@ while [ "$i" -lt 600 ]; do /bin/sleep 0.1; i=$((i + 1)); done
 EOS
   cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
 verify_user=''
-verify_settled="${STUB_SETTLED:-}"
+verify_settled=''
+verify_reported=''
+[ "$STUB_MODE" = unproven ] || verify_settled=1
 verify_procs_baseline=''
 verify_leftovers=''
 verify_sweep_unanswerable=''
@@ -1432,13 +1436,13 @@ echo "$verify_pgid" >"$BATS_TEST_TMPDIR/leftover.pid"
 trap verify_on_exit EXIT
 echo 'changed=true' >>"$GITHUB_OUTPUT"
 set -e
-[ -n "$verify_settled" ] || false
-exit 0
+[ "$STUB_MODE" != reported ] || contained_exit 0 changed=true
+false
 EOS
-  local fns='scrub_file_commands verify_survivors verify_kill reap_verify_group unexplained_procs kill_unexplained verify_on_exit'
+  local fns='scrub_file_commands verify_survivors verify_kill reap_verify_group unexplained_procs kill_unexplained scrub_or_refuse contained_exit verify_on_exit'
 
   # shellcheck disable=SC2086  # 就是要按空格拆成多个函数名
-  run run_helper "$BATS_TEST_TMPDIR/stub.sh" $fns
+  STUB_MODE=unproven run run_helper "$BATS_TEST_TMPDIR/stub.sh" $fns
   assert_equal "$status" 1
   assert_equal "$output" ''
   pid="$(cat "$BATS_TEST_TMPDIR/leftover.pid")"
@@ -1449,11 +1453,18 @@ EOS
 
   : >"$GITHUB_OUTPUT"
   # shellcheck disable=SC2086
-  STUB_SETTLED=1 run run_helper "$BATS_TEST_TMPDIR/stub.sh" $fns
+  STUB_MODE=settled run run_helper "$BATS_TEST_TMPDIR/stub.sh" $fns
+  reap_planted_pid
+  assert_equal "$status" 1
+  assert_equal "$output" ''
+  assert_equal "$(cat "$GITHUB_OUTPUT")" 'contained=true'
+
+  : >"$GITHUB_OUTPUT"
+  # shellcheck disable=SC2086
+  STUB_MODE=reported run run_helper "$BATS_TEST_TMPDIR/stub.sh" $fns
+  reap_planted_pid
   assert_equal "$status" 0
-  assert_equal "$(step_output changed)" true
-  pid="$(cat "$BATS_TEST_TMPDIR/leftover.pid")"
-  kill -0 "$pid" 2>/dev/null || { echo 'a settled exit reaped the group anyway' >&2; return 1; }
+  assert_equal "$(cat "$GITHUB_OUTPUT")" "$(printf 'changed=true\ncontained=true')"
 }
 
 # 验证正文拆成了两步定义（专用账号那一组函数单独一步，块大小，R43）。缺了那一组，
