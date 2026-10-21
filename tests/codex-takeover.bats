@@ -834,8 +834,6 @@ git config --local --get http.https://github.com/.extraheader >>"$probe" ||
 # 假 gh 的目录，后面「召唤复审」那步就会跑那个假 gh —— 而那步带的是
 # CODEX_TRIGGER_TOKEN。验证子进程拿到的必须是废纸篓文件。
 @test "takeover: the PR's own verify command cannot poison the next steps' PATH or env" {
-  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
-  : >"$GITHUB_PATH"
   push_workspace 'printf "%s\n" "$PWD/evil-bin" >>"$GITHUB_PATH"
 printf "SNEAK=yes\n" >>"$GITHUB_ENV"'
 
@@ -851,8 +849,6 @@ printf "SNEAK=yes\n" >>"$GITHUB_ENV"'
 # （效果等同捞回来，但不依赖 /proc 在不在），要守的是：验证跑完那两个文件被清空，
 # runner 在 step 收尾时读到的是空的。
 @test "takeover: a verify command that recovers the real runner file paths still cannot poison them" {
-  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
-  : >"$GITHUB_PATH"
   export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV"
   push_workspace 'printf "%s\n" "$PWD/evil-bin" >>"$REAL_PATH_FILE"
 printf "SNEAK=yes\n" >>"$REAL_ENV_FILE"'
@@ -1565,8 +1561,6 @@ EOS
 # 守的是：清点证明没活进程之后再清一次文件命令通道，所以 BASH_ENV 到不了后面的步骤。
 # 两条子进程各打一个时点：收到 TERM 才补写的（活到被收那一刻），和 leader 退出后晚一瞬的短命的。
 @test "takeover: a TERM-trapping child's BASH_ENV written after the truncation never survives" {
-  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
-  : >"$GITHUB_PATH"
   export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV" PLANT_PIDFILE="$BATS_TEST_TMPDIR/leftover.pid"
   # 子进程不拿 bats 的输出管道、号码记进 leftover.pid：守卫哪天没收掉它，这条是红而不是把整套
   # 卡到 job 超时（2026-10-21 PR #75 自己的验证就这样卡满了 60 分钟），teardown 再把它收掉。
@@ -1580,12 +1574,10 @@ true'
   while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.1; i=$((i + 1)); done
   ! kill -0 "$pid" 2>/dev/null || { echo "planted child $pid outlived the guard" >&2; return 1; }
   refute_contains "$(cat "$GITHUB_ENV")" 'BASH_ENV'
-  [ -z "${GITHUB_PATH:-}" ] || refute_contains "$(cat "$GITHUB_PATH")" '/tmp'
+  refute_contains "$(cat "$GITHUB_PATH")" '/tmp'
 }
 
 @test "takeover: a short-lived child's BASH_ENV written just after the leader exits never survives" {
-  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
-  : >"$GITHUB_PATH"
   export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV"
   push_workspace '( sleep 0.02; printf "BASH_ENV=/tmp/evil-bash-env\n" >>"$REAL_ENV_FILE" ) &
 true'

@@ -789,7 +789,8 @@ outcome() { trust_fake_bin; run run_block "$WF" "Check the fix outcome"; }
 # 不一样的 PR（正好是钉别的 ref 演练的那种）就被错认成它：发一条错的告警，还挡住 Codex 接手。
 # 所以判据删了：没有执行记录的失败一律是普通的 fix-failed，也不再去比那两份文件。
 @test "outcome: a fixer that left no record on a PR whose caller stub differs is a plain fix-failed" {
-  outcome_env success ''
+  # 报失败才走得到分类：报成功却没记录，在分类之前就被保险丝拦下（codex-takeover.bats）
+  outcome_env failure ''
   live_head "$H"
   export WORKFLOW_REF='o/r/.github/workflows/claude-codex-iterate.yml@refs/pull/7/merge'
   export DEFAULT_BRANCH=develop

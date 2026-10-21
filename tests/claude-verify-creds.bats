@@ -1313,7 +1313,8 @@ EOS
 }
 
 # 文件命令通道五个都换成废纸篓，GITHUB_STATE 也在内（以前漏了它）：专用账号写不动外层那份真
-# state，调用方的测试一写就「权限不够」；回退路径上它写得进去，post 步骤读的就是那份。两条路都查。
+# state，调用方的测试一写就「权限不够」。它没有下游（只有 action 自己的 post 读 STATE_*），所以
+# 这只关失败、不关凭据。两条路都查。
 @test "claude: the verify command gets a decoy for every runner file command, state included" {
   launch_stub >"$BATS_TEST_TMPDIR/stub.sh"
   export STUB_VERIFY='printf "%s\n" "$GITHUB_ENV" "$GITHUB_PATH" "$GITHUB_OUTPUT" "$GITHUB_STATE" "$GITHUB_STEP_SUMMARY"'

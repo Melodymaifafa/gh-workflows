@@ -1138,7 +1138,8 @@ jobs:
             wait "$verify_pgid" || verify_status=$?
 
             # 会应用到后面步骤的那几个文件命令通道（同 Put back 清的集合，不含只渲染的 step summary）。
-            # 子孙直接写真文件 —— GITHUB_ENV 一行 BASH_ENV 抢在 PATH 过滤 / 换 HOME 之前跑；PATH/OUTPUT/STATE 同理。
+            # 子孙直接写真文件 —— GITHUB_ENV 一行 BASH_ENV 抢在 PATH 过滤 / 换 HOME 之前跑；PATH/OUTPUT 同理。
+            # STATE 没有下游（run: 步骤没有 post），一起清只为了一份写坏的 state 不把这一步弄红。
             scrub_file_commands() {
               local fc
               for fc in "${GITHUB_ENV:-}" "${GITHUB_OUTPUT:-}" "${GITHUB_PATH:-}" "${GITHUB_STATE:-}"; do
