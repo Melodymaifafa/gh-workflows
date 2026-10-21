@@ -2100,6 +2100,14 @@ outcome_denials() { # outcome_denials <permission_denials JSON 数组>
   assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-failed'
 }
 
+# action 改了 output 名、根本没交出路径（Codex 2026-10-21 在 c3d77a8 上的 P1）：同样是读不出来。
+@test "outcome: a fixer that succeeded but handed over no execution-record path reds the round" {
+  outcome_exec ''
+  assert_equal "$status" 1
+  assert_contains "$output" 'execution record'
+  assert_contains "$(fake_last_body "gh pr comment")" 'reason=fix-failed'
+}
+
 @test "outcome: an execution record that is not the format the action writes reds the round" {
   for body in 'not json {' '{"type":"result","permission_denials":[]}' '[{"type":"assistant"}]' \
               '[{"type":"result","permission_denials":"none"}]'; do

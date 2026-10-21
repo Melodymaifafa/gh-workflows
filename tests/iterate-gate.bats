@@ -680,8 +680,12 @@ carried_review() { # carried_review <id> <login> <assoc> <inline title>
 # ---------- Outcome ----------
 
 outcome_env() { # outcome_env <FIX_OUTCOME> <STRUCTURED> [exec fixture]
+  # 修复员报成功时 action 总会交出执行记录；没点名就给一份没有拒绝的。没有路径本身算读不出来
+  # （codex-takeover.bats 的 outcome: 那几条钉着）。
+  local fixture="${3:-}"
+  [ -n "$fixture" ] || [ "$1" != success ] || fixture=exec-success-structured.json
   export HEAD_SHA="$H" ROUND=3 FIX_OUTCOME="$1" STRUCTURED="$2" EXEC_FILE=""
-  if [ -n "${3:-}" ]; then export EXEC_FILE="$FIXTURES_DIR/sdk/$3"; fi
+  if [ -n "$fixture" ]; then export EXEC_FILE="$FIXTURES_DIR/sdk/$fixture"; fi
 }
 
 # 判的是这一步的行为（正文、额度换算、去重），不是它的 PATH —— 把假命令接回去。

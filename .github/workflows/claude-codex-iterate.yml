@@ -2741,7 +2741,7 @@ jobs:
           # （--allowedTools "Edit(./**)" 解析变了之类），修复员就一个文件都没改，这一轮会被读成「看完
           # 觉得都不用改」静悄悄放过。所以修复员那一步报成功时，看执行记录里最后一条 result 的
           # permission_denials：Edit/Write/MultiEdit 在工作区里（且不在 .git 下）被拒，那不是「不用改」。
-          # 记录本身读不出来（没有、读不动、或不是 action v1.0.241 写的那个格式：一个 SDK 消息数组，
+          # 记录本身读不出来（action 没交出路径、文件没有、读不动、或不是 action v1.0.241 写的那个格式：一个 SDK 消息数组，
           # 最后一条 type=result；base-action/src/run-claude-sdk.ts 收集、execution-file.ts 写进
           # $RUNNER_TEMP/claude-execution-output.json）也算，那正是 action 升级改了格式时这道保险丝
           # 静默失效的样子（fix round 2）。只在成功那条路上读：撞额度 / 没跑成要交给 Decide the takeover。
@@ -2761,10 +2761,10 @@ jobs:
             local ws ws_real
             fixer_record_problem=''
             denied_in_ws=''
-            [ "${FIX_OUTCOME:-}" = success ] && [ -n "${EXEC_FILE:-}" ] || return 0
+            [ "${FIX_OUTCOME:-}" = success ] || return 0
             ws="${GITHUB_WORKSPACE:-$PWD}"
             ws_real="$(cd "$ws" 2>/dev/null && pwd -P)" || ws_real="$ws"
-            if [ ! -r "$EXEC_FILE" ] || ! denied_in_ws="$(jq -r --arg ws "$ws" --arg wr "$ws_real" '
+            if [ ! -r "${EXEC_FILE:-}" ] || ! denied_in_ws="$(jq -r --arg ws "$ws" --arg wr "$ws_real" '
                 def rel($p): if startswith($p + "/") then .[($p | length) + 1:] else null end;
                 if type != "array" then error("not an array") else . end
                 | ([.[] | select(type == "object" and .type == "result")] | last)
