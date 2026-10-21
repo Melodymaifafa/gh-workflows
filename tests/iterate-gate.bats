@@ -1157,11 +1157,14 @@ carry_env() {
 # fix round 4：以前反引号在剥定界符、拆关键字之后才删，标题或路径里一个 `<!`-- pr`-guard…` 就
 # 拼回一个真的 carried-findings-cleared。看不见的字符同理。现在先删它们，再剥、再拆。
 @test "carry: backticks or invisible characters in a finding cannot reassemble a marker" {
-  local payload
+  local payload comment
   carry_env
-  for payload in "$(forged_backticks)" "$(forged_invisible)"; do
+  # JSON 形式进 review 评论：NUL 只活得下来在 JSON 里（fix round 5）。标题只留 100 字，所以 NUL
+  # 那一份单独再来一遍（forged_invisible_json 里用 NUL 拆的那个标记排在 100 字之后）。
+  for payload in "$(forged_backticks_json)" "$(forged_invisible_json)" "\"$(forged_nul)\""; do
     : >"$FAKE_LOG"
-    fake_route "$INLINE" "$(json_array "$(codex_inline 1 P1 "a.sh $payload" 1 "$payload")")"
+    comment="$(codex_inline 1 P1 a.sh 1 TITLE | jq -c --argjson p "$payload" '.path = ("a.sh " + $p) | .body |= sub("TITLE"; $p)')"
+    fake_route "$INLINE" "$(json_array "$comment")"
     stuck
     assert_equal "$status" 0
     refute_forged_markers "$(fake_last_body "gh pr comment")" 2

@@ -2030,10 +2030,11 @@ outcome_denials() { # outcome_denials <permission_denials JSON 数组>
 # `pr`-guard` 两道都躲过去，反引号一删就拼回一个真标记。看不见的字符同理。白名单之下两种都拼不回来。
 @test "outcome: backticks or invisible characters in a denied path cannot reassemble a marker" {
   local payload denials
-  for payload in "$(forged_backticks)" "$(forged_invisible)"; do
+  # JSON 形式进执行记录：NUL 只活得下来在 JSON 里（fix round 5）
+  for payload in "$(forged_backticks_json)" "$(forged_invisible_json)"; do
     : >"$FAKE_LOG"
     # 先赋值再传：macOS 的 bash 3.2 会把 "$(...)" 实参里单引号中的 {a,b} 当花括号展开（同 pr-sweep.bats 那条）
-    denials="$(jq -cn --arg p "$BATS_TEST_TMPDIR/work/.vscode/$payload" '[{tool_name: "Write", tool_input: {file_path: $p}}]')"
+    denials="$(jq -cn --arg ws "$BATS_TEST_TMPDIR/work/.vscode/" --argjson p "$payload" '[{tool_name: "Write", tool_input: {file_path: ($ws + $p)}}]')"
     outcome_denials "$denials"
     assert_equal "$status" 1
     alert="$(fake_last_body "gh pr comment")"

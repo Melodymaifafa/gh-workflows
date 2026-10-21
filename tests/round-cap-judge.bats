@@ -323,17 +323,52 @@ assert_round_cap_alert() { # assert_round_cap_alert <expected-substring>
 # fix round 4：清洗用 Define pr-guard helpers 里那一份 defang —— 先删看不见的字符（零宽、双向
 # 控制、软连字符、回车），再剥定界符、拆关键字。反引号原样留着：剥完之后没人删它，拼不回标记。
 @test "sanitize: backticks or invisible characters cannot reassemble a marker in the verdict" {
-  local payload
-  for payload in "$(forged_backticks)" "$(forged_invisible)"; do
+  local payload v
+  # JSON 形式进结构化输出：NUL 只活得下来在 JSON 里（fix round 5）
+  for payload in "$(forged_backticks_json)" "$(forged_invisible_json)"; do
     : >"$FAKE_LOG"
     : >"$GITHUB_OUTPUT"
-    use_verdict "$(verdict merge "$payload" "$(item P2 "$payload" "$payload")")"
+    v="$(jq -cn --argjson p "$payload" '{verdict: "merge", summary_zh: $p, findings: [{id: "F1", severity: "P2", title: $p, reason: $p}]}')"
+    use_verdict "$v"
     run run_block "$WF" "$POST"
     assert_equal "$status" 0
     body="$(m8_post)"
     assert_equal "${body##*$'\n'}" "<!-- claude-judge-clean: head=$H reviews=901,902 -->"
     refute_forged_markers "$body" 1
   done
+}
+
+# 复审的 NUL 探针（fix round 5）：这条放行评论用主人的 PAT 发，judge 写的话里一个 NUL 以前就够拼回
+# 一个标记（jq -r 打出 NUL，bash 的 $(...) 把它删了）。
+# JSON 用 jq 拼，不用 bash 的 ${v/…/…}：bash 5.2 的替换串对反斜杠另有讲究（patsub_replacement）。
+@test "sanitize: a NUL inside a marker cannot reassemble it in the M8 verdict" {
+  local v
+  v="$(jq -cn --argjson p "\"$(forged_nul)\"" '{verdict: "merge", summary_zh: $p, findings: [{id: "F1", severity: "P2", title: "t", reason: "r"}]}')"
+  use_verdict "$v"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  refute_forged_markers "$(m8_post)" 1
+}
+
+# 确认了 bug 的那条 review（M9）和停车告警里的 bug 标题走同一份清洗；末尾三个标记之外一个都不许有。
+@test "sanitize: a NUL inside a marker cannot reassemble it in the confirmed-bug review or the stop alert" {
+  local v body
+  v="$(jq -cn --argjson p "\"$(forged_nul)\"" '{verdict: "stop", summary_zh: $p, findings: [{id: "F1", severity: "P1", title: $p, reason: $p}]}')"
+  use_verdict "$v"
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  body="$(fake_last_body 'gh api POST repos/o/r/pulls/7/reviews')"
+  assert_contains "$body" "<!-- claude-judge-fix: head=$H -->"
+  refute_forged_markers "$body" 3
+
+  : >"$FAKE_LOG"
+  : >"$GITHUB_OUTPUT"
+  export ROUND=11
+  run run_block "$WF" "$POST"
+  assert_equal "$status" 0
+  body="$(fake_last_body 'gh pr comment')"
+  assert_contains "$body" "reason=round-cap"
+  refute_forged_markers "$body" 1
 }
 
 @test "without the pr-guard helpers the step goes red instead of skipping the alert" {

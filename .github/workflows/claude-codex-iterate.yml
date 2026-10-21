@@ -204,6 +204,9 @@ jobs:
           # 第 5 个参数可选：只进评论、不进手机推送的额外标记行（如 carried-findings）。
           alert_once() {
             local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" prev body resume
+            # 告警的话里不许有 HTML 注释：标记只由下面这几行加，第 5 个参数也是调用处自己的标记。
+            # 话里会带外部文字（被拒的文件名、意见标题、judge 列的 bug），见 only_own_markers。
+            only_own_markers 0 "the $reason alert" "$msg" || return 1
             # 已有可信标记里最大的 until：没有标记 = 空串，有标记但 until=- 记 0
             prev="$(trusted_comments | jq -r --arg m "<!-- pr-guard: alert head=$head reason=$reason " '
               [.[] | .body | select(contains($m))
@@ -299,24 +302,42 @@ jobs:
 
           # defang_jq：打印 jq 定义 defang。外部能左右的文字（模型写的、审查方写的、PR 里的文件名和
           # 标题）发进 github-actions[bot] 或主人署名的评论之前都过它：标记只认这两个账号写的。
-          # 顺序是要害：先删看不见的字符（零宽、双向控制、软连字符、回车），再剥 HTML 注释定界符直到
-          # 剥不动、打码令牌、拆开标记关键字、@ 后插零宽空格。以前删字符排在剥之后，`<!`--` 这样夹
-          # 一个反引号的定界符躲过了剥，反引号一删就拼回一个真标记（fix round 4，两个工作流里四处中招）。
-          # 所以 defang 之后不许再删任何字符；要删反引号的，在 defang 之前删。codex-approved-merge
+          # 顺序是要害：先删控制字符和格式字符（Unicode 的 Cc、Cf 两类，加行分隔符、段分隔符：NUL、
+          # 回车、零宽、双向控制、软连字符都在里面；只留制表符和换行），再剥 HTML 注释定界符直到剥不动、
+          # 打码令牌、拆开标记关键字、@ 后插零宽空格。以前删字符排在剥之后，`<!`--` 这样夹一个反引号
+          # 的定界符躲过了剥，反引号一删就拼回一个真标记（fix round 4，两个工作流里四处中招）。NUL 是
+          # bash 替我们删的：jq -r 照样打出 NUL，$(...) 把它丢掉（fix round 5）。所以 defang 之后不许再删
+          # 任何字符；要删反引号的，在 defang 之前删；发之前再过一道 only_own_markers。codex-approved-merge
           # 拿不到本文件，那边两份逐字相同的副本由 tests/claude-verdict.bats 盯着。
           defang_jq() {
             printf '%s\n' 'def defang: tostring
-              | gsub("[\r\u00AD\u200B-\u200F\u2028-\u202E\u2060-\u2064\uFEFF]"; "")
+              | gsub("(?![\t\n])[\\p{Cc}\\p{Cf}\u2028\u2029]"; "")
               | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
               | gsub("sk-ant-[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")
               | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
               | gsub("@"; "@​");'
           }
 
-          declare -f pushover trusted_comments alert_once post_comment_retry carried_reviews findings_review_ids judged_already defang_jq >"$RUNNER_TEMP/pr-guard.sh"
+          # only_own_markers <几个> <说的是什么> <正文>：正文里的 <!-- 和 --> 各正好是这一步自己加的那几个
+          # 才放行；否则打一条 ::error::、返回非零，调用处就不发（本来红的照旧红，本来只警告的照旧只
+          # 警告、跳过）。这是发之前最后一道：defang 之后谁再删掉一个字符，标记就拼得回来 —— fix
+          # round 4 是反引号，fix round 5 是 NUL（jq -r 照样打出 NUL，bash 的 $(...) 把它删了）。只用
+          # shell 内建。codex-approved-merge 那两份逐字相同（tests/claude-verdict.bats 盯着）。
+          only_own_markers() {
+            local want="$1" what="$2" rest open=0 close=0
+            rest="$3"
+            while [[ "$rest" == *'<!--'* ]]; do rest="${rest#*'<!--'}"; open=$((open + 1)); done
+            rest="$3"
+            while [[ "$rest" == *'-->'* ]]; do rest="${rest#*'-->'}"; close=$((close + 1)); done
+            [ "$open" -eq "$want" ] && [ "$close" -eq "$want" ] && return 0
+            echo "::error::refusing to post $what: it carries $open '<!--' and $close '-->' where this step adds $want"
+            return 1
+          }
+
+          declare -f pushover trusted_comments alert_once post_comment_retry carried_reviews findings_review_ids judged_already defang_jq only_own_markers >"$RUNNER_TEMP/pr-guard.sh"
           {
             echo 'script<<__PR_GUARD_HELPERS_EOF__'
-            declare -f pushover trusted_comments alert_once post_comment_retry carried_reviews findings_review_ids judged_already defang_jq
+            declare -f pushover trusted_comments alert_once post_comment_retry carried_reviews findings_review_ids judged_already defang_jq only_own_markers
             echo '__PR_GUARD_HELPERS_EOF__'
           } >>"$GITHUB_OUTPUT"
 
@@ -2556,7 +2577,7 @@ jobs:
           # 把还没修的意见当成已处理，自动合并照常放行。反引号留着：总结是 markdown，defang 之后
           # 也没人删它，拼不回标记。清洗没拿到就不发这条评论（同上面找不到 jq）。
           eval "${PR_GUARD:-}"
-          if ! declare -F defang_jq >/dev/null; then
+          if ! declare -F defang_jq only_own_markers >/dev/null; then
             echo '::warning::the pr-guard helpers did not arrive from the Define step; skipping the PR comment'
             exit 0
           fi
@@ -2600,6 +2621,8 @@ jobs:
             fi
             printf '\n模型：%s · 思考力度：%s\n' "$model_used" "${CLAUDE_EFFORT:-unknown}"
           )"
+          # 发之前最后一道（见 only_own_markers）：这段正文一个 HTML 注释都不该有，有就不发、不落盘。
+          only_own_markers 0 'the Claude summary comment' "$body" || exit 0
           printf '%s\n' "$body" >>"$GITHUB_STEP_SUMMARY"
 
           if ! command -v gh >/dev/null 2>&1; then
@@ -3933,7 +3956,7 @@ jobs:
           if [ "$reason" = findings-carried ]; then
             if [[ "${REVIEW_ID:-}" =~ ^[0-9]+$ ]]; then
               # 意见原文是外部输入，而这条评论署名 github-actions[bot]、标记认的正是它：
-              # 过一遍 defang（看不见的字符、HTML 注释定界符、令牌、标记关键字、@），免得一行
+              # 过一遍 defang（控制字符和看不见的字符、HTML 注释定界符、令牌、标记关键字、@），免得一行
               # 标题伪造出标记（比如把还没修的意见写成已关掉）或者召唤谁。反引号在 defang 之前
               # 删（路径要套进行内代码）：以前排在剥定界符之后，`<!`--` 就拼回了一个真标记
               # （fix round 4）。每条只留一行，最多点名 3 条：同一段话也是手机推送的正文，
@@ -4240,7 +4263,7 @@ jobs:
           set -euo pipefail
 
           eval "${PR_GUARD:-}"
-          declare -F alert_once defang_jq >/dev/null || {
+          declare -F alert_once defang_jq only_own_markers >/dev/null || {
             echo '::error::the pr-guard helpers did not arrive from the iterate job'
             exit 1
           }
@@ -4313,7 +4336,7 @@ jobs:
           fi
 
           # 清洗 Claude 写的每一段文字（同 codex-approved-merge 的 Post Claude verdict）：过一遍 defang
-          # （先删看不见的字符，再去掉 HTML 注释符号防伪造标记、打码令牌、拆开标记关键字、@ 后插零宽
+          # （先删控制字符和看不见的字符，再去掉 HTML 注释符号防伪造标记、打码令牌、拆开标记关键字、@ 后插零宽
           # 空格防 @ 人和 @codex），再限长。defang 从 Define pr-guard helpers 交过来，见那里的注释。
           # shellcheck disable=SC2016  # jq 程序，$n 是 jq 变量
           sanitize="$(defang_jq)"'
@@ -4484,6 +4507,9 @@ jobs:
                 + "\n\n<!-- claude-judge-clean: head=" + $head + " reviews=" + $reviews + " -->"
               ' <<<"$STRUCTURED_OUTPUT"
             )"
+            # 发之前最后一道（见 only_own_markers）：只许有末尾那一个放行标记。不发就红着停下，
+            # posted 没写，round-cap-park 照旧停车告警。
+            only_own_markers 1 "the $park_reason clean verdict" "$body" || exit 1
             gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null
             echo 'posted=true' >>"$GITHUB_OUTPUT"
             # 修满轮数才推手机：判「不用改」再复核放行是常态，每个 PR 推一条就成了噪音。
@@ -4532,6 +4558,8 @@ jobs:
                 + "\n<!-- claude-judge-fix: head=" + $head + " -->"
               ' <<<"$STRUCTURED_OUTPUT"
             )"
+            # 同上：只许有末尾那三个标记。
+            only_own_markers 3 'the confirmed-bug review' "$body" || exit 1
             jq -n --arg head "$HEAD_SHA" --arg body "$body" \
               '{commit_id: $head, event: "COMMENT", body: $body}' |
               gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --input - >/dev/null

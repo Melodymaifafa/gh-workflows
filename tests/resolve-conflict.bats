@@ -714,20 +714,49 @@ stuck_env() { # stuck_env <reason> [detail]
 # `<!`-- pr`-guard…` 就拼回一个真标记。看不见的字符同理。现在先删它们，再剥、再拆。
 @test "hand over: backticks or invisible characters cannot reassemble a marker" {
   local payload
+  # 文件名从上一步的 output 进来（纯文本，装不下 NUL）；Claude 的话从结构化输出进来，用 JSON 形式。
   for payload in "$(forged_backticks)" "$(forged_invisible)"; do
     : >"$FAKE_LOG"
     stuck_env markers-left "$payload"
     run run_step "$WF" "$PUSH"
     assert_equal "$status" 0
     refute_forged_markers "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" 1
-
+  done
+  for payload in "$(forged_backticks_json)" "$(forged_invisible_json)"; do
     : >"$FAKE_LOG"
     stuck_env claude-gave-up
-    STRUCTURED_OUTPUT="$(jq -cn --arg s "$payload" '{verdict: "give_up", files: [], summary_zh: $s}')"
+    STRUCTURED_OUTPUT="$(jq -cn --argjson s "$payload" '{verdict: "give_up", files: [], summary_zh: $s}')"
     run run_step "$WF" "$PUSH"
     assert_equal "$status" 0
     refute_forged_markers "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" 1
   done
+}
+
+# 合进来之后那条说明里，Claude 写的每个文件怎么解的（files[].path / how）走同一份清洗。
+@test "push: backticks, invisible characters or a NUL in Claude's file notes cannot reassemble a marker" {
+  local payload
+  resolved_and_committed
+  for payload in "$(forged_backticks_json)" "$(forged_invisible_json)" "\"$(forged_nul)\""; do
+    : >"$FAKE_LOG"
+    # 上一轮已经推上去了：把远端倒回解冲突时那个 head，这一轮的推送才照常是快进
+    "$REAL_GIT" -C "$BATS_TEST_TMPDIR/origin.git" update-ref refs/heads/topic "$HEAD_SHA"
+    export STRUCTURED_OUTPUT; STRUCTURED_OUTPUT="$(jq -cn --argjson p "$payload" '{verdict: "resolved", files: [{path: $p, how: $p}], summary_zh: "x"}')"
+    run run_step "$WF" "$PUSH"
+    assert_equal "$status" 0
+    note="$(nth_body 1 'gh api POST repos/o/r/issues/7/comments')"
+    assert_contains "$note" 'Claude 解开了 1 个文件里的冲突'
+    refute_forged_markers "$note" 1
+  done
+}
+
+# 复审的 NUL 探针（fix round 5）：Claude 交回来的理由里一个 NUL 以前就够拼回一个标记（jq -r 打出
+# NUL，bash 的 $(...) 把它删了）。
+@test "hand over: a NUL inside a marker cannot reassemble it in Claude's reason" {
+  stuck_env claude-gave-up
+  STRUCTURED_OUTPUT='{"verdict":"give_up","files":[],"summary_zh":"'"$(forged_nul)"'"}'
+  run run_step "$WF" "$PUSH"
+  assert_equal "$status" 0
+  refute_forged_markers "$(fake_last_body 'gh api POST repos/o/r/issues/7/comments')" 1
 }
 
 @test "hand over: a head already handed over is not pinged twice" {
