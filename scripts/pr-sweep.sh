@@ -359,7 +359,7 @@ alert_once() {
   head_unchanged || return 0
   if [ "${4:-}" != quiet ] && [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
     # 推送失败就不留标记，下一轮巡检重发，免得告警丢了还当作已发。
-    curl -sf -X POST https://api.pushover.net/1/messages.json \
+    curl -q -sf -X POST https://api.pushover.net/1/messages.json \
       --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
       --form-string "title=🤖 PR 巡检：$repo#$n" --form-string "message=$msg $url" >/dev/null 2>&1 ||
       { echo "::warning::$who Pushover 发送失败，下轮重试"; return 0; }

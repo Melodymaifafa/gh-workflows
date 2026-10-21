@@ -93,7 +93,7 @@ jobs:
           now="$(date +%s)"
           if [ "$due" -le "$now" ] && [ "$due" -gt "$prev" ] &&
             [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-            curl -sf -X POST https://api.pushover.net/1/messages.json \
+            curl -q -sf -X POST https://api.pushover.net/1/messages.json \
               --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
               --form-string "title=🤖 gh-workflows 45 天没提交" \
               --form-string "message=再过 15 天 GitHub 会停掉 PR 巡检的定时任务；随便推一个提交到 develop 就能续上。" >/dev/null ||
@@ -111,7 +111,7 @@ jobs:
           prev="$(gh api "repos/$REPO/actions/workflows/pr-sweeper.yml/runs?status=completed&per_page=1" \
             --jq '.workflow_runs[0].conclusion // "none"')"
           if [ "$prev" = success ] && [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-            curl -sf -X POST https://api.pushover.net/1/messages.json \
+            curl -q -sf -X POST https://api.pushover.net/1/messages.json \
               --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
               --form-string "title=🤖 PR 巡检挂了" \
               --form-string "message=巡检这一轮失败了，卡住的 PR 暂时没人补；请打开日志看原因。$RUN_URL" >/dev/null ||

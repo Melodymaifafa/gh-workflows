@@ -39,6 +39,14 @@ fake_log() {
   fi
 }
 
+# fake_note_home <命令名>：记下这次调用时真 gh / curl 会去找用户配置的那几处（$HOME 和指向配置目录的
+# 变量）。种点文件的测试拿它断言「这一步没有指回被种过的那个 $HOME」（common.bash 的 plant_home）。
+fake_note_home() {
+  mkdir -p "$FAKE_DIR/state"
+  printf '%s HOME=%s XDG_CONFIG_HOME=%s GH_CONFIG_DIR=%s CURL_HOME=%s\n' \
+    "$1" "${HOME-}" "${XDG_CONFIG_HOME-}" "${GH_CONFIG_DIR-}" "${CURL_HOME-}" >>"$FAKE_DIR/state/homes"
+}
+
 # fake_next_count <counter-name>：该计数器 +1 后输出新值（从 1 开始）。
 fake_next_count() {
   local f="$FAKE_DIR/state/count_$1" n=0

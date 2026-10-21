@@ -130,7 +130,7 @@ jobs:
 
           push_alert() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-              curl -sf -X POST https://api.pushover.net/1/messages.json \
+              curl -q -sf -X POST https://api.pushover.net/1/messages.json \
                 --form-string "token=$PUSHOVER_TOKEN" \
                 --form-string "user=$PUSHOVER_USER" \
                 --form-string "title=$1" \
@@ -1013,7 +1013,7 @@ jobs:
             --add-dir pr
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
+            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,RunWorkflow,SendMessage,RemoteTrigger,PowerShell,CronCreate,AppifactRepl,self_hosted_runner_spawn_local,self_hosted_runner_requeue_session"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","findings","summary_zh"],"properties":{"verdict":{"type":"string","enum":["clean","findings"]},"summary_zh":{"type":"string","maxLength":400},"findings":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["path","line","severity","title","detail"],"properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":0},"severity":{"type":"string","enum":["P0","P1","P2"]},"title":{"type":"string","maxLength":120},"detail":{"type":"string","maxLength":800}}}}}}'
           prompt: |
             你在代替 Codex 审 ${{ github.repository }} 的 PR #${{ github.event.pull_request.number || github.event.issue.number }}，只审 head 提交 ${{ needs.watch-and-merge.outputs.head }}。
@@ -1050,12 +1050,28 @@ jobs:
 
           push_alert() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-              curl -sf -X POST https://api.pushover.net/1/messages.json \
+              curl -q -sf -X POST https://api.pushover.net/1/messages.json \
                 --form-string "token=$PUSHOVER_TOKEN" \
                 --form-string "user=$PUSHOVER_USER" \
                 --form-string "title=$1" \
                 --form-string "message=$2" >/dev/null 2>&1 || true
             fi
+          }
+
+          # only_own_markers <几个> <说的是什么> <正文>：正文里的 <!-- 和 --> 各正好是这一步自己加的那几个
+          # 才放行；否则打一条 ::error::、返回非零，调用处就不发（本来红的照旧红，本来只警告的照旧只
+          # 警告、跳过）。这是发之前最后一道：defang 之后谁再删掉一个字符，标记就拼得回来 —— fix
+          # round 4 是反引号，fix round 5 是 NUL（jq -r 照样打出 NUL，bash 的 $(...) 把它删了）。只用
+          # shell 内建。跟 claude-codex-iterate.yml 的那一份逐字相同（tests/claude-verdict.bats 盯着）。
+          only_own_markers() {
+            local want="$1" what="$2" rest open=0 close=0
+            rest="$3"
+            while [[ "$rest" == *'<!--'* ]]; do rest="${rest#*'<!--'}"; open=$((open + 1)); done
+            rest="$3"
+            while [[ "$rest" == *'-->'* ]]; do rest="${rest#*'-->'}"; close=$((close + 1)); done
+            [ "$open" -eq "$want" ] && [ "$close" -eq "$want" ] && return 0
+            echo "::error::refusing to post $what: it carries $open '<!--' and $close '-->' where this step adds $want"
+            return 1
           }
 
           # 同 watch-and-merge 的 alert_once：每个 (head, 原因) 只推送一次。
@@ -1161,25 +1177,27 @@ jobs:
           if [ "$OUTCOME" = success ] &&
             jq -e "$valid" <<<"${STRUCTURED_OUTPUT:-}" >/dev/null 2>&1
           then
-            # 清洗 Claude 写的每一段文字：去掉 HTML 注释符号（防伪造标记）、
-            # @ 后插零宽空格（防 @ 人和 @codex）、打码令牌、拆开标记关键字、限长。
+            # 清洗 Claude 写的每一段文字（defang）：先删控制字符和格式字符（NUL、回车、零宽、双向控制、
+            # 软连字符这一类，制表符和换行留着），再去掉 HTML 注释符号（防伪造标记）、打码令牌、拆开
+            # 标记关键字、@ 后插零宽空格（防 @ 人和 @codex），最后限长。defang 之后不再删任何字符：以前
+            # 详情在清洗之后再删一遍回车，`<!\r--` 躲过了剥、回车一删就拼回一个真标记（fix round 4）；
+            # NUL 由 bash 的 $(...) 删，同理（fix round 5）。发之前再过一道 only_own_markers。defang 跟
+            # claude-codex-iterate.yml 的 defang_jq、本文件解冲突那一步的逐字相同（这个工作流拿不到
+            # 别的文件，只能各抄一份；tests/claude-verdict.bats 盯着）。
             # shellcheck disable=SC2016  # jq 程序，$n 是 jq 变量
             sanitize='
-              def clean($n):
-                tostring
-                | until((contains("<!--") or contains("-->")) | not;
-                    gsub("<!--"; "") | gsub("-->"; ""))
-                | gsub("sk-ant-[A-Za-z0-9_-]+|gh[pous]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+";
-                    "[已隐藏]")
-                | gsub("@"; "@​")
-                | gsub("(?<k>claude-review|codex-review-head|fix-retry|fix-round|pr-guard)";
-                    "\(.k[0:1])​\(.k[1:])")
-                | if length > $n then .[0:$n] + "…" else . end;
+              def defang: tostring
+                | gsub("(?![\t\n])[\\p{Cc}\\p{Cf}\u2028\u2029]"; "")
+                | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
+                | gsub("sk-ant-[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")
+                | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
+                | gsub("@"; "@​");
+              def clean($n): defang | if length > $n then .[0:$n] + "…" else . end;
               def line1: gsub("[\r\n]+"; " ");
               def item:
                 "- **\(.severity)** `\(.path | clean(200) | line1 | gsub("`"; "'"'"'"))`:\(.line) "
                 + (.title | clean(120) | line1)
-                + "\n  " + (.detail | clean(800) | gsub("\r"; "") | gsub("\n"; "\n  "));
+                + "\n  " + (.detail | clean(800) | gsub("\n"; "\n  "));
             '
             verdict="$(jq -r .verdict <<<"$STRUCTURED_OUTPUT")"
             if [ "$verdict" = findings ]; then
@@ -1191,6 +1209,8 @@ jobs:
                   + "\n\n<!-- claude-review-findings: " + $head + " -->"
                 ' <<<"$STRUCTURED_OUTPUT"
               )"
+              # 发之前最后一道（见 only_own_markers）：只许有末尾那一个标记，不发就红着停下。
+              only_own_markers 1 'the Claude findings review' "$body" || exit 1
               jq -n --arg head "$HEAD_SHA" --arg body "$body" \
                 '{commit_id: $head, event: "COMMENT", body: $body}' |
                 gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --input - >/dev/null
@@ -1206,6 +1226,7 @@ jobs:
                   + "\n\n<!-- claude-review-clean: " + $head + " -->"
                 ' <<<"$STRUCTURED_OUTPUT"
               )"
+              only_own_markers 1 'the Claude clean result' "$body" || exit 1
               gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null
               echo "::notice::Posted Claude clean result for $HEAD_SHA"
             fi
@@ -1553,7 +1574,7 @@ jobs:
             --add-dir pr
             --tools "Read,Glob,Grep,Edit"
             --allowedTools "Read,Glob,Grep,Edit(pr/**)"
-            --disallowedTools "Bash,Monitor,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,SendMessage,RemoteTrigger,PowerShell"
+            --disallowedTools "Bash,Monitor,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill,Workflow,RunWorkflow,SendMessage,RemoteTrigger,PowerShell,CronCreate,AppifactRepl,self_hosted_runner_spawn_local,self_hosted_runner_requeue_session"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","files","summary_zh"],"properties":{"verdict":{"type":"string","enum":["resolved","give_up"]},"summary_zh":{"type":"string","maxLength":400},"files":{"type":"array","maxItems":15,"items":{"type":"object","additionalProperties":false,"required":["path","how"],"properties":{"path":{"type":"string"},"how":{"type":"string","maxLength":200}}}}}}'
           prompt: |
             ${{ github.repository }} 的 PR #${{ github.event.pull_request.number || github.event.issue.number }} 跟 ${{ inputs.base_branch }} 有冲突。
@@ -1710,32 +1731,52 @@ jobs:
           run_url="${GITHUB_SERVER_URL:-https://github.com}/$REPO/actions/runs/${GITHUB_RUN_ID:-}"
           push_alert() {
             if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-              curl -sf -X POST https://api.pushover.net/1/messages.json \
+              curl -q -sf -X POST https://api.pushover.net/1/messages.json \
                 --form-string "token=$PUSHOVER_TOKEN" \
                 --form-string "user=$PUSHOVER_USER" \
                 --form-string "title=$1" \
                 --form-string "message=$2" >/dev/null 2>&1 || true
             fi
           }
-          # 文件名和 Claude 写的话都是 PR 能左右的：去掉 HTML 注释符号（防伪造标记）、拆开标记
-          # 关键字、@ 后插零宽空格、打码令牌、去反引号、压成一行、限长。
+          # only_own_markers <几个> <说的是什么> <正文>：正文里的 <!-- 和 --> 各正好是这一步自己加的那几个
+          # 才放行；否则打一条 ::error::、返回非零，调用处就不发（本来红的照旧红，本来只警告的照旧只
+          # 警告、跳过）。这是发之前最后一道：defang 之后谁再删掉一个字符，标记就拼得回来 —— fix
+          # round 4 是反引号，fix round 5 是 NUL（jq -r 照样打出 NUL，bash 的 $(...) 把它删了）。只用
+          # shell 内建。跟 claude-codex-iterate.yml 的那一份逐字相同（tests/claude-verdict.bats 盯着）。
+          only_own_markers() {
+            local want="$1" what="$2" rest open=0 close=0
+            rest="$3"
+            while [[ "$rest" == *'<!--'* ]]; do rest="${rest#*'<!--'}"; open=$((open + 1)); done
+            rest="$3"
+            while [[ "$rest" == *'-->'* ]]; do rest="${rest#*'-->'}"; close=$((close + 1)); done
+            [ "$open" -eq "$want" ] && [ "$close" -eq "$want" ] && return 0
+            echo "::error::refusing to post $what: it carries $open '<!--' and $close '-->' where this step adds $want"
+            return 1
+          }
+          # 文件名和 Claude 写的话都是 PR 能左右的：去反引号（文件名要套进行内代码）、去结尾的换行，
+          # 再过一遍 defang（先删控制字符和格式字符，NUL、回车、零宽、双向控制这一类，再去掉 HTML 注释
+          # 符号防伪造标记、打码令牌、拆开标记关键字、@ 后插零宽空格），最后压成一行、限长。删字符都在
+          # defang 之前：以前反引号和回车排在剥定界符之后删，`<!`--` 躲过了剥、反引号一删就拼回一个
+          # 真标记（fix round 4）。defang 跟
+          # Post Claude verdict 那一份、claude-codex-iterate.yml 的 defang_jq 逐字相同
+          # （tests/claude-verdict.bats 盯着）。
           # shellcheck disable=SC2016  # jq 程序，$n 是 jq 变量
           clean_jq='
+            def defang: tostring
+              | gsub("(?![\t\n])[\\p{Cc}\\p{Cf}\u2028\u2029]"; "")
+              | until((contains("<!--") or contains("-->")) | not; gsub("<!--"; "") | gsub("-->"; ""))
+              | gsub("sk-ant-[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"; "[已隐藏]")
+              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)"; "\(.k[0:1])​\(.k[1:])")
+              | gsub("@"; "@​");
             def clean($n):
-              tostring
-              | until((contains("<!--") or contains("-->")) | not;
-                  gsub("<!--"; "") | gsub("-->"; ""))
-              | gsub("sk-ant-[A-Za-z0-9_-]+|gh[pous]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+"; "[已隐藏]")
-              | gsub("@"; "@​")
-              | gsub("(?<k>claude-review|claude-judge|codex-review-head|codex-fix-request|fix-retry|fix-round|pr-guard|carried-findings)";
-                  "\(.k[0:1])​\(.k[1:])")
-              | gsub("[`\r]"; "") | gsub("\n+$"; "") | gsub("\n"; "、")
+              tostring | gsub("`"; "") | gsub("[\r\n]+$"; "") | defang
+              | gsub("\n"; "、")
               | if length > $n then .[0:$n] + "…" else . end;'
           clean() { jq -Rrs --argjson n "$1" "$clean_jq"' clean($n)'; }
 
           # 交给人：每个 head 只推一次手机、留一次标记。巡检看到 conflict-stuck 就不再管这个 head。
           hand_over() {
-            local why="$1"
+            local why="$1" body
             if [ -n "${GH_TOKEN:-}" ] &&
               gh api --paginate --slurp "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null |
               jq -e --arg p "pr-guard: alert head=$HEAD_SHA reason=conflict-stuck " '
@@ -1753,8 +1794,10 @@ jobs:
               echo "::warning::CODEX_TRIGGER_TOKEN is missing; the alert went to Pushover only"
               return 0
             fi
-            gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
-              -f body="🤖 这个 PR 跟 ${BASE_BRANCH} 有冲突，自动解冲突没成：${why} 请在本地把 ${BASE_BRANCH} 合进来、解完冲突后推上来。"$'\n\n'"<!-- pr-guard: alert head=$HEAD_SHA reason=conflict-stuck until=- -->" \
+            body="🤖 这个 PR 跟 ${BASE_BRANCH} 有冲突，自动解冲突没成：${why} 请在本地把 ${BASE_BRANCH} 合进来、解完冲突后推上来。"$'\n\n'"<!-- pr-guard: alert head=$HEAD_SHA reason=conflict-stuck until=- -->"
+            # 发之前最后一道（见 only_own_markers）：只许有末尾那一个标记；不发也只警告，同发不出去。
+            only_own_markers 1 'the conflict-stuck alert' "$body" || return 0
+            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" \
               >/dev/null || echo "::warning::Could not post the conflict-stuck alert"
           }
 
@@ -1842,8 +1885,11 @@ jobs:
           fi
           body+=$'\n\n'"合出来的这一版要等 CI 跑绿、再审一遍，都过了才会照常自动合并。"
           body+=$'\n\n'"<!-- pr-guard: conflict-merged head=$HEAD_SHA new=$new_head -->"
-          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null ||
-            echo "::warning::Could not post the merge note"
+          # 发之前最后一道（见 only_own_markers）：只许有末尾那一个标记；不发也只警告，同发不出去。
+          if only_own_markers 1 'the merge note' "$body"; then
+            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null ||
+              echo "::warning::Could not post the merge note"
+          fi
           # 请 Codex 审合出来的这一版：跟巡检的请求同一个格式，单独一条。Codex 额度没恢复（巡检记在
           # gh-workflows 的 issue 里，同 iterate 的召唤那一步）就直接请 Claude 审：同一条评论带上
           # codex-silent，叫醒本 workflow 的路径 G。读不到就按额度正常算。

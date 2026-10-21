@@ -10,6 +10,7 @@
 # shellcheck source=tests/test_helper/fake-bin/_lib.sh
 . "$(dirname "$0")/_lib.sh"
 fake_require_env curl
+fake_note_home curl
 
 url="" body="" has_body=0 prev="" stdin_body=0 header_files=()
 for a in "$@"; do
