@@ -1087,7 +1087,8 @@ jobs:
             launch_the_verify_command() {
               if [ -z "$verify_user" ]; then
                 env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
-                    GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
+                    GITHUB_OUTPUT="$decoy/output" GITHUB_STATE="$decoy/state" \
+                    GITHUB_STEP_SUMMARY="$decoy/summary" \
                     npm_config_prefix="$verify_tools" \
                     PATH="$verify_path" \
                     bash -euo pipefail -c "$VERIFY"
@@ -1119,7 +1120,8 @@ jobs:
                     npm_config_cache="$verify_sandbox/cache/npm" \
                     npm_config_prefix="$verify_tools" \
                     GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
-                    GITHUB_OUTPUT="$decoy/output" GITHUB_STEP_SUMMARY="$decoy/summary" \
+                    GITHUB_OUTPUT="$decoy/output" GITHUB_STATE="$decoy/state" \
+                    GITHUB_STEP_SUMMARY="$decoy/summary" \
                     PATH="$verify_path" \
                     "$verify_bash" -euo pipefail \
                       -c 'umask 002; exec "$0" -euo pipefail -c "$1"' \

@@ -1291,7 +1291,7 @@ run_marker() { # run_marker <账号已存在 0|1> <标记已在 1|0> <标记属�
 # 的 umask。设在里面报 0002，挪回外层就报 0022 —— 这一条当场变红。
 launch_stub() { # launch_stub >桩脚本
   cat <<'EOS'
-verify_user=ghwf-verify
+verify_user=${STUB_USER-ghwf-verify}
 verify_sandbox="$BATS_TEST_TMPDIR/launch-sandbox"
 decoy="$BATS_TEST_TMPDIR/launch-decoy"
 verify_tools="$verify_sandbox/tools"
@@ -1299,7 +1299,7 @@ mkdir -p "$verify_sandbox/home" "$decoy" "$verify_tools/bin"
 verify_path="$verify_tools/bin:$PATH"
 verify_bash=/bin/bash
 [ -x "$verify_bash" ] || verify_bash=/usr/bin/bash
-VERIFY='umask'
+VERIFY=${STUB_VERIFY-umask}
 # 迷你 sudo：把 `-E -u <用户>` 剥掉，剩下的原样跑
 as_root() {
   while [ "$#" -gt 0 ]; do
@@ -1310,6 +1310,20 @@ as_root() {
 umask 022
 launch_the_verify_command
 EOS
+}
+
+# 文件命令通道五个都换成废纸篓，GITHUB_STATE 也在内（以前漏了它）：专用账号写不动外层那份真
+# state，调用方的测试一写就「权限不够」；回退路径上它写得进去，post 步骤读的就是那份。两条路都查。
+@test "claude: the verify command gets a decoy for every runner file command, state included" {
+  launch_stub >"$BATS_TEST_TMPDIR/stub.sh"
+  export STUB_VERIFY='printf "%s\n" "$GITHUB_ENV" "$GITHUB_PATH" "$GITHUB_OUTPUT" "$GITHUB_STATE" "$GITHUB_STEP_SUMMARY"'
+  local d="$BATS_TEST_TMPDIR/launch-decoy"
+  for STUB_USER in ghwf-verify ''; do
+    export STUB_USER
+    run run_helper "$BATS_TEST_TMPDIR/stub.sh" launch_the_verify_command
+    assert_equal "$status" 0
+    assert_equal "$output" "$(printf '%s\n' "$d/env" "$d/path" "$d/output" "$d/state" "$d/summary")"
+  done
 }
 
 @test "claude: the cooperative umask is set inside the sudo command, where the verify process still sees it" {

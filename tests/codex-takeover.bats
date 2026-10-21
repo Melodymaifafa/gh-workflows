@@ -1567,10 +1567,18 @@ EOS
 @test "takeover: a TERM-trapping child's BASH_ENV written after the truncation never survives" {
   export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
   : >"$GITHUB_PATH"
-  export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV"
-  push_workspace '( trap "printf \"BASH_ENV=/tmp/evil-bash-env\n\" >>\"\$REAL_ENV_FILE\"; exit 0" TERM; while :; do sleep 0.05; done ) &
+  export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV" PLANT_PIDFILE="$BATS_TEST_TMPDIR/leftover.pid"
+  # 子进程不拿 bats 的输出管道、号码记进 leftover.pid：守卫哪天没收掉它，这条是红而不是把整套
+  # 卡到 job 超时（2026-10-21 PR #75 自己的验证就这样卡满了 60 分钟），teardown 再把它收掉。
+  push_workspace '( trap "printf \"BASH_ENV=/tmp/evil-bash-env\n\" >>\"\$REAL_ENV_FILE\"; exit 0" TERM; while :; do sleep 0.05; done ) >/dev/null 2>&1 </dev/null &
+echo $! >"$PLANT_PIDFILE"
 true'
   run_verify
+  # 守卫真把它收掉了：没收的话它从没收到 TERM、也就从没写过，下面那条白绿
+  pid="$(cat "$PLANT_PIDFILE")"
+  i=0
+  while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.1; i=$((i + 1)); done
+  ! kill -0 "$pid" 2>/dev/null || { echo "planted child $pid outlived the guard" >&2; return 1; }
   refute_contains "$(cat "$GITHUB_ENV")" 'BASH_ENV'
   [ -z "${GITHUB_PATH:-}" ] || refute_contains "$(cat "$GITHUB_PATH")" '/tmp'
 }
@@ -1615,6 +1623,7 @@ drop_probe_units() {
 
 teardown() {
   [ -z "${MEL288_PROBE_UNITS:-}" ] || drop_probe_units
+  reap_planted_pid
 }
 
 # 两条反面测试种出来的那个载荷：收掉它，别让它活到后面几条测试里去。
@@ -1969,9 +1978,10 @@ outcome_exec() { # outcome_exec <执行记录的路径（可以不存在）> [FI
 # 跟 action 写的一样：一个 SDK 消息数组，最后一条 type=result 带 permission_denials（v1.0.241 的
 # base-action/src/run-claude-sdk.ts 把每条消息 push 进数组、见到 result 就 break，再整个
 # JSON.stringify 写进 $RUNNER_TEMP/claude-execution-output.json）。
+# 数组从 stdin 进 jq：Linux 单个参数上限 128 KiB，几百条拒绝当 --argjson 传会 E2BIG。
 outcome_denials() { # outcome_denials <permission_denials JSON 数组>
-  jq -n --argjson d "$1" '[{type:"system",subtype:"init"},{type:"result",subtype:"success",is_error:false,permission_denials:$d}]' \
-    >"$BATS_TEST_TMPDIR/exec.json"
+  jq '[{type:"system",subtype:"init"},{type:"result",subtype:"success",is_error:false,permission_denials:.}]' \
+    <<<"$1" >"$BATS_TEST_TMPDIR/exec.json"
   outcome_exec "$BATS_TEST_TMPDIR/exec.json"
 }
 

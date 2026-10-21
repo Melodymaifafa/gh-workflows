@@ -192,7 +192,11 @@ setup_fake_env() {
   export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/github_output"
   export GITHUB_ENV="$BATS_TEST_TMPDIR/github_env"
   export GITHUB_STEP_SUMMARY="$BATS_TEST_TMPDIR/github_step_summary"
-  : >"$GITHUB_OUTPUT"; : >"$GITHUB_ENV"; : >"$GITHUB_STEP_SUMMARY"
+  # PATH / STATE 也不从外面继承：被测的守卫会清空它们。在流水线自己的验证里跑（专用账号）时
+  # 外层那份真文件写不动，守卫当场退出、把残留留在 bats 的管道上，整套卡到 job 超时。
+  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
+  export GITHUB_STATE="$BATS_TEST_TMPDIR/github_state"
+  : >"$GITHUB_OUTPUT"; : >"$GITHUB_ENV"; : >"$GITHUB_STEP_SUMMARY"; : >"$GITHUB_PATH"; : >"$GITHUB_STATE"
 }
 
 # 参数是已存在的文件、tests/fixtures 下的相对路径，或者字面 JSON/文本。
