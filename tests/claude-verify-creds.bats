@@ -2246,7 +2246,7 @@ claude_mode_context() {
   gate_ran 'Say why this round pushed nothing'
 }
 
-# 验证抓到一个杀不掉的残留、或者守卫中途被打断（I2）→ 没有 contained=true。这时候它可能还活着、
+# 验证抓到一个杀不掉的残留、或者守卫在清点证明之前被打断（I2）→ 没有 contained=true。这时候它可能还活着、
 # 同一个 uid，Decide / Say why 一跑就被它从 /proc/<pid>/environ 读走 GH_TOKEN。所以这两步必须跳过，
 # 整个 job 彻底红，由 Mac 上的巡检重试 / 告警。正面门：没写就是没证明，写成别的值也一样。
 @test "gating: an uncontained leftover skips every failure step that holds a credential" {

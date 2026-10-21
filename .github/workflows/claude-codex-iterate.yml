@@ -1385,7 +1385,7 @@ jobs:
             fi
 
             # 清点干净：补写的那一笔这里再清一次（C1），排在指纹 / 树 / changed 和各 reject 分支之前。
-            # 清不掉就红着停下（I2）。之后的每个出口都走 contained_exit，中途被打断的不交信号。
+            # 清不掉就红着停下（I2）。之后的每个出口都走 contained_exit，中途被打断的由 verify_on_exit 代调 contained_exit。
             scrub_or_refuse
             verify_settled=1
 
