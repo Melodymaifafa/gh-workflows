@@ -646,6 +646,10 @@ command -v pnpm >"$BATS_TEST_TMPDIR/pnpm-path.txt"'
 
 # 验证留下一个活进程，它盯着 .git/config 等凭据回来。两道各守一半：跑完先按进程组
 # 收掉它，而且凭据摘掉之后再也不还回那个文件 —— 战利品是空的 = 它什么都没等到。
+teardown() {
+  reap_planted_pid
+}
+
 @test "claude: a process the verify command leaves behind never sees the credentials return" {
   # 载荷写成本次 run 临时目录下的一个文件再后台跑，不写成匿名子 shell：本机跑测试时
   # 清点按 argv 里带不带这个目录认「哪些进程是我们的」（见 sweep-bin/ps），匿名子
@@ -1389,19 +1393,67 @@ EOS
 }
 
 # 按进程组收不干净（TERM、KILL 之后组里还有活进程）也是「验证留了活进程」：跟清点抓到残留
-# 杀不掉同一个处置 —— 先把文件命令通道清掉（它可能已经往 GITHUB_ENV 写了 BASH_ENV），再交出
-# contained=false，让 Decide / Say why 这两步也跳过（fix round 3）。同一个用户的进程扛不住
-# SIGKILL，真跑造不出这种残留，所以按结构钉：清通道、交 contained=false、再退出，顺序不能乱。
+# 杀不掉同一个处置 —— 先把文件命令通道清掉（它可能已经往 GITHUB_ENV 写了 BASH_ENV），再红着
+# 退出、不交 contained=true，Decide / Say why 这两步于是跳过（fix round 3，I2 起改成正面门）。
+# 同一个用户的进程扛不住 SIGKILL，真跑造不出这种残留，所以按结构钉：先清通道再退出，中间不交信号。
 @test "split: a process group that outlives TERM and KILL scrubs the channels and gates the failure steps" {
   branch="$(fix_guard_body verify_the_fix | awk '/^if ! reap_verify_group; then$/{f=1} f{print} f&&/^fi$/{exit}')"
   [ -n "$branch" ] || { echo 'reap-failure branch not found' >&2; return 1; }
   scrub="$(grep -n '^  scrub_file_commands' <<<"$branch" | head -n 1 | cut -d: -f1)"
-  gate="$(grep -nF "echo 'contained=false' >>\"\$GITHUB_OUTPUT\"" <<<"$branch" | head -n 1 | cut -d: -f1)"
   quit="$(grep -n '^  exit 1$' <<<"$branch" | head -n 1 | cut -d: -f1)"
-  [ -n "$scrub" ] && [ -n "$gate" ] && [ -n "$quit" ] ||
-    { echo "missing scrub ($scrub), contained=false ($gate) or exit ($quit) in: $branch" >&2; return 1; }
-  [ "$scrub" -lt "$gate" ] && [ "$gate" -lt "$quit" ] ||
-    { echo "wrong order: scrub $scrub, contained=false $gate, exit $quit" >&2; return 1; }
+  [ -n "$scrub" ] && [ -n "$quit" ] ||
+    { echo "missing scrub ($scrub) or exit ($quit) in: $branch" >&2; return 1; }
+  [ "$scrub" -lt "$quit" ] || { echo "wrong order: scrub $scrub, exit $quit" >&2; return 1; }
+  refute_contains "$branch" 'contained_exit'
+  refute_contains "$branch" ">>\"\$GITHUB_OUTPUT\""
+}
+
+# I2：守卫在验证命令起来之后从哪儿退出都先收组（EXIT trap），哪怕是中途一笔写失败被 set -e 打断。
+# 这里拿真的那几个函数，起一个真进程组，然后 set -e 之下一条 false：组必须被收掉，而且 trap 一声不吭、
+# 不改退出码。反过来，正常路径证明过之后（verify_settled）trap 什么都不做：不清通道、不改通过的结果。
+@test "split: an abort after the launch still reaps the verify group, and a settled exit is left alone" {
+  cat >"$BATS_TEST_TMPDIR/idle.sh" <<'EOS'
+#!/bin/sh
+i=0
+while [ "$i" -lt 600 ]; do /bin/sleep 0.1; i=$((i + 1)); done
+EOS
+  cat >"$BATS_TEST_TMPDIR/stub.sh" <<'EOS'
+verify_user=''
+verify_settled="${STUB_SETTLED:-}"
+verify_procs_baseline=''
+verify_leftovers=''
+verify_sweep_unanswerable=''
+user_procs() { printf ''; }
+set -m
+/bin/sh "$BATS_TEST_TMPDIR/idle.sh" >/dev/null 2>&1 </dev/null &
+verify_pgid=$!
+set +m
+echo "$verify_pgid" >"$BATS_TEST_TMPDIR/leftover.pid"
+trap verify_on_exit EXIT
+echo 'changed=true' >>"$GITHUB_OUTPUT"
+set -e
+[ -n "$verify_settled" ] || false
+exit 0
+EOS
+  local fns='scrub_file_commands verify_survivors verify_kill reap_verify_group unexplained_procs kill_unexplained verify_on_exit'
+
+  # shellcheck disable=SC2086  # 就是要按空格拆成多个函数名
+  run run_helper "$BATS_TEST_TMPDIR/stub.sh" $fns
+  assert_equal "$status" 1
+  assert_equal "$output" ''
+  pid="$(cat "$BATS_TEST_TMPDIR/leftover.pid")"
+  i=0
+  while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.1; i=$((i + 1)); done
+  ! kill -0 "$pid" 2>/dev/null || { echo "verify group $pid outlived the aborted guard" >&2; return 1; }
+  assert_equal "$(cat "$GITHUB_OUTPUT")" ''
+
+  : >"$GITHUB_OUTPUT"
+  # shellcheck disable=SC2086
+  STUB_SETTLED=1 run run_helper "$BATS_TEST_TMPDIR/stub.sh" $fns
+  assert_equal "$status" 0
+  assert_equal "$(step_output changed)" true
+  pid="$(cat "$BATS_TEST_TMPDIR/leftover.pid")"
+  kill -0 "$pid" 2>/dev/null || { echo 'a settled exit reaped the group anyway' >&2; return 1; }
 }
 
 # 验证正文拆成了两步定义（专用账号那一组函数单独一步，块大小，R43）。缺了那一组，
@@ -2127,6 +2179,8 @@ claude_mode_context() {
   gate_set steps.select.outputs.first claude
   gate_set steps.select.outcome success
   gate_set steps.claude_verify.outputs.changed true
+  # 验证那一步证明过名下没活进程才交这一行（I2）；没跑的话它压根不在
+  gate_set steps.claude_verify.outputs.contained true
 }
 
 @test "gating: a Claude round reaches the verify, push and summary steps" {
@@ -2168,29 +2222,49 @@ claude_mode_context() {
   gate_ran 'Say why this round pushed nothing'
 }
 
-# R41（Codex 2026-10-21 的 I1）：验证抓到残留、杀干净了（不交 contained=false）—— 这一轮照旧
+# R41（Codex 2026-10-21 的 I1）：验证抓到残留、杀干净了（交 contained=true）—— 这一轮照旧
 # 红着停下，但残留已经没了，Decide / Say why 可以安全地跑。它们俩手里有 GH_TOKEN，所以得证明
 # 它们确实没被 contained 这道门误伤。
-@test "gating: a killed leftover (contained unset) still lets the failure steps run" {
+@test "gating: a killed leftover (contained=true) still lets the failure steps run" {
   claude_mode_context
   gate_fails 'Verify the Claude fix'
+  gate_set steps.claude_verify.outputs.contained true
   gate_trace "$WF"
 
   gate_ran 'Decide the takeover'
   gate_ran 'Say why this round pushed nothing'
 }
 
-# 验证抓到一个杀不掉的残留 → 交出 contained=false。这时候它还活着、同一个 uid，Decide / Say why
-# 一跑就被它从 /proc/<pid>/environ 读走 GH_TOKEN。所以这两步必须跳过，整个 job 彻底红，由 Mac
-# 上的巡检重试 / 告警。
+# 验证抓到一个杀不掉的残留、或者守卫中途被打断（I2）→ 没有 contained=true。这时候它可能还活着、
+# 同一个 uid，Decide / Say why 一跑就被它从 /proc/<pid>/environ 读走 GH_TOKEN。所以这两步必须跳过，
+# 整个 job 彻底红，由 Mac 上的巡检重试 / 告警。正面门：没写就是没证明，写成别的值也一样。
 @test "gating: an uncontained leftover skips every failure step that holds a credential" {
-  claude_mode_context
-  gate_fails 'Verify the Claude fix'
-  gate_set steps.claude_verify.outputs.contained false
-  gate_trace "$WF"
+  for contained in '' false yes; do
+    claude_mode_context
+    gate_fails 'Verify the Claude fix'
+    gate_set steps.claude_verify.outputs.contained "$contained"
+    gate_trace "$WF"
 
-  gate_skipped 'Decide the takeover'
-  gate_skipped 'Say why this round pushed nothing'
+    gate_skipped 'Decide the takeover'
+    gate_skipped 'Say why this round pushed nothing'
+  done
+}
+
+# 两步都只认正面信号（I2）：被审 PR 的验证命令能把 contained=false 那一笔一起堵掉（它走的也是
+# GITHUB_OUTPUT），所以「没说 false」不能当成「没事」。Decide 只看 Claude 那一步：Codex 验证排在
+# 它后面，那时 steps.codex_verify 还不存在，写进去 Decide 就永远不跑。
+@test "gating: both credentialed failure steps open only on a positive containment signal" {
+  positive() { printf "(steps.%s.outcome == 'skipped' || steps.%s.outputs.contained == 'true')" "$1" "$1"; }
+  decide="$(step_key "$WF" 'Decide the takeover' if)"
+  say_why="$(step_key "$WF" 'Say why this round pushed nothing' if)"
+  assert_contains "$decide" "$(positive claude_verify)"
+  refute_contains "$decide" 'codex_verify'
+  assert_contains "$say_why" "$(positive claude_verify)"
+  assert_contains "$say_why" "$(positive codex_verify)"
+  refute_contains "$(cat "$REPO_ROOT/$WF")" 'contained=false'
+  refute_contains "$(cat "$REPO_ROOT/$WF")" "contained != 'false'"
+  # contained=true 只有两处来源：起来之前就退出的那一处，和 contained_exit
+  assert_equal "$(fix_guard_body verify_the_fix | grep -c "contained=true' >>")" 2
 }
 
 # 推送被拒：同样一个字都没人说过，同样得有人说。

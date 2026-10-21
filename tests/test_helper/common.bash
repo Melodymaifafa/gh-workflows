@@ -646,6 +646,15 @@ EOF
   )
 }
 
+# 测试种出来、号码记在 leftover.pid 的那个载荷：收掉它，别让它活到后面几条测试里去。
+# pid 为 0 / 1 / 空的时候绝不 kill —— kill 0 会打到我们自己这一整个进程组。
+reap_planted_pid() {
+  local pid
+  pid="$(cat "$BATS_TEST_TMPDIR/leftover.pid" 2>/dev/null || true)"
+  case "$pid" in ''|0|1) return 0 ;; *[!0-9]*) return 0 ;; esac
+  kill -9 "$pid" 2>/dev/null || true
+}
+
 # step_output <name>：读回 $GITHUB_OUTPUT 里的值（支持 name=v 和 name<<EOF 多行写法，后写的赢）。
 step_output() {
   awk -v want="$1" '

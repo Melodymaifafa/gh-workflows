@@ -646,6 +646,11 @@ jobs:
           verify_the_fix() {
             set -euo pipefail
 
+            # 验证命令起来之前就退出（没改动、没命令、ps 不在……）：被审 PR 的代码一行都还没跑，交
+            # contained=true，Decide / Say why 照常跑（正面信号的另一处见 contained_exit）。起来之后换成 verify_on_exit。
+            contained_before_launch() { echo 'contained=true' >>"$GITHUB_OUTPUT" || true; }
+            trap contained_before_launch EXIT
+
             # 我们自己跑的每一条命令，都必须来自「验证命令写不动」的目录。runner 的
             # PATH 前几项在 $HOME 下（`.local/bin` 之类），验证命令跟我们同一个用户，
             # 往那儿放一个假 ps 就能把自己从清点里隐掉，放一个假 git 就能报一棵假的树
@@ -1127,27 +1132,27 @@ jobs:
                       -c 'umask 002; exec "$0" -euo pipefail -c "$1"' \
                       "$verify_bash" "$VERIFY"
             }
-            # 它造出来的文件和目录，我们回头也要写得动（验证跑完那次 add -u、下一轮交接
-            # 前的 git clean -fdx）。目录 setgid 让组跟着工作区，umask 002 让那个组写得动
-            # —— 那句 umask 设在 sudo 起的命令里面（上面写了为什么）。回退路径不改。
-            set -m
-            launch_the_verify_command </dev/null &
-            verify_pgid=$!
-            set +m
-            verify_status=0
-            wait "$verify_pgid" || verify_status=$?
-
             # 会应用到后面步骤的那几个文件命令通道（同 Put back 清的集合，不含只渲染的 step summary）。
             # 子孙直接写真文件 —— GITHUB_ENV 一行 BASH_ENV 抢在 PATH 过滤 / 换 HOME 之前跑；PATH/OUTPUT 同理。
             # STATE 没有下游（run: 步骤没有 post），一起清只为了一份写坏的 state 不把这一步弄红。
+            # 文件归我们，所以总是我们赢（I2）：回退路径上验证命令能 chmod a-w 其中一个、或换成 symlink / 目录 /
+            # FIFO。这里先补回属主写权限（文件和所在目录），不是普通文件的换成空的普通文件，再截断。从不打断守卫
+            # （以前一次截断失败，set -e 就跳过了下面的收组）：哪个还不是空的普通文件就返回非零，由调用处决定。
             scrub_file_commands() {
-              local fc
+              local fc bad=0
               for fc in "${GITHUB_ENV:-}" "${GITHUB_OUTPUT:-}" "${GITHUB_PATH:-}" "${GITHUB_STATE:-}"; do
-                [ -z "$fc" ] || : >"$fc"
+                [ -n "$fc" ] || continue
+                chmod u+w "${fc%/*}" 2>/dev/null || true
+                if [ -L "$fc" ] || { [ -e "$fc" ] && [ ! -f "$fc" ]; }; then
+                  [ -L "$fc" ] || [ ! -d "$fc" ] || chmod -R u+w "$fc" 2>/dev/null || true
+                  rm -rf "$fc" 2>/dev/null || true
+                fi
+                [ ! -f "$fc" ] || chmod u+w "$fc" 2>/dev/null || true
+                { : >"$fc"; } 2>/dev/null || true
+                { [ -f "$fc" ] && [ ! -L "$fc" ] && [ ! -s "$fc" ]; } || bad=1
               done
+              return "$bad"
             }
-            # 紧接 wait 先清一次；退出后、收干净前补写的那一笔盖不住，下面清点证明没活进程后再清（C1）。
-            scrub_file_commands
 
             # 组里还活着的进程。僵尸不算：它已经死了，只是还没被收尸。
             verify_survivors() {
@@ -1177,17 +1182,7 @@ jobs:
               [ -z "$(verify_survivors)" ]
             }
 
-            if ! reap_verify_group; then
-              # 收不掉跟下面「杀不掉的残留」同一个处置（fix round 3）：它还活着，可能已经往文件命令
-              # 通道写了 BASH_ENV；清掉，再交出 contained=false，让 Decide / Say why 也跳过。
-              scrub_file_commands
-              echo 'contained=false' >>"$GITHUB_OUTPUT"
-              echo '- verification: **rejected**, it left a process running' >>"$GITHUB_STEP_SUMMARY"
-              echo "::error::the verify command left live processes behind ($(verify_survivors | tr '\n' ' ')); refusing to trust anything it ran"
-              exit 1
-            fi
-
-            # 上面按组号收完了，这里要那份正面证据：这个用户名下再没有「不是基线里的、
+            # 按组号收完之后还要那份正面证据：这个用户名下再没有「不是基线里的、
             # 也不是我们自己后代的」活进程。逃出进程组（setsid / 双重 fork）、关光继承
             # 的描述符、改掉环境变量，都换不掉 uid，所以这份清点它退不出去。
             # 「我们自己的后代」按当下这一份快照里的父子链认：验证命令那棵树的头已经被
@@ -1286,12 +1281,73 @@ jobs:
               [ -z "$verify_leftovers" ]
             }
 
+            # 清点证明它名下没活进程之后清通道：清不掉就红着停下，不交 contained=true（I2）。
+            scrub_or_refuse() {
+              scrub_file_commands && return 0
+              echo '::error::a runner file-command file is still not an empty regular file after the process sweep; refusing to report the verify step as contained'
+              exit 1
+            }
+
+            # 正面信号（I2）：Decide / Say why 只认 contained=true。只写在这里和「验证命令起来之前就退出」那一处
+            # （contained_before_launch）：清点已经证明它名下没活进程，而且最后这一次清通道成功了。
+            # 已知缺口（R42）：同一个 uid 下一个 SIGKILL 都停不了的残留，仍然伪造得了这一行。
+            contained_exit() { # contained_exit <退出码> [先写进 GITHUB_OUTPUT 的行]...
+              local rc="$1" line
+              shift
+              scrub_or_refuse
+              for line in "$@"; do echo "$line" >>"$GITHUB_OUTPUT"; done
+              echo 'contained=true' >>"$GITHUB_OUTPUT"
+              exit "$rc"
+            }
+
+            # 验证命令起来之后的任何出口，包括中途哪一笔写失败、被 set -e 打断（I2），都先尽力收组、清点、
+            # 杀残留、再清通道，一声不吭。这里不写 contained=true：中途退出的一律算没证明。
+            # 正常路径自己收过、证明过（verify_settled），这里就什么都不做，不改它的结果，也不重复报。
+            verify_on_exit() {
+              local rc=$?
+              set +e
+              if [ -z "$verify_settled" ]; then
+                {
+                  reap_verify_group
+                  if verify_leftovers="$(unexplained_procs)"; then kill_unexplained; fi
+                  scrub_file_commands
+                } >/dev/null 2>&1
+              fi
+              exit "$rc"
+            }
+
+            # 它造出来的文件和目录，我们回头也要写得动（验证跑完那次 add -u、下一轮交接
+            # 前的 git clean -fdx）。目录 setgid 让组跟着工作区，umask 002 让那个组写得动
+            # —— 那句 umask 设在 sudo 起的命令里面（上面写了为什么）。回退路径不改。
+            set -m
+            launch_the_verify_command </dev/null &
+            verify_pgid=$!
+            set +m
+            # 从这一刻起被审 PR 的代码在跑：之后从哪儿退出，verify_on_exit 都先把它收掉。
+            verify_settled=''
+            trap verify_on_exit EXIT
+            verify_status=0
+            wait "$verify_pgid" || verify_status=$?
+
+            # 紧接 wait 先清一次。这时候还没收组，它可能还活着跟我们抢，所以失败只记一笔、照样往下收（I2）。
+            # 退出后、收干净前补写的那一笔这里盖不住，下面清点证明没活进程之后再清，那一次清不掉才红（C1）。
+            scrub_file_commands ||
+              echo '::warning::a runner file-command file could not be emptied right after the verify command; it is emptied again once the process sweep is clean'
+
+            if ! reap_verify_group; then
+              # 收不掉跟下面「杀不掉的残留」同一个处置（fix round 3）：它还活着，可能已经往文件命令
+              # 通道写了 BASH_ENV；清掉，不交 contained=true，Decide / Say why 于是跳过。
+              scrub_file_commands || true
+              echo '- verification: **rejected**, it left a process running' >>"$GITHUB_STEP_SUMMARY"
+              echo "::error::the verify command left live processes behind ($(verify_survivors | tr '\n' ' ')); refusing to trust anything it ran"
+              exit 1
+            fi
+
             if ! verify_tree_is_contained; then
               verify_leftovers_seen="$verify_leftovers"
-              # 「问不出来」= 门自己坏了（没 sudo / ps）：枚举不了就杀不了，fail closed（contained=false）。
+              # 「问不出来」= 门自己坏了（没 sudo / ps）：枚举不了就杀不了，fail closed（不交 contained=true）。
               if [ -n "$verify_sweep_unanswerable" ]; then
-                scrub_file_commands
-                echo 'contained=false' >>"$GITHUB_OUTPUT"
+                scrub_file_commands || true
                 echo '- verification: **rejected**, the leftover-process sweep could not be answered' >>"$GITHUB_STEP_SUMMARY"
                 echo "::error::cannot list the processes owned by uid $verify_uid after the verify command${verify_user:+ (the dedicated account $verify_user)}; refusing to read an unanswerable sweep as containment"
                 exit 1
@@ -1301,22 +1357,24 @@ jobs:
               origins="$(leftover_origins | tr '\n' ';')"
               killed_clean=0
               kill_unexplained || killed_clean=$?
-              scrub_file_commands   # 杀的过程中残留可能又补写了一笔，清掉再往下
+              scrub_file_commands || true   # 杀的过程中残留可能又补写了一笔，清掉再往下
               if [ "$killed_clean" -ne 0 ] || [ -n "$verify_sweep_unanswerable" ]; then
-                # 杀不干净：fail closed，gate 掉后面每一步。
-                echo 'contained=false' >>"$GITHUB_OUTPUT"
+                # 杀不干净：fail closed，不交 contained=true，gate 掉后面每一步。
                 echo '- verification: **rejected**, a process survived the kill' >>"$GITHUB_STEP_SUMMARY"
                 echo "::error::a process owned by uid $verify_uid${verify_user:+ (account $verify_user)} outlived the verify command and could not be killed ($(printf '%s' "$verify_leftovers" | tr '\n' ';')); failing the whole job so no credentialed step starts; cgroups: $origins"
                 exit 1
               fi
-              # 杀干净了：照旧红着停下、不 push，但 Decide / Say why 可安全跑，不交 contained=false。
+              # 杀干净了：照旧红着停下、不 push；最后一次清通道成功才交 contained=true，Decide / Say why 可安全跑。
+              verify_settled=1
               echo '- verification: **rejected**, a process it started outlived it (since killed)' >>"$GITHUB_STEP_SUMMARY"
               echo "::error::a process owned by uid $verify_uid${verify_user:+ (account $verify_user)} outlived the verify command and was killed before the credentials returned ($verify_leftovers_seen); cgroups: $origins"
-              exit 1
+              contained_exit 1
             fi
 
             # 清点干净：补写的那一笔这里再清一次（C1），排在指纹 / 树 / changed 和各 reject 分支之前。
-            scrub_file_commands
+            # 清不掉就红着停下（I2）。之后的每个出口都走 contained_exit，中途被打断的不交信号。
+            scrub_or_refuse
+            verify_settled=1
 
             # 清点证明「此刻它名下没人」之后，立刻把写工作区的能力也收回：把账号从工作区
             # 那个组里摘出去。这一道专治「过后有人来」—— 一个排好的 cron 任务起来时
@@ -1340,7 +1398,7 @@ jobs:
             if [ -L "$git_dir/config" ] || [ ! -f "$git_dir/config" ]; then
               echo '- verification: **rejected**, .git/config is no longer a regular file' >>"$GITHUB_STEP_SUMMARY"
               echo '::error::.git/config is no longer a regular file; refusing to restore the credentials into it'
-              exit 1
+              contained_exit 1
             fi
 
             # 这一比对必须排在「把凭据塞回去」之前：凭据一回到 .git/config，下一步就
@@ -1348,7 +1406,7 @@ jobs:
             if [ "$(git_state_digest)" != "$git_state_before" ]; then
               echo '- verification: **rejected**, the verify command modified .git' >>"$GITHUB_STEP_SUMMARY"
               echo '::error::the verify command modified .git (hooks or config); refusing to run any credentialed git command on this checkout'
-              exit 1
+              contained_exit 1
             fi
 
             # 报「哪一条变了」，不要只报「变了」：出事的时候这一行就是证据。两份快照
@@ -1375,7 +1433,7 @@ jobs:
             if [ "$ref_state_after" != "$ref_state_before" ]; then
               echo '- verification: **rejected**, it moved a ref or left a git operation half-done' >>"$GITHUB_STEP_SUMMARY"
               echo "::error::the verify command changed HEAD, a ref or an in-progress git operation ($(ref_state_changes)); refusing to commit or push on top of it"
-              exit 1
+              contained_exit 1
             fi
 
             # 同一道门的另一半，位置和理由跟上面那条指纹一样：排在「把凭据塞回去」
@@ -1410,14 +1468,14 @@ jobs:
               if [ -n "$offenders" ]; then
                 echo '- verification: **rejected**, it rewrote tracked files it is not allowed to touch' >>"$GITHUB_STEP_SUMMARY"
                 echo "::error::the verify command rewrote tracked files outside verify_writable_paths:$offenders; refusing to commit or push"
-                exit 1
+                contained_exit 1
               fi
             fi
 
             if [ "$verify_status" -ne 0 ]; then
               echo '- verification: **failed**, nothing was pushed' >>"$GITHUB_STEP_SUMMARY"
               echo "::error::verification failed after the $FIXER fix; the change was not pushed"
-              exit 1
+              contained_exit 1
             fi
 
             # 提交的必须是验过的那棵树。验证本身会改被跟踪的文件 —— `uv sync --dev`
@@ -1428,8 +1486,7 @@ jobs:
             sealed_git add -u
 
             # 写 changed 之前再清最后一次（C1）：清点和这里之间又补一笔的短命子进程这下盖掉。
-            scrub_file_commands
-            echo 'changed=true' >>"$GITHUB_OUTPUT"
+            contained_exit 0 changed=true
           }
 
           {
@@ -2928,12 +2985,12 @@ jobs:
       # 也好、代码没修好也好，都不许留下一个绿勾。
       - name: Decide the takeover
         id: decide
-        # contained != 'false'：Claude 验证抓到一个杀不掉的残留时交出 contained=false
-        # （Ruling R41）。这一步用 !cancelled()，验证红了它照样跑、手里有 GH_TOKEN 和
-        # Pushover 密钥 —— 残留从 /proc/<pid>/environ 读得到。杀不掉就连这一步一起跳过，
-        # job 彻底红，由 Mac 上的巡检重试。只认 claude_verify：Codex 验证排在这一步之后，
+        # 正面门（R41 / I2）：Claude 验证没跑，或者它交出了 contained=true（清点证明名下没活进程）才跑。
+        # 这一步用 !cancelled()，验证红了它照样跑、手里有 GH_TOKEN 和 Pushover 密钥 —— 残留从
+        # /proc/<pid>/environ 读得到。所以收不掉、杀不掉、守卫中途被打断，都没有那一行，这一步跟着
+        # 跳过，job 彻底红，由 Mac 上的巡检重试。只认 claude_verify：Codex 验证排在这一步之后，
         # 那条路的 contained 由排在最后的 Say why 把门。
-        if: ${{ !cancelled() && steps.gate.outputs.run == 'true' && steps.select.outcome == 'success' && steps.claude_verify.outputs.contained != 'false' }}
+        if: ${{ !cancelled() && steps.gate.outputs.run == 'true' && steps.select.outcome == 'success' && (steps.claude_verify.outcome == 'skipped' || steps.claude_verify.outputs.contained == 'true') }}
         env:
           REVIEW_FIXER: ${{ inputs.review_fixer }}
           FIRST: ${{ steps.select.outputs.first }}
@@ -3830,10 +3887,10 @@ jobs:
       # 跑不通（wechat-mimic-finetune，2026-10-01），以及这个仓库自己「改好了但推不上去」
       # （令牌不许改 workflow 文件，2026-10-04 四条红 run，PR 上全程没有一个字）。
       # 本步只补说明，不再额外打红：job 早已经红了。同一个 head 同一原因只发一次。
-      # contained != 'false'：同 Decide the takeover —— 验证抓到杀不掉的残留时它也手握
-      # GH_TOKEN / Pushover，一起跳过（巡检重试 / 告警，Ruling R41）。
+      # 正面门：同 Decide the takeover —— 它也手握 GH_TOKEN / Pushover，两个验证步骤各自要么没跑、
+      # 要么交出 contained=true 才跑，否则一起跳过（巡检重试 / 告警，Ruling R41 / I2）。
       - name: Say why this round pushed nothing
-        if: ${{ failure() && steps.claude_verify.outputs.contained != 'false' && steps.codex_verify.outputs.contained != 'false' }}
+        if: ${{ failure() && (steps.claude_verify.outcome == 'skipped' || steps.claude_verify.outputs.contained == 'true') && (steps.codex_verify.outcome == 'skipped' || steps.codex_verify.outputs.contained == 'true') }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
