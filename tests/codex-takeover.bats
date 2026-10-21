@@ -834,8 +834,6 @@ git config --local --get http.https://github.com/.extraheader >>"$probe" ||
 # 假 gh 的目录，后面「召唤复审」那步就会跑那个假 gh —— 而那步带的是
 # CODEX_TRIGGER_TOKEN。验证子进程拿到的必须是废纸篓文件。
 @test "takeover: the PR's own verify command cannot poison the next steps' PATH or env" {
-  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
-  : >"$GITHUB_PATH"
   push_workspace 'printf "%s\n" "$PWD/evil-bin" >>"$GITHUB_PATH"
 printf "SNEAK=yes\n" >>"$GITHUB_ENV"'
 
@@ -851,8 +849,6 @@ printf "SNEAK=yes\n" >>"$GITHUB_ENV"'
 # （效果等同捞回来，但不依赖 /proc 在不在），要守的是：验证跑完那两个文件被清空，
 # runner 在 step 收尾时读到的是空的。
 @test "takeover: a verify command that recovers the real runner file paths still cannot poison them" {
-  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
-  : >"$GITHUB_PATH"
   export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV"
   push_workspace 'printf "%s\n" "$PWD/evil-bin" >>"$REAL_PATH_FILE"
 printf "SNEAK=yes\n" >>"$REAL_ENV_FILE"'
@@ -1565,8 +1561,6 @@ EOS
 # 守的是：清点证明没活进程之后再清一次文件命令通道，所以 BASH_ENV 到不了后面的步骤。
 # 两条子进程各打一个时点：收到 TERM 才补写的（活到被收那一刻），和 leader 退出后晚一瞬的短命的。
 @test "takeover: a TERM-trapping child's BASH_ENV written after the truncation never survives" {
-  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
-  : >"$GITHUB_PATH"
   export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV" PLANT_PIDFILE="$BATS_TEST_TMPDIR/leftover.pid"
   # 子进程不拿 bats 的输出管道、号码记进 leftover.pid：守卫哪天没收掉它，这条是红而不是把整套
   # 卡到 job 超时（2026-10-21 PR #75 自己的验证就这样卡满了 60 分钟），teardown 再把它收掉。
@@ -1580,17 +1574,146 @@ true'
   while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.1; i=$((i + 1)); done
   ! kill -0 "$pid" 2>/dev/null || { echo "planted child $pid outlived the guard" >&2; return 1; }
   refute_contains "$(cat "$GITHUB_ENV")" 'BASH_ENV'
-  [ -z "${GITHUB_PATH:-}" ] || refute_contains "$(cat "$GITHUB_PATH")" '/tmp'
+  refute_contains "$(cat "$GITHUB_PATH")" '/tmp'
 }
 
 @test "takeover: a short-lived child's BASH_ENV written just after the leader exits never survives" {
-  export GITHUB_PATH="$BATS_TEST_TMPDIR/github_path"
-  : >"$GITHUB_PATH"
   export REAL_PATH_FILE="$GITHUB_PATH" REAL_ENV_FILE="$GITHUB_ENV"
   push_workspace '( sleep 0.02; printf "BASH_ENV=/tmp/evil-bash-env\n" >>"$REAL_ENV_FILE" ) &
 true'
   run_verify
   refute_contains "$(cat "$GITHUB_ENV")" 'BASH_ENV'
+}
+
+# ---------- 验证命令弄坏守卫的那一笔写，门照样关着（I2，hotfix 1d）----------
+#
+# 回退路径上验证命令跟我们同一个用户：它能摸回真文件命令的路径（这里由 REAL_FC 直接递给它，同
+# 上面那两条），往里写一笔、把它弄成写不动，再留一个后台进程。以前收组之前那次截断一失败，set -e
+# 就结束了守卫：组没收，也没人写 contained=false，Decide / Say why 带着令牌在一棵活树旁边开跑。
+# 现在：后台进程一定收掉；四个会应用到后面步骤的文件归我们，守卫拿回来清空，清点证明名下没人
+# 才交 contained=true（这时候它是真的）；证明之后守卫自己那笔写被堵死（step summary），中途退出也照样交。
+# 文件命令挪进一个单独的目录，目录那一种才弄得坏它；teardown 把权限还回去。
+# 后台进程是 leftover_probe：不拿 bats 的输出管道，号码记进 leftover.pid，teardown 收。
+run_sabotaged() { # run_sabotaged <GITHUB_* 变量名> <验证命令里弄坏 $REAL_FC 的那几句>
+  local d="$BATS_TEST_TMPDIR/file-commands" i=0
+  mkdir -p "$d"
+  export GITHUB_ENV="$d/env" GITHUB_OUTPUT="$d/output" GITHUB_PATH="$d/path" \
+         GITHUB_STATE="$d/state" GITHUB_STEP_SUMMARY="$d/summary"
+  : >"$GITHUB_ENV"; : >"$GITHUB_OUTPUT"; : >"$GITHUB_PATH"; : >"$GITHUB_STATE"; : >"$GITHUB_STEP_SUMMARY"
+  export REAL_FC="${!1}"
+  push_workspace "$2
+$(leftover_probe)
+exit 1"
+  run_verify
+  [ -s "$BATS_TEST_TMPDIR/leftover.pid" ] || { echo 'the background probe never started' >&2; return 1; }
+  while [ "$i" -lt 20 ] && [ "$(leftover_state)" = alive ]; do /bin/sleep 0.1; i=$((i + 1)); done
+  assert_equal "$(leftover_state)" gone
+  assert_equal "$status" 1
+}
+
+# 四个会应用到后面步骤的文件：守卫赢回来，写进去的那一笔不在了，文件还是一个写得动的普通文件。
+assert_taken_back() {
+  [ -f "$REAL_FC" ] && [ ! -L "$REAL_FC" ] && [ -w "$REAL_FC" ] ||
+    { echo "$REAL_FC is not a writable regular file after the step" >&2; return 1; }
+  refute_contains "$(cat "$REAL_FC")" 'BASH_ENV'
+  assert_equal "$(step_output contained)" true
+}
+
+LOCK_IT='printf "BASH_ENV=/tmp/evil-bash-env\n" >>"$REAL_FC"; chmod a-w "$REAL_FC"'
+
+@test "contained: a read-only GITHUB_ENV plus a background process never skips the reap" {
+  run_sabotaged GITHUB_ENV "$LOCK_IT"
+  assert_taken_back
+}
+
+@test "contained: a read-only GITHUB_OUTPUT plus a background process never skips the reap" {
+  run_sabotaged GITHUB_OUTPUT "$LOCK_IT"
+  assert_taken_back
+}
+
+@test "contained: a read-only GITHUB_PATH plus a background process never skips the reap" {
+  run_sabotaged GITHUB_PATH "$LOCK_IT"
+  assert_taken_back
+}
+
+@test "contained: a read-only GITHUB_STATE plus a background process never skips the reap" {
+  run_sabotaged GITHUB_STATE "$LOCK_IT"
+  assert_taken_back
+}
+
+# step summary 不在清空的那一组里（它只渲染）。守卫红着停下时要往里写一行，写不进去就中途退出。
+# 那时候清点已经证明名下没人，所以 EXIT trap 照样清通道、交 contained=true：信号是真的，告警不丢。
+@test "contained: a read-only step summary ends the guard early and the proven tree keeps its signal" {
+  run_sabotaged GITHUB_STEP_SUMMARY "$LOCK_IT"
+  assert_equal "$(step_output contained)" true
+}
+
+@test "contained: a read-only file-command directory with the file gone is taken back the same way" {
+  run_sabotaged GITHUB_ENV 'mv "$REAL_FC" "$REAL_FC.gone"; chmod a-w "${REAL_FC%/*}"'
+  assert_taken_back
+}
+
+# 目录设成 000：只补写权限的话进都进不去、也截不了。守卫补回目录的 rwx。
+@test "contained: a file-command directory set to 000 is taken back the same way" {
+  run_sabotaged GITHUB_ENV 'printf "BASH_ENV=/tmp/evil-bash-env\n" >>"$REAL_FC"; chmod 000 "${REAL_FC%/*}"'
+  assert_taken_back
+}
+
+@test "contained: a file command swapped for a symlink to a read-only file is taken back the same way" {
+  planted="$BATS_TEST_TMPDIR/planted-env"
+  export PLANTED="$planted"
+  run_sabotaged GITHUB_ENV 'printf "BASH_ENV=/tmp/evil-bash-env\n" >"$PLANTED"; chmod a-w "$PLANTED"
+rm -f "$REAL_FC"; ln -s "$PLANTED" "$REAL_FC"'
+  assert_taken_back
+  # 换回来的是我们自己的新文件，没有顺着快捷方式去写它指的那份
+  assert_contains "$(cat "$planted")" 'BASH_ENV'
+}
+
+# 守卫在清点证明之后还要写别的地方（$RUNNER_TEMP 下的新钩子目录、临时索引）。那里写不进去，守卫就
+# 中途退出：后台进程已经收掉，EXIT trap 照样清通道、交 contained=true，这一步照旧红。
+# 这一条打的是「证明之后」：后台进程在中途退出之前就被正常路径收掉了。「证明之前」被打断时 trap
+# 自己收组那一半，端到端造不出来（收组之前已经没有会致命的写），由 claude-verify-creds.bats 里
+# 「split: an abort after the launch still reaps the verify group; …」那条拿真函数钉住。
+@test "contained: an abort after the proof keeps a true signal and a red step" {
+  push_workspace "chmod a-w \"\$RUNNER_TEMP\"
+$(leftover_probe)
+true"
+  run_verify
+  chmod u+w "$RUNNER_TEMP"
+  [ -s "$BATS_TEST_TMPDIR/leftover.pid" ] || { echo 'the background probe never started' >&2; return 1; }
+  i=0
+  while [ "$i" -lt 20 ] && [ "$(leftover_state)" = alive ]; do /bin/sleep 0.1; i=$((i + 1)); done
+  assert_equal "$(leftover_state)" gone
+  [ "$status" -ne 0 ]
+  assert_equal "$(step_output contained)" true
+  assert_equal "$(git show -s --format=%s origin/topic)" 'base'
+}
+
+# 正面那一半：门只在证明过之后才开，但证明过了就一定开 —— 验证正常失败、正常通过、压根没东西
+# 可验（没跑被审 PR 的代码），三种都交 contained=true，Decide / Say why 照常跑。
+@test "contained: a verification that fails normally is red and still reports contained=true" {
+  push_workspace 'exit 1'
+  run_verify
+  assert_equal "$status" 1
+  assert_equal "$(step_output contained)" true
+}
+
+@test "contained: a passing verification reports contained=true next to changed=true" {
+  push_workspace 'true'
+  run_verify
+  assert_equal "$status" 0
+  assert_equal "$(step_output changed)" true
+  assert_equal "$(step_output contained)" true
+}
+
+@test "contained: a round with nothing to verify reports contained=true before running any PR code" {
+  push_workspace 'echo ran >"$BATS_TEST_TMPDIR/verify-ran.txt"'
+  git checkout -q -- app.txt
+  run_verify
+  assert_equal "$status" 0
+  assert_equal "$(step_output changed)" false
+  assert_equal "$(step_output contained)" true
+  [ ! -e "$BATS_TEST_TMPDIR/verify-ran.txt" ]
 }
 
 # ---------- 按需拉起来的服务进基线，清点那一边一点不放宽 ----------
@@ -1624,15 +1747,8 @@ drop_probe_units() {
 teardown() {
   [ -z "${MEL288_PROBE_UNITS:-}" ] || drop_probe_units
   reap_planted_pid
-}
-
-# 两条反面测试种出来的那个载荷：收掉它，别让它活到后面几条测试里去。
-# pid 为 0 / 1 / 空的时候绝不 kill —— kill 0 会打到我们自己这一整个进程组。
-reap_planted_pid() {
-  local pid
-  pid="$(cat "$BATS_TEST_TMPDIR/leftover.pid" 2>/dev/null || true)"
-  case "$pid" in ''|0|1) return 0 ;; *[!0-9]*) return 0 ;; esac
-  kill -9 "$pid" 2>/dev/null || true
+  # contained: 那几条把目录弄成写不动；守卫坏了的话权限留在那儿，bats 清不掉临时目录
+  chmod u+rwx "$BATS_TEST_TMPDIR/file-commands" "$RUNNER_TEMP" 2>/dev/null || true
 }
 
 # 机器上「由某个正在监听的 socket 按需拉起来、而且定义文件落在我们写不动的 /usr 下面」的
