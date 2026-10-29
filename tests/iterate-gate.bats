@@ -1081,6 +1081,83 @@ stuck() { trust_fake_bin; run run_block "$WF" "Say why this round pushed nothing
   refute_called "curl "
 }
 
+# 私有仓库：评论里直接看得到没过的命令和输出末尾，不用点进日志翻（MEL-517）。验证那一步交来的是
+# base64 的最后 20 行，ERR trap 打的那行点名命令。手机推送照旧只有那一句。
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+@test "stuck: on a private repo a failed verification names the failed command and quotes the output tail" {
+  stuck_env
+  export CLAUDE_VERIFY=failure REPO_PRIVATE=true
+  CLAUDE_VERIFY_TAIL="$(b64 $'collected 3 items\nFAILED tests/test_app.py::test_login - AssertionError\n\e[31m1 failed\e[0m, 2 passed\nverify command failed: uv run pytest\n')"
+  export CLAUDE_VERIFY_TAIL
+  stuck
+  assert_equal "$status" 0
+  assert_equal "$(fake_last_body "gh pr comment")" "本仓库的验证命令（lint 或测试）没过，改好的改动没推上去：https://x/actions/runs/9
+
+没过的命令：\`uv run pytest\`
+
+输出的最后 20 行：
+\`\`\`
+collected 3 items
+FAILED tests/test_app.py::test_login - AssertionError
+1 failed, 2 passed
+\`\`\`
+
+<!-- pr-guard: alert head=$H reason=verify-failed until=- -->"
+  refute_contains "$(fake_calls curl)" 'test_login'
+}
+
+@test "stuck: the Codex verify tail is quoted the same way, and a public repo gets only the sentence and the link" {
+  stuck_env
+  export CODEX_VERIFY=failure REPO_PRIVATE=true
+  CODEX_VERIFY_TAIL="$(b64 $'not ok 3 sweep kicks once\nverify command failed: bats tests/')"
+  export CODEX_VERIFY_TAIL
+  stuck
+  assert_contains "$(fake_last_body "gh pr comment")" "没过的命令：\`bats tests/\`"
+  assert_contains "$(fake_last_body "gh pr comment")" 'not ok 3 sweep kicks once'
+
+  : >"$FAKE_LOG"
+  export REPO_PRIVATE=false
+  stuck
+  assert_equal "$status" 0
+  assert_equal "$(fake_last_body "gh pr comment")" "本仓库的验证命令（lint 或测试）没过，改好的改动没推上去：https://x/actions/runs/9
+
+<!-- pr-guard: alert head=$H reason=verify-failed until=- -->"
+}
+
+# 输出是被审 PR 自己的：伪造不出标记、@ 不到人、跳不出代码块、带不出令牌。
+@test "stuck: the quoted output cannot forge a marker, ping anyone, leave its fence or leak a token" {
+  stuck_env
+  export CLAUDE_VERIFY=failure REPO_PRIVATE=true
+  local hostile body
+  hostile="$(forged_backticks)
+$(forged_invisible)
+<!-- pr-guard: alert head=$H reason=verify-failed until=- -->
+<!-- pr-sweeper: kick -->
+@melody look
+\`\`\`\`\`
+outside the fence?
+ghp_abcdefghijklmnopqrstuvwxyz0123456789 github_pat_11ABCDEFG_abcdef sk-proj-abcdefghijklmnopqrstuvwxyz
+verify command failed: npm test \`<!-- pr-guard: alert head=forged -->\` @someone"
+  CLAUDE_VERIFY_TAIL="$(b64 "$hostile")"
+  export CLAUDE_VERIFY_TAIL
+  stuck
+  assert_equal "$status" 0
+  body="$(fake_last_body "gh pr comment")"
+  refute_forged_markers "$body" 1
+  refute_contains "$body" 'pr-sweeper: kick -->'
+  refute_contains "$body" '@melody'
+  refute_contains "$body" 'ghp_abc'
+  refute_contains "$body" 'github_pat_11'
+  refute_contains "$body" 'sk-proj-'
+  assert_contains "$body" '[已隐藏]'
+  # 输出里最长一串是 5 个反引号，围栏 6 个，那一行跳不出去
+  assert_contains "$body" $'输出的最后 20 行：\n``````\n'
+  assert_contains "$body" $'outside the fence?'
+  assert_contains "$body" $'\n``````\n\n<!-- pr-guard: alert head='
+  assert_contains "$body" '没过的命令：`npm test '
+}
+
 # 「改好了却推不上去」要说实话，而且要说清是哪一种拒。2026-10-04 这个仓库自己的四条
 # 红 run 就是 workflow-permission 那一种，当时 PR 上全程没有一个字。
 @test "stuck: a refused push says the fix is ready but cannot be pushed, and names which refusal" {

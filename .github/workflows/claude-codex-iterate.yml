@@ -202,11 +202,13 @@ jobs:
           # 额度类（fix-quota / review-quota）：已告警过但这次 until 更晚 → 静默补一条新 until 的标记，
           # 巡检才知道要等到新的重置时间；其余原因同 (head, 原因) 只发一次。
           # 第 5 个参数可选：只进评论、不进手机推送的额外标记行（如 carried-findings）。
+          # 第 6 个参数可选：只进评论、不进手机推送的正文，接在话后面（如验证没过时的输出末尾：Pushover
+          # 超过 1024 字整条发不出去）。
           alert_once() {
-            local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" prev body resume
+            local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" detail="${6:-}" prev body resume
             # 告警的话里不许有 HTML 注释：标记只由下面这几行加，第 5 个参数也是调用处自己的标记。
-            # 话里会带外部文字（被拒的文件名、意见标题、judge 列的 bug），见 only_own_markers。
-            only_own_markers 0 "the $reason alert" "$msg" || return 1
+            # 话里会带外部文字（被拒的文件名、意见标题、judge 列的 bug、验证的输出），见 only_own_markers。
+            only_own_markers 0 "the $reason alert" "$msg$detail" || return 1
             # 已有可信标记里最大的 until：没有标记 = 空串，有标记但 until=- 记 0
             prev="$(trusted_comments | jq -r --arg m "<!-- pr-guard: alert head=$head reason=$reason " '
               [.[] | .body | select(contains($m))
@@ -214,8 +216,8 @@ jobs:
               | if length == 0 then "" else max end')"
             if [ -z "$prev" ]; then
               pushover "🤖 PR #$PR_NUMBER 自动修复停了" "$msg"
-              printf -v body '%s\n\n<!-- pr-guard: alert head=%s reason=%s until=%s -->' \
-                "$msg" "$head" "$reason" "$until"
+              printf -v body '%s%s\n\n<!-- pr-guard: alert head=%s reason=%s until=%s -->' \
+                "$msg" "$detail" "$head" "$reason" "$until"
             elif { [ "$reason" = fix-quota ] || [ "$reason" = review-quota ]; } && [ "$until" -gt "$prev" ]; then
               resume="$(date -u -d "@$((until + 28800))" '+%m-%d %H:%M')"
               printf -v body '🤖 额度又用完了，改到北京时间 %s 后继续（不再重复推送）。\n\n<!-- pr-guard: alert head=%s reason=%s until=%s -->' \
@@ -684,7 +686,7 @@ jobs:
             done
             PATH="$trusted_path"
             # 少了哪一样都等于这一整步没法判定 —— 红着停下，别静默空转。
-            for tool in git ps awk sed cut id mktemp cp ls; do
+            for tool in git ps awk sed cut id mktemp cp ls mkfifo tee tail base64 tr; do
               command -v "$tool" >/dev/null 2>&1 && continue
               echo "::error::$tool is not available from a write-protected PATH entry; cannot verify this checkout safely"
               exit 1
@@ -1302,6 +1304,13 @@ jobs:
               exit "$rc"
             }
 
+            # 没过的那段输出的末尾，交给 Say why（tail=…）：20 行、最多 3 KB，base64 成一行 —— 原样写进 GITHUB_OUTPUT
+            # 的话，输出里一行 contained=true 或 x<<EOF 就伪造了一个 output。不是普通文件（被换成 symlink 之类）就不取。
+            verify_output_tail() {
+              { [ -f "$verify_out/log" ] && [ ! -L "$verify_out/log" ]; } || return 0
+              tail -n 20 "$verify_out/log" | tail -c 3072 | base64 | tr -d '\n'
+            }
+
             # 验证命令起来之后的任何出口，包括中途哪一笔写失败、被 set -e 打断（I2）：
             #   · 还没证明（verify_settled 空）：尽力收组、清点、杀残留、再清通道，一声不吭，不交信号；
             #   · 证明过、却在 contained_exit 之前被打断（summary 写不进、mktemp、add -u 失败……）：树已经
@@ -1325,6 +1334,17 @@ jobs:
               exit "$rc"
             }
 
+            # 验证没过时 Say why 要在 PR 上贴出没过的那条命令和输出末尾（MEL-517）。命令前面接一个 ERR trap：set -e
+            # 退出之前把那条命令打一行（接在第一行行首，报错里的行号照旧）。末尾补一行 exit $?：不然 bash -c 直接 exec
+            # 最后一条命令，trap 跟着没了（bash 3.2 实测），而最后一条多半就是测试。输出经 FIFO 交给我们自己起的 tee：
+            # 照样实时进日志，另存一份在只有我们进得去的目录里（专用账号进不去；回退到同一个用户时它本来就管得了自己的
+            # 输出）。tee 是我们的子进程，不在它的进程组里，清点也认得出是我们的。tee 不在就挂在 FIFO 上，所以上面查了它。
+            VERIFY="trap 'echo \"verify command failed: \$BASH_COMMAND\" >&2' ERR; $VERIFY"$'\n''exit $?'
+            verify_out="$(mktemp -d "$RUNNER_TEMP/verify-out-XXXXXX")"
+            mkfifo "$verify_out/pipe"
+            tee "$verify_out/log" <"$verify_out/pipe" &
+            verify_tee=$!
+
             # 它造出来的文件和目录，我们回头也要写得动（验证跑完那次 add -u、下一轮交接
             # 前的 git clean -fdx）。目录 setgid 让组跟着工作区，umask 002 让那个组写得动
             # —— 那句 umask 设在 sudo 起的命令里面（上面写了为什么）。回退路径不改。
@@ -1334,7 +1354,7 @@ jobs:
             verify_reported=''
             set -m
             trap - EXIT
-            launch_the_verify_command </dev/null &
+            launch_the_verify_command </dev/null >"$verify_out/pipe" 2>&1 &
             verify_pgid=$!
             set +m
             # 从这一刻起被审 PR 的代码在跑：之后从哪儿退出，verify_on_exit 都先把它收掉。
@@ -1388,6 +1408,8 @@ jobs:
             # 清不掉就红着停下（I2）。之后的每个出口都走 contained_exit，中途被打断的由 verify_on_exit 代调 contained_exit。
             scrub_or_refuse
             verify_settled=1
+            # 它名下再没有活进程，FIFO 也就再没人写：等 tee 读完最后一行，日志的先后和下面取的末尾才是全的。
+            wait "$verify_tee" || true
 
             # 清点证明「此刻它名下没人」之后，立刻把写工作区的能力也收回：把账号从工作区
             # 那个组里摘出去。这一道专治「过后有人来」—— 一个排好的 cron 任务起来时
@@ -1488,7 +1510,7 @@ jobs:
             if [ "$verify_status" -ne 0 ]; then
               echo '- verification: **failed**, nothing was pushed' >>"$GITHUB_STEP_SUMMARY"
               echo "::error::verification failed after the $FIXER fix; the change was not pushed"
-              contained_exit 1
+              contained_exit 1 "tail=$(verify_output_tail)"
             fi
 
             # 提交的必须是验过的那棵树。验证本身会改被跟踪的文件 —— `uv sync --dev`
@@ -3917,6 +3939,10 @@ jobs:
           CODEX_BLOCKED: ${{ steps.codex_push.outputs.blocked }}
           CLAUDE_RETRY: ${{ steps.claude_push.outputs.retry }}
           CODEX_RETRY: ${{ steps.codex_push.outputs.retry }}
+          # 验证没过时那段输出的末尾（base64，验证那一步清点证明它死透之后才取）。只贴进私有仓库的评论。
+          CLAUDE_VERIFY_TAIL: ${{ steps.claude_verify.outputs.tail }}
+          CODEX_VERIFY_TAIL: ${{ steps.codex_verify.outputs.tail }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
           # 这一轮修的那条 review：分支被人推过、修复没落地时，告警要点名它的意见。
           REVIEW_ID: ${{ steps.gate.outputs.target }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -4025,6 +4051,28 @@ jobs:
             exit 1
           }
 
+          # 私有仓库的 verify-failed：评论里接上没过的那条命令和输出末尾，不用再点进日志翻（MEL-517）。公开仓库
+          # 照旧只有那一句和链接；手机推送也只有那一句（alert_once 的第 6 个参数）。输出是被审 PR 自己的，跟下面
+          # 意见原文一样先清洗：去掉 ANSI 颜色、打码 sk- 开头的密钥，再过 defang。命令要套行内代码，反引号在
+          # defang 之前删（理由见下面那段）；输出放进代码块，围栏比里面最长的一串反引号还长，跳不出去。
+          detail=''
+          if [ "$reason" = verify-failed ] && [ "${REPO_PRIVATE:-}" = true ]; then
+            tail_b64="${CLAUDE_VERIFY_TAIL:-}"
+            [ -n "$tail_b64" ] || tail_b64="${CODEX_VERIFY_TAIL:-}"
+            if [ -n "$tail_b64" ]; then
+              # shellcheck disable=SC2016  # jq 程序
+              detail="$(jq -rn --arg b "$tail_b64" "$(defang_jq)"'
+                def scrub: gsub("\u001b\\[[0-?]*[ -/]*[@-~]"; "") | gsub("sk-[A-Za-z0-9_-]{20,}"; "[已隐藏]");
+                "verify command failed: " as $m
+                | ($b | @base64d | split("\n")) as $lines
+                | ([$lines[] | select(startswith($m))] | last // "" | ltrimstr($m) | gsub("`"; "") | .[0:200] | scrub | defang) as $cmd
+                | ([$lines[] | select(startswith($m) | not)] | join("\n") | sub("\n+$"; "") | scrub | defang) as $out
+                | ("`" * ([$out | scan("`+") | length] + [2] | max + 1)) as $fence
+                | (if $cmd == "" then "" else "\n\n没过的命令：`\($cmd)`" end)
+                  + "\n\n输出的最后 20 行：\n\($fence)\n\($out)\n\($fence)"')" || detail=''
+            fi
+          fi
+
           carry=''
           if [ "$reason" = findings-carried ]; then
             if [[ "${REVIEW_ID:-}" =~ ^[0-9]+$ ]]; then
@@ -4060,7 +4108,7 @@ jobs:
           # 拦合并的那个标记重试几次还是没发出去：手机上那条已经说了「不会自动合并」，可合并
           # 检查这时候根本看不到要拦什么。Pushover 不走 GitHub，再推一条说实话，让人自己拦；
           # 这一步照旧红着停下。
-          if ! alert_once "$HEAD_SHA" "$reason" - "$msg" "$carry"; then
+          if ! alert_once "$HEAD_SHA" "$reason" - "$msg" "$carry" "$detail"; then
             if [ -n "$carry" ]; then
               pushover "🤖 PR #$PR_NUMBER 要你手动拦一下" "上一条说这个 PR 不会自动合并，但拦合并的标记没发到 PR 上（GitHub 连着拒了几次）。它现在可能被自动合并，没修的意见会一起进去。先别让它合，自己处理：$PR_URL"
             fi

@@ -521,6 +521,62 @@ git config --local --get http.https://github.com/.extraheader >>"$probe" ||
   refute_called 'gh pr comment'
 }
 
+# 验证没过时 Say why 要在 PR 上贴出没过的那条命令和输出末尾（MEL-517）。交接走 step output，在清点证明它
+# 死透之后才取：最后 20 行、最多 3 KB，base64 成一行 —— 输出里一行 contained=true 伪造不出别的 output。
+# 输出照样进日志。
+verify_tail() { jq -rn --arg b "$(step_output tail)" '$b | @base64d'; }
+
+@test "claude: a failing verification hands over the failed command and its last 20 lines as one base64 output" {
+  push_workspace 'for i in $(seq 1 30); do echo "line $i"; done
+echo contained=true
+echo "FAILED tests/test_app.py::test_login" >&2
+false
+echo never'
+
+  run_verify
+
+  [ "$status" -ne 0 ]
+  assert_contains "$output" 'FAILED tests/test_app.py::test_login'
+  # 一行，只有 base64 的字符
+  [ -n "$(step_output tail)" ]
+  assert_equal "$(step_output tail | tr -d 'A-Za-z0-9+/=')" ''
+  assert_equal "$(grep -c '^contained=true$' "$GITHUB_OUTPUT")" 1
+  tail="$(verify_tail)"
+  assert_equal "$(printf '%s\n' "$tail" | wc -l | tr -d ' ')" 20
+  assert_contains "$tail" $'line 14\n'
+  refute_contains "$tail" 'line 13'
+  assert_contains "$tail" $'contained=true\nFAILED tests/test_app.py::test_login\nverify command failed: false'
+  refute_contains "$tail" never
+}
+
+@test "claude: the handed-over output is capped at 3 KB, and a passing verification hands over none" {
+  push_workspace 'printf "%05000d\n" 0
+sh -c "exit 3"'
+  run_verify
+  [ "$status" -ne 0 ]
+  # jq -r 多打一个换行
+  [ "$(verify_tail | wc -c)" -le 3073 ]
+  assert_contains "$(verify_tail)" 'verify command failed: sh -c "exit 3"'
+
+  : >"$GITHUB_OUTPUT"
+  reset_workspace
+  export VERIFY='echo all green'
+  run_verify
+  assert_equal "$status" 0
+  run step_output tail
+  [ "$status" -ne 0 ]
+}
+
+# 命令末尾补的那行 exit $? 不改结局：关了 set -e、最后一条红了，照样算没过。
+@test "claude: the verify command's own exit status still decides, also under set +e" {
+  push_workspace 'set +e
+false'
+  run_verify
+  [ "$status" -ne 0 ]
+  assert_contains "$output" 'verification failed after the Claude fix'
+  assert_contains "$(verify_tail)" 'verify command failed: false'
+}
+
 # 验证命令往 .git 里种一个「后面某一步会去跑」的钩子 —— 下一步手上有写权限凭据，
 # 种下去就有人替它跑。验证前后指纹有差异就红着停下，停在凭据回来之前。
 @test "claude: a hook the verify command plants stops the chain before the credentials return" {
