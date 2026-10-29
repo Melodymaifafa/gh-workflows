@@ -116,3 +116,23 @@ spawn r1"
 b r1 idle
 c r2 busy"
 }
+
+# pm2 的日志以前一行时间都没有（MEL-517：runner 池日志 1120 行，一个时间都没有）。直接跑时 stdout、
+# stderr 每行开头都是日期时间；被 source 时（上面这些测试）不接管输出。
+@test "run directly, every stdout and stderr line starts with the date and time" {
+  local bin="$BATS_TEST_TMPDIR/bin"
+  mkdir -p "$bin"
+  # docker 连不上：打一行 stdout（启动 colima）、一行 stderr（告警）；sleep 退出，循环只走一圈。
+  printf '%s\n' '#!/bin/sh' 'exit 1' >"$bin/docker"
+  printf '%s\n' '#!/bin/sh' 'exit 0' >"$bin/colima"
+  printf '%s\n' '#!/bin/sh' 'echo "sleep err" >&2' 'exit 1' >"$bin/sleep"
+  chmod +x "$bin/docker" "$bin/colima" "$bin/sleep"
+  run_split "$BATS_TEST_TMPDIR/out" "$BATS_TEST_TMPDIR/err" \
+    env PATH="$bin:$PATH" RUNNER_POOL_STATE="$BATS_TEST_TMPDIR/state" GH_WORKFLOWS_SECRETS="$BATS_TEST_TMPDIR/none" \
+    bash "$REPO_ROOT/scripts/runner-pool.sh"
+  assert_stamped "$BATS_TEST_TMPDIR/out"
+  assert_stamped "$BATS_TEST_TMPDIR/err"
+  assert_contains "$(cat "$BATS_TEST_TMPDIR/out")" '连不上 colima 里的 docker'
+  assert_contains "$(cat "$BATS_TEST_TMPDIR/err")" 'colima 里的 docker 起不来'
+  assert_contains "$(cat "$BATS_TEST_TMPDIR/err")" ' sleep err'
+}

@@ -1549,6 +1549,56 @@ quota_trail() {
   refute_contains "$output" "private-caller"
 }
 
+# 主人 Mac 上的日志只有主人看得到（MEL-517）：pr-sweep-local.sh 设 SWEEP_LOG_REAL_NAMES=1，私有仓库照写
+# 真名、PR 号、SHA 和 gh 的报错 —— 以前只有标签，出了事认不出是哪个仓库的哪个 PR。
+# GITHUB_ACTIONS 清空：本仓库自己的 CI 跑在 Actions 上，那里这个开关不认（见下一条）。
+@test "on the Mac a private repo is logged by name, PR number and SHA, with gh's own errors" {
+  one_pr clean 900
+  GITHUB_ACTIONS='' SWEEP_LOG_REAL_NAMES=1 run bash "$REPO_ROOT/scripts/pr-sweep.sh"
+  assert_equal "$status" 0
+  assert_contains "$output" "$R: 集成分支 develop"
+  assert_contains "$output" "$R#7 (${H:0:7}): idle="
+  assert_contains "$(cat "$GITHUB_STEP_SUMMARY")" "kicked $R#7 (${H:0:7})"
+  refute_contains "$output$(cat "$GITHUB_STEP_SUMMARY")" "repo-"
+
+  fake_route_fail "repos/$R/pulls?state=open&per_page=100" 1 '{"message":"Not Found"}'
+  GITHUB_ACTIONS='' SWEEP_LOG_REAL_NAMES=1 run bash "$REPO_ROOT/scripts/pr-sweep.sh"
+  assert_contains "$output" "::warning::$R 列 PR 失败"
+  assert_contains "$output" "gh: fake HTTP error"
+  refute_contains "$output" "repo-"
+}
+
+# Actions 的 run 日志是公开的：那里设了开关也只写标签，pr-sweeper.yml 自己也不设它。
+@test "the real-names switch is ignored on Actions, and pr-sweeper.yml never sets it" {
+  one_pr clean 900
+  GITHUB_ACTIONS=true SWEEP_LOG_REAL_NAMES=1 run bash "$REPO_ROOT/scripts/pr-sweep.sh"
+  assert_equal "$status" 0
+  assert_contains "$output" "$LABEL: idle="
+  refute_contains "$output$(cat "$GITHUB_STEP_SUMMARY")" "private-caller"
+  refute_contains "$output$(cat "$GITHUB_STEP_SUMMARY")" "${H:0:7}"
+  refute_contains "$(cat "$REPO_ROOT/$SWEEPER")" SWEEP_LOG_REAL_NAMES
+}
+
+# pm2 的错误日志以前一行时间都没有（MEL-517）：本机循环自己的和 pr-sweep.sh 的 stderr 每行开头都是日期
+# 时间，stdout 不动（每轮已有一行 == 时间 ==）。它还把 SWEEP_LOG_REAL_NAMES=1 交给 pr-sweep.sh。
+@test "the Mac loop stamps every stderr line with the date and time, and asks the sweep for real names" {
+  local d="$BATS_TEST_TMPDIR/local" bin="$BATS_TEST_TMPDIR/local-bin"
+  mkdir -p "$d" "$bin"
+  cp "$REPO_ROOT/scripts/pr-sweep-local.sh" "$d/"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "sweep out real=${SWEEP_LOG_REAL_NAMES:-}"' 'echo "sweep err" >&2' >"$d/pr-sweep.sh"
+  # 本机 gh 读到的总开关；sleep 退出，循环只走一圈。
+  printf '%s\n' '#!/bin/sh' 'echo live' >"$bin/gh"
+  printf '%s\n' '#!/bin/sh' 'echo "sleep err" >&2' 'exit 1' >"$bin/sleep"
+  chmod +x "$d/pr-sweep.sh" "$bin/gh" "$bin/sleep"
+  echo 'CODEX_TRIGGER_TOKEN=t' >"$d/secrets.env"
+  run_split "$d/out" "$d/err" env PATH="$bin:/usr/bin:/bin" GH_WORKFLOWS_SECRETS="$d/secrets.env" bash "$d/pr-sweep-local.sh"
+  assert_stamped "$d/err"
+  assert_contains "$(cat "$d/err")" ' sweep err'
+  assert_contains "$(cat "$d/err")" ' sleep err'
+  assert_equal "$(sed -n 2p "$d/out")" 'sweep out real=1'
+  grep -Eq '^== [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ==$' "$d/out"
+}
+
 # ── Codex 额度（全局，记在 gh-workflows 的一条 issue 里） ──
 
 QUOTA_ISSUES="gh api POST repos/Melodymaifafa/gh-workflows/issues"

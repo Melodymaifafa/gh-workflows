@@ -23,6 +23,10 @@ export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.colima/default/docker.sock}"
 
 gh_owner() { env -u GH_TOKEN -u GITHUB_TOKEN gh "$@"; }
 
+# 每行前面加上日期时间：pm2 的日志不带时间（main 把 stdout、stderr 都接过来）。用 date 不用 printf %(…)T：
+# Mac 自带的 bash 是 3.2。
+stamp() { while IFS= read -r line || [ -n "$line" ]; do printf '%s %s\n' "$(date '+%F %T')" "$line"; done; }
+
 notify() {
   (
     # shellcheck source=/dev/null
@@ -218,6 +222,7 @@ tick() {
 }
 
 main() {
+  exec > >(stamp) 2> >(stamp >&2)
   mkdir -p "$state"
   local last_refresh=0 now
   while :; do

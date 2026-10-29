@@ -8,6 +8,11 @@
 # 读不到就这一轮不扫。密钥文件里的 SWEEP_MODE 只能把它往下调（live → dry / off）。
 set -euo pipefail
 
+# pm2 的错误日志不带时间：stderr（本脚本自己的和 pr-sweep.sh 的）每行前面加上日期时间。stdout 不动，
+# 每轮开头已经有一行 == 时间 ==。用 date 不用 printf %(…)T：Mac 自带的 bash 是 3.2。
+stamp() { while IFS= read -r line || [ -n "$line" ]; do printf '%s %s\n' "$(date '+%F %T')" "$line"; done; }
+exec 2> >(stamp >&2)
+
 secrets="${GH_WORKFLOWS_SECRETS:-$HOME/.config/gh-workflows/secrets.env}"
 here="$(cd "$(dirname "$0")" && pwd)"
 switch_alerted=
@@ -30,6 +35,8 @@ sweep_once() (
   export GH_TOKEN="$CODEX_TRIGGER_TOKEN"
   export PUSHOVER_TOKEN="${PUSHOVER_TOKEN:-}" PUSHOVER_USER="${PUSHOVER_USER:-}"
   export OWNER="${OWNER:-Melodymaifafa}"
+  # 这份日志只有主人看得到：私有仓库也写真名和 PR 号（pr-sweeper.yml 的公开日志照旧只写标签）。
+  export SWEEP_LOG_REAL_NAMES=1
   unset CODEX_TRIGGER_TOKEN CLAUDE_CODE_OAUTH_TOKEN LINEAR_API_KEY
 
   # 总开关用本机 gh 的登录读（主人的账号，gh auth login 那个）：fine-grained PAT 没有 Variables 权限，

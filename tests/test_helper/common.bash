@@ -152,6 +152,24 @@ refute_contains() {
   esac
 }
 
+# run_split <out 文件> <err 文件> <命令…>：stdout、stderr 分开落盘，等最后一个写的进程也关了才返回 ——
+# exec > >(…) 起的过滤进程比命令本身晚退出，直接 >file 的话，读的时候它可能还没写完。退出码不管：
+# 拿来跑的是常驻循环，测试里靠假 sleep 退出。
+run_split() {
+  local out="$1" err="$2"
+  shift 2
+  { "$@" 2>&1 >&3 3>&- | cat >"$err"; } 3>&1 | cat >"$out" || true
+}
+
+# assert_stamped <文件>：至少有一行，而且每一行都以「YYYY-MM-DD HH:MM:SS 」开头。
+assert_stamped() {
+  [ -s "$1" ] || { echo "$1 is empty" >&2; return 1; }
+  if grep -Ev '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ' "$1"; then
+    echo "the lines above in $1 carry no date and time" >&2
+    return 1
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # 假 GitHub 环境：gh / curl / sleep / date 换成 tests/test_helper/fake-bin 里的假命令。
 #

@@ -101,10 +101,10 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 - **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **漏接的仓库每轮都点名**（2026-10-06，MEL-308）：有开着的 PR 却没装共享调用桩的仓库，run 摘要和 warning 里每次都列出来，并给出 `./onboard.sh <仓库> <python|node>`。`unwatched` 告警是按 head 去重的，head 不变就只响一次 —— 但仓库漏接是仓库级的，换个 head 也不会自己好，所以这条不跟着 head 去重。MEL-308 查出来的就是这个：三个仓库漏接，5 个 PR 全停，最久的两周没人管。
-- **节奏**：主力是主人 Mac 上的 `scripts/pr-sweep-local.sh`，它自己常驻、每轮跑完歇 5 分钟，pm2 只管让它活着（密钥读 onboard.sh 用的同一份本机密钥文件，每轮重读）：`pm2 start scripts/pr-sweep-local.sh --name pr-sweeper --interpreter bash && pm2 save`。以前按 `--cron-restart '*/5 * * * *' --no-autorestart` 装过的，先 `pm2 delete pr-sweeper` 再按这条重装：pm2 的定时重启只管还活着的进程，跑一轮就退出的脚本不会再被拉起来。`pr-sweeper.yml` 兜底：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。
+- **节奏**：主力是主人 Mac 上的 `scripts/pr-sweep-local.sh`，它自己常驻、每轮跑完歇 5 分钟，pm2 只管让它活着（密钥读 onboard.sh 用的同一份本机密钥文件，每轮重读）：`pm2 start scripts/pr-sweep-local.sh --name pr-sweeper --interpreter bash && pm2 save`。以前按 `--cron-restart '*/5 * * * *' --no-autorestart` 装过的，先 `pm2 delete pr-sweeper` 再按这条重装：pm2 的定时重启只管还活着的进程，跑一轮就退出的脚本不会再被拉起来。`pr-sweeper.yml` 兜底：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。Mac 上那份日志只有主人看得到，私有仓库也写真名和 PR 号（如 `Melodymaifafa/Weibo--automation-android#168`），错误日志（`~/.pm2/logs/pr-sweeper-error.log`）每行开头是日期时间（2026-10-30，MEL-517）。
 - **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`：Mac 上那个也每轮读这个变量，下一轮起两边都停，不用去 Mac 上关。Mac 上用本机 `gh` 的登录读它（fine-grained PAT 没有 Variables 权限）；读不了就不敢动手、推一次手机通知。
 - **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
-- 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。
+- 本仓库是 public，run 日志人人能看：`pr-sweeper.yml` 里私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。Mac 上的日志照写（`pr-sweep-local.sh` 设 `SWEEP_LOG_REAL_NAMES=1`；Actions 里设了也不认）。
 
 故意不管的：草稿、从 fork 开的 PR、标题带 `[no-codex-merge]` / `[no-claude]` 的 PR、`agent/*` 分支的 PR（momo 的，它在 Mac 上自己追 Codex、自己合并；iterate 和合并工作流也跳过它们，两边一起动会撞推送）。叫审 3 次没结果的 head 之后只每天叫一次、共 7 天，然后不再叫；有冲突的 head 只叫一次自动解冲突、只告警一次；已停车的 head 只告警一次。用内联副本、没接共享调用桩的仓库（如 Weibo--automation-android）：每个 PR 的每个 head 空闲 60 分钟后告警一次 `unwatched`，不叫审；私有仓库要等巡检读得到调用桩才生效。
 
@@ -208,6 +208,7 @@ jobs:
 - **只给私有仓库开**：公开仓库谁都能提 PR，陌生人的代码不能在主人的 Mac 上跑 —— 公开仓库设了变量也不理。注册 runner 用主人本机 `gh` 的登录，容器只拿到一次性的 JIT 配置。
 - **磁盘**：job 删掉的数据只在虚拟机里腾地方，Mac 上的磁盘文件不会自己缩，所以每 10 分钟 `fstrim` 一次还给 Mac（不 trim 时 2026-10-12 涨到 19 GB，trim 后 4 GB）。
 - **手机通知**：colima 起不来、注册不上 runner（多半是本机 `gh` 登录失效）、磁盘剩不到 5 GB，各推一次，恢复了再推一次。
+- **日志**：`~/.pm2/logs/ghwf-runner-pool-*.log` 每行开头是日期时间（2026-10-30 起）。
 - **代价**：Mac 关机或睡眠时 job 排队，GitHub 排满 24 小时就取消；虚拟机是 arm64，不是 x86。调用方仓库自己写死 `runs-on: ubuntu-latest` 的 job（比如 wechat-mimic-finetune 的 `training-cpu`）不受变量管，要改成 `${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}`。
 
 装法（`env -i` 是因为 UTF-8 locale 会弄坏 macOS 自带的 bash 3.2，见巡检那条）：
