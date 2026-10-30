@@ -783,7 +783,9 @@ run_verify() {
   # 跑验证的确实是这一步：它拿的是验证那份共用正文（两条路同一份，MEL-262），
   # 而正文里跑的就是 $VERIFY。
   assert_contains "$keys" 'FIX_VERIFY_GUARD'
-  assert_contains "$(fix_guard_body verify_the_fix)" 'bash -euo pipefail -c "$VERIFY"'
+  assert_contains "$(fix_guard_body verify_the_fix)" 'bash -euo pipefail -c "$verify_script"'
+  # verify_script 就是 $VERIFY，前面只接了报「哪一条没过」的 ERR 钩子（MEL-523）。
+  assert_contains "$(fix_guard_body verify_the_fix)" ' ERR; $VERIFY"'
   # 带令牌的那一步反过来一个字的验证正文都拿不到：它只拿推送那一份。
   assert_contains "$(step_env_keys "$WF" 'Commit and push the Codex fix')" 'GH_TOKEN'
   refute_contains "$(step_env_keys "$WF" 'Commit and push the Codex fix')" 'FIX_VERIFY_GUARD'
@@ -1615,7 +1617,9 @@ exit 1"
 assert_taken_back() {
   [ -f "$REAL_FC" ] && [ ! -L "$REAL_FC" ] && [ -w "$REAL_FC" ] ||
     { echo "$REAL_FC is not a writable regular file after the step" >&2; return 1; }
-  refute_contains "$(cat "$REAL_FC")" 'BASH_ENV'
+  # 验证没过时那条命令原样进 output 的一个多行值（MEL-523），原文就带着这串字：只跳过这两个值再查。
+  refute_contains "$(awk '/^(failed_command|output_tail)<</ { d = substr($0, index($0, "<<") + 2); next }
+    d != "" { if ($0 == d) d = ""; next } { print }' "$REAL_FC")" 'BASH_ENV'
   assert_equal "$(step_output contained)" true
 }
 
