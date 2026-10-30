@@ -332,7 +332,9 @@ curl_calls() {
   # 跑验证的确实是这一步：它拿的是验证那份共用正文，而正文里跑的就是 $VERIFY。
   # 改个步骤名、或者哪天忘了把正文递过来，这条就空转不了。
   assert_contains "$keys" 'FIX_VERIFY_GUARD'
-  assert_contains "$(fix_guard_body verify_the_fix)" 'bash -euo pipefail -c "$VERIFY"'
+  assert_contains "$(fix_guard_body verify_the_fix)" 'bash -euo pipefail -c "$verify_script"'
+  # verify_script 就是 $VERIFY，前面只接了报「哪一条没过」的 ERR 钩子（MEL-523）。
+  assert_contains "$(fix_guard_body verify_the_fix)" ' ERR; $VERIFY"'
   # 带令牌的那一步反过来一个字的验证正文都拿不到：它只拿推送那一份。
   assert_contains "$(step_env_keys "$WF" 'Commit and push the Claude fix')" 'GH_TOKEN'
   refute_contains "$(step_env_keys "$WF" 'Commit and push the Claude fix')" 'FIX_VERIFY_GUARD'
@@ -1304,6 +1306,8 @@ verify_path="$verify_tools/bin:$PATH"
 verify_bash=/bin/bash
 [ -x "$verify_bash" ] || verify_bash=/usr/bin/bash
 VERIFY=${STUB_VERIFY-umask}
+# 正文跑的是 $VERIFY 前面接一个 ERR 钩子（MEL-523）；这几条问的不是钩子，原样跑 $VERIFY。
+verify_script="$VERIFY"
 # 迷你 sudo：把 `-E -u <用户>` 剥掉，剩下的原样跑
 as_root() {
   while [ "$#" -gt 0 ]; do
@@ -1349,7 +1353,7 @@ EOS
   assert_contains "$(fix_guard_body verify_the_fix)" 'for candidate in /bin/bash /usr/bin/bash'
   assert_contains "$(fix_guard_body verify_the_fix)" '[ -n "$verify_bash" ] || return 1'
   # 回退路径一个字不改：它照旧是原来那一句，没有 umask、也不该有
-  assert_contains "$(verify_helper launch_the_verify_command)" 'bash -euo pipefail -c "$VERIFY"'
+  assert_contains "$(verify_helper launch_the_verify_command)" 'bash -euo pipefail -c "$verify_script"'
 }
 
 # ---------- 两条路共用同一段正文 ----------

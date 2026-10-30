@@ -202,11 +202,14 @@ jobs:
           # 额度类（fix-quota / review-quota）：已告警过但这次 until 更晚 → 静默补一条新 until 的标记，
           # 巡检才知道要等到新的重置时间；其余原因同 (head, 原因) 只发一次。
           # 第 5 个参数可选：只进评论、不进手机推送的额外标记行（如 carried-findings）。
+          # 第 6 个参数可选：只进评论、排在话后面的说明（验证没过时的命令和输出末尾）；Pushover 超过 1024 字整条发不出去。
           alert_once() {
-            local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" prev body resume
+            local head="$1" reason="$2" until="$3" msg="$4" extra="${5:-}" detail="${6:-}" prev body resume said
             # 告警的话里不许有 HTML 注释：标记只由下面这几行加，第 5 个参数也是调用处自己的标记。
-            # 话里会带外部文字（被拒的文件名、意见标题、judge 列的 bug），见 only_own_markers。
-            only_own_markers 0 "the $reason alert" "$msg" || return 1
+            # 话里会带外部文字（被拒的文件名、意见标题、judge 列的 bug、验证命令的输出），见 only_own_markers。
+            said="$msg"
+            [ -z "$detail" ] || said+=$'\n\n'"$detail"
+            only_own_markers 0 "the $reason alert" "$said" || return 1
             # 已有可信标记里最大的 until：没有标记 = 空串，有标记但 until=- 记 0
             prev="$(trusted_comments | jq -r --arg m "<!-- pr-guard: alert head=$head reason=$reason " '
               [.[] | .body | select(contains($m))
@@ -215,7 +218,7 @@ jobs:
             if [ -z "$prev" ]; then
               pushover "🤖 PR #$PR_NUMBER 自动修复停了" "$msg"
               printf -v body '%s\n\n<!-- pr-guard: alert head=%s reason=%s until=%s -->' \
-                "$msg" "$head" "$reason" "$until"
+                "$said" "$head" "$reason" "$until"
             elif { [ "$reason" = fix-quota ] || [ "$reason" = review-quota ]; } && [ "$until" -gt "$prev" ]; then
               resume="$(date -u -d "@$((until + 28800))" '+%m-%d %H:%M')"
               printf -v body '🤖 额度又用完了，改到北京时间 %s 后继续（不再重复推送）。\n\n<!-- pr-guard: alert head=%s reason=%s until=%s -->' \
@@ -684,7 +687,7 @@ jobs:
             done
             PATH="$trusted_path"
             # 少了哪一样都等于这一整步没法判定 —— 红着停下，别静默空转。
-            for tool in git ps awk sed cut id mktemp cp ls; do
+            for tool in git ps awk sed cut id mktemp cp ls mkfifo tee tail tr; do
               command -v "$tool" >/dev/null 2>&1 && continue
               echo "::error::$tool is not available from a write-protected PATH entry; cannot verify this checkout safely"
               exit 1
@@ -1089,6 +1092,12 @@ jobs:
             # 两条路只差「谁来跑」这一件事，所以写成一个函数：下面那一串 env 两边一字
             # 不差，不留第二份 —— 「两份逐行副本，改一份忘了另一份」是 MEL-254 已经
             # 吃过的亏。
+            # 跑的是 $VERIFY 前面接一个 ERR 钩子：没过时退出前打一行 $verify_failed_mark + 那条命令，Say why 拿它
+            # 说是哪一条没过（MEL-523）。set -E 让 ( ) 子 shell 里也作数；取最后一行，bash 5 上是最外层那条。
+            # 接在同一行，PR 报错的行号不变。末尾补一句 exit $?：bash -c 直接 exec 最后一条命令，钩子就没机会
+            # 跑，而挂的往往正是最后那条测试；退出码照旧是它的。这一行被审 PR 也打得出来，只当外部文字。
+            verify_failed_mark='::error::the verify command failed at: '
+            verify_script="set -E; trap 'printf \"\\n%s%s\\n\" \"$verify_failed_mark\" \"\$BASH_COMMAND\" >&2' ERR; $VERIFY"$'\n\nexit $?'
             launch_the_verify_command() {
               if [ -z "$verify_user" ]; then
                 env GITHUB_ENV="$decoy/env" GITHUB_PATH="$decoy/path" \
@@ -1096,7 +1105,7 @@ jobs:
                     GITHUB_STEP_SUMMARY="$decoy/summary" \
                     npm_config_prefix="$verify_tools" \
                     PATH="$verify_path" \
-                    bash -euo pipefail -c "$VERIFY"
+                    bash -euo pipefail -c "$verify_script"
                 return
               fi
               # hosted runner 的 /etc/sudoers 写着 `Defaults use_pty`（2026-10-02 实测），
@@ -1130,7 +1139,7 @@ jobs:
                     PATH="$verify_path" \
                     "$verify_bash" -euo pipefail \
                       -c 'umask 002; exec "$0" -euo pipefail -c "$1"' \
-                      "$verify_bash" "$VERIFY"
+                      "$verify_bash" "$verify_script"
             }
             # 会应用到后面步骤的那几个文件命令通道（同 Put back 清的集合，不含只渲染的 step summary）。
             # 子孙直接写真文件 —— GITHUB_ENV 一行 BASH_ENV 抢在 PATH 过滤 / 换 HOME 之前跑；PATH/OUTPUT 同理。
@@ -1297,7 +1306,7 @@ jobs:
               shift
               verify_reported=1
               scrub_or_refuse
-              for line in "$@"; do echo "$line" >>"$GITHUB_OUTPUT"; done
+              for line in "$@"; do printf '%s\n' "$line" >>"$GITHUB_OUTPUT"; done
               echo 'contained=true' >>"$GITHUB_OUTPUT"
               exit "$rc"
             }
@@ -1332,10 +1341,18 @@ jobs:
             # 从 & 到装上 verify_on_exit 之间没有 trap，那里退出就不交信号（fail closed）。
             verify_settled=''
             verify_reported=''
+            # 输出照旧一行行进日志（tee 的 stdout）；另一份经 FIFO 流进我们开的 tail，只留末尾，没过时由
+            # verify_failure_outputs 读走（MEL-523）。这几个进程是 $$ 的后代、不在验证的进程组里；
+            # 清点证明它名下没活进程之后才读，那时写端已经全关了。
+            verify_tail_fifo="$(mktemp -d "$RUNNER_TEMP/verify-tail-XXXXXX")/tail"
+            mkfifo "$verify_tail_fifo"
+            exec 8< <(tail -c 65536 <"$verify_tail_fifo" | tail -n 30 | tr -d '\000')
+            exec 9> >(tee "$verify_tail_fifo")
             set -m
             trap - EXIT
-            launch_the_verify_command </dev/null &
+            launch_the_verify_command </dev/null >&9 2>&1 8<&- 9>&- &
             verify_pgid=$!
+            exec 9>&-
             set +m
             # 从这一刻起被审 PR 的代码在跑：之后从哪儿退出，verify_on_exit 都先把它收掉。
             trap verify_on_exit EXIT
@@ -1485,10 +1502,41 @@ jobs:
               fi
             fi
 
+            # 没过的那条命令和输出的最后 20 行，交给 Say why（MEL-523）。两样都是被审 PR 写出来的字：那一步当外部
+            # 文字清洗；这里只拆开、截到 3 KB（截了就丢掉半截的第一行、开头标 …），再用一个正文里没有的定界符
+            # 写进 output，不落 $RUNNER_TEMP 的文件。没有钩子那一行（直接 exit、PR 换了钩子、被信号打断）就报整条验证命令。
+            verify_failure_outputs() {
+              local LC_ALL=C raw='' line at='' kept=() n=0 i out='' nl=$'\n' delim
+              IFS= read -r -d '' raw <&8 || true
+              while IFS= read -r line; do
+                case "$line" in
+                  "$verify_failed_mark"*) at="${line#"$verify_failed_mark"}" ;;
+                  *) kept[n]="$line"; n=$((n + 1)) ;;
+                esac
+              done <<<"$raw"
+              while [ "$n" -gt 0 ] && [ -z "${kept[n - 1]}" ]; do n=$((n - 1)); done
+              i=$((n > 20 ? n - 20 : 0))
+              while [ "$i" -lt "$n" ]; do out+="${kept[i]}$nl"; i=$((i + 1)); done
+              out="${out%"$nl"}"
+              if [ "${#out}" -gt 3072 ]; then
+                out="${out: -3072}"
+                out="…$nl${out#*"$nl"}"
+              fi
+              # bash 5 报一整个 ( ) 块时带着括号，剥掉
+              case "$at" in '( '*' )') at="${at#'( '}"; at="${at%' )'}" ;; esac
+              [ -n "$at" ] || at="$VERIFY"
+              at="${at:0:300}"
+              delim="__FIX_VERIFY_FAILURE_${RANDOM}${RANDOM}__"
+              while [[ "$at$nl$out" == *"$delim"* ]]; do delim="__FIX_VERIFY_FAILURE_${RANDOM}${RANDOM}__"; done
+              failed_command_output="failed_command<<$delim$nl$at$nl$delim"
+              output_tail_output="output_tail<<$delim$nl$out$nl$delim"
+            }
+
             if [ "$verify_status" -ne 0 ]; then
               echo '- verification: **failed**, nothing was pushed' >>"$GITHUB_STEP_SUMMARY"
               echo "::error::verification failed after the $FIXER fix; the change was not pushed"
-              contained_exit 1
+              verify_failure_outputs
+              contained_exit 1 "$failed_command_output" "$output_tail_output"
             fi
 
             # 提交的必须是验过的那棵树。验证本身会改被跟踪的文件 —— `uv sync --dev`
@@ -3917,6 +3965,13 @@ jobs:
           CODEX_BLOCKED: ${{ steps.codex_push.outputs.blocked }}
           CLAUDE_RETRY: ${{ steps.claude_push.outputs.retry }}
           CODEX_RETRY: ${{ steps.codex_push.outputs.retry }}
+          # 验证没过时那条命令和输出末尾：验证那一步的父 shell 写进 output（同 contained），不读 $RUNNER_TEMP 的文件。
+          # 只贴在私有仓库的 PR 上：公开仓库的 PR 人人可看。
+          CLAUDE_FAILED_COMMAND: ${{ steps.claude_verify.outputs.failed_command }}
+          CODEX_FAILED_COMMAND: ${{ steps.codex_verify.outputs.failed_command }}
+          CLAUDE_OUTPUT_TAIL: ${{ steps.claude_verify.outputs.output_tail }}
+          CODEX_OUTPUT_TAIL: ${{ steps.codex_verify.outputs.output_tail }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
           # 这一轮修的那条 review：分支被人推过、修复没落地时，告警要点名它的意见。
           REVIEW_ID: ${{ steps.gate.outputs.target }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -4025,6 +4080,31 @@ jobs:
             exit 1
           }
 
+          # 私有仓库：验证没过时，那句话后面贴上没过的那条命令和输出的最后 20 行（MEL-523）。两样都是被审 PR 的
+          # 代码写出来的：先删 ANSI 转义序列，再过 defang（控制字符、HTML 注释定界符、令牌、标记关键字、@；
+          # 它之后不许再删字符），再打码 sk- 开头的令牌、截到 3 KB；围栏比正文里最长的一串反引号多一个。
+          # 只进评论，不进手机推送（alert_once 的第 6 个参数）。
+          detail=''
+          if [ "$reason" = verify-failed ] && [ "${REPO_PRIVATE:-}" = true ]; then
+            failed_command="${CLAUDE_FAILED_COMMAND:-}"
+            output_tail="${CLAUDE_OUTPUT_TAIL:-}"
+            if [ -z "$failed_command" ]; then
+              failed_command="${CODEX_FAILED_COMMAND:-}"
+              output_tail="${CODEX_OUTPUT_TAIL:-}"
+            fi
+            if [ -n "$failed_command" ]; then
+              # shellcheck disable=SC2016  # jq 程序
+              detail="$(jq -nr --arg c "$failed_command" --arg t "$output_tail" "$(defang_jq)"'
+                def clean: gsub("\u001b(\\[[0-?]*[ -/]*[@-~]|\\][^\u0007\u001b]*(\u0007|\u001b\\\\)?|[@-_])"; "") | defang
+                  | gsub("\\bsk-[A-Za-z0-9_-]{20,}"; "[已隐藏]");
+                def fenced: ([scan("`+") | length] | max // 0) as $n | ("`" * ([$n + 1, 3] | max)) as $f
+                  | $f + "\n" + . + "\n" + $f;
+                ($t | clean | if length > 3072 then "…" + .[-3072:] else . end) as $t
+                | "没过的命令：\n" + ($c | clean | fenced)
+                  + "\n\n最后 20 行输出：\n" + (if $t == "" then "（没有输出）" else $t | fenced end)')" || detail=''
+            fi
+          fi
+
           carry=''
           if [ "$reason" = findings-carried ]; then
             if [[ "${REVIEW_ID:-}" =~ ^[0-9]+$ ]]; then
@@ -4060,7 +4140,7 @@ jobs:
           # 拦合并的那个标记重试几次还是没发出去：手机上那条已经说了「不会自动合并」，可合并
           # 检查这时候根本看不到要拦什么。Pushover 不走 GitHub，再推一条说实话，让人自己拦；
           # 这一步照旧红着停下。
-          if ! alert_once "$HEAD_SHA" "$reason" - "$msg" "$carry"; then
+          if ! alert_once "$HEAD_SHA" "$reason" - "$msg" "$carry" "$detail"; then
             if [ -n "$carry" ]; then
               pushover "🤖 PR #$PR_NUMBER 要你手动拦一下" "上一条说这个 PR 不会自动合并，但拦合并的标记没发到 PR 上（GitHub 连着拒了几次）。它现在可能被自动合并，没修的意见会一起进去。先别让它合，自己处理：$PR_URL"
             fi
