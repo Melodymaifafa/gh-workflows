@@ -85,7 +85,7 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 **以后再做的记到 Linear**：judge 给每条 P2 多填一个 `later`。`later=true`（优化、新功能、超出本 PR 范围但值得做）在放行或 M9 时记成一张 Linear 票：Backlog、不指派、带 Improvement 标签，正文写 judge 的理由、来源 PR 和原意见链接 —— 不进 Agent Queue，流水线不给自己派活。找项目先认挂着这个仓库 GitHub 链接的项目（名字常对不上，如 `learn-api-integrations` → Duolinguo learning app），再认同名项目（跳过已取消的），都没有就建一个同名项目并挂上链接。每次最多 5 张；同一个 PR 同标题的票不重记。没配 `LINEAR_API_KEY`、Linear 出错或查不到团队的 Backlog 状态（免得票落进 Triage）只写进评论（M9 时写进那条 review，注明本 PR 不用改），照样放行。停车时不记票，人先看。
 
-改好了却没推上去时，PR 上也一定有一句话（2026-10-05）：验证命令没过 → `verify-failed`；提交了但 push 被拒 → `push-failed`，告警里直接说是哪一种拒（令牌不许改 workflow 文件 / 分支保护 / 分支落后），两条都带 run 链接。这两种以前在 PR 上一个字都没有，只能等巡检重试两次之后收到一条不说原因的 `retry-exhausted`。
+改好了却没推上去时，PR 上也一定有一句话（2026-10-05）：验证命令没过 → `verify-failed`；提交了但 push 被拒 → `push-failed`，告警里直接说是哪一种拒（令牌不许改 workflow 文件 / 分支保护 / 分支落后），两条都带 run 链接。这两种以前在 PR 上一个字都没有，只能等巡检重试两次之后收到一条不说原因的 `retry-exhausted`。私有仓库的 `verify-failed` 还贴出没过的那条命令和它输出的最后 20 行（最多 3 KB，清洗同下面的外部文字），看得到挂的是哪条测试；公开仓库照旧一句话加链接，手机推送也只有那一句（2026-10-30，MEL-523）。
 
 **分支在修的时候被人推过**（2026-10-07）：push 被判落后（non-fast-forward）时，拉下分支尖、把这一笔修复 rebase 上去、再推一次，只推一次，永不强推。接上去的那一版没在 runner 上重新验证（验证跑的是被审 PR 的代码，不许跟推送凭据同处一步），由 PR 自己的 CI 验，合并前必须全绿；Claude 的总结里会写明这一点。还是没推上去（冲突、拉不下来、重推又被拒）→ 告警 `findings-carried`，点名这一轮没修进去的意见。在那之前合并环节不自动合并（怎么接着修见下一段）。标记是推不上去之后才发的，所以合并前还要先看这个 PR 上有没有修复在跑（或排队），有就最多等一分钟，还在跑就这次不合 —— 免得新 head 审查通过得快，赶在旧那轮发标记之前合掉。人看过之后直接点 Merge 即可。这两种标记都只发一次，所以告警和 M7 发不出去时隔 10 / 30 / 60 秒再试；`carried-findings` 重试完还是没发出去，就再推一条手机提醒「拦合并的标记没发到 PR 上，先别让它合」，那一步红着停下。起因：wechat-mimic-finetune PR #15（2026-10-06），修复被丢、下一次复审没再报那条 P1，PR 带着 bug 合了进去。Claude 的总结评论署名 github-actions[bot]，所以发之前剥掉 HTML 注释、拆开标记关键字，免得一段被意见带偏的总结伪造出「已关掉」。所有发出去的外部文字（总结、审查结论、意见标题、文件名、模型名）都先删控制字符和看不见的格式字符（NUL、回车、零宽、双向控制、软连字符这一类），再剥、再拆，之后不再删任何字符：顺序反过来，`` <!`-- `` 这样夹一个反引号的定界符躲得过剥，反引号一删就拼回一个真标记（2026-10-21，两个工作流里四处清洗都有这个洞；NUL 是 bash 自己删的）。发之前还数一遍：正文里的 HTML 注释比这一步自己加的标记多一个就不发。告警里列的被拒文件名只留字母、数字和 `._/+-`。
 
@@ -101,7 +101,7 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 - **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **漏接的仓库每轮都点名**（2026-10-06，MEL-308）：有开着的 PR 却没装共享调用桩的仓库，run 摘要和 warning 里每次都列出来，并给出 `./onboard.sh <仓库> <python|node>`。`unwatched` 告警是按 head 去重的，head 不变就只响一次 —— 但仓库漏接是仓库级的，换个 head 也不会自己好，所以这条不跟着 head 去重。MEL-308 查出来的就是这个：三个仓库漏接，5 个 PR 全停，最久的两周没人管。
-- **节奏**：主力是主人 Mac 上的 `scripts/pr-sweep-local.sh`，它自己常驻、每轮跑完歇 5 分钟，pm2 只管让它活着（密钥读 onboard.sh 用的同一份本机密钥文件，每轮重读）：`pm2 start scripts/pr-sweep-local.sh --name pr-sweeper --interpreter bash && pm2 save`。以前按 `--cron-restart '*/5 * * * *' --no-autorestart` 装过的，先 `pm2 delete pr-sweeper` 再按这条重装：pm2 的定时重启只管还活着的进程，跑一轮就退出的脚本不会再被拉起来。`pr-sweeper.yml` 兜底：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。
+- **节奏**：主力是主人 Mac 上的 `scripts/pr-sweep-local.sh`，它自己常驻、每轮跑完歇 5 分钟，pm2 只管让它活着（密钥读 onboard.sh 用的同一份本机密钥文件，每轮重读）：`pm2 start scripts/pr-sweep-local.sh --name pr-sweeper --interpreter bash && pm2 save`。以前按 `--cron-restart '*/5 * * * *' --no-autorestart` 装过的，先 `pm2 delete pr-sweeper` 再按这条重装：pm2 的定时重启只管还活着的进程，跑一轮就退出的脚本不会再被拉起来。`pr-sweeper.yml` 兜底：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。Mac 上那份日志写真名（`owner/repo#N`，`pr-sweep-local.sh` 设了 `SWEEP_LOG_REAL_NAMES=1`），错误日志每行开头带 `YYYY-MM-DD HH:MM:SS`；`pr-sweeper.yml` 的日志照旧只写代号（2026-10-30，MEL-522）。pm2 跑的是本机这份仓库里的脚本，改了要 `git pull --ff-only` 再 `pm2 restart pr-sweeper ghwf-runner-pool`。
 - **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`：Mac 上那个也每轮读这个变量，下一轮起两边都停，不用去 Mac 上关。Mac 上用本机 `gh` 的登录读它（fine-grained PAT 没有 Variables 权限）；读不了就不敢动手、推一次手机通知。
 - **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
 - 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。
@@ -207,6 +207,7 @@ jobs:
 - **每个仓库常备一个空闲的**：合并环节会占着 runner 等 CI（最多 30 分钟），一个仓库只有一个 runner 就会互相等死。空闲的约 40 MB。容器总数到「仓库数 + `MAX_EXTRA_RUNNERS`（默认 4）」就不再补，排队等；空闲的随时会接 job，所以这也是同时跑的 job 上限。满了时，有 job 在跑的仓库可以收掉一个「没 job 在跑的仓库」的空闲 runner 给自己用（runner 只服务注册它的仓库）。虚拟机自己限 4 GB 内存，挤不到 Mac。
 - **只给私有仓库开**：公开仓库谁都能提 PR，陌生人的代码不能在主人的 Mac 上跑 —— 公开仓库设了变量也不理。注册 runner 用主人本机 `gh` 的登录，容器只拿到一次性的 JIT 配置。
 - **磁盘**：job 删掉的数据只在虚拟机里腾地方，Mac 上的磁盘文件不会自己缩，所以每 10 分钟 `fstrim` 一次还给 Mac（不 trim 时 2026-10-12 涨到 19 GB，trim 后 4 GB）。
+- **日志**：`ghwf-runner-pool` 的输出和错误每行开头带 `YYYY-MM-DD HH:MM:SS`（2026-10-30，MEL-522）。
 - **手机通知**：colima 起不来、注册不上 runner（多半是本机 `gh` 登录失效）、磁盘剩不到 5 GB，各推一次，恢复了再推一次。
 - **代价**：Mac 关机或睡眠时 job 排队，GitHub 排满 24 小时就取消；虚拟机是 arm64，不是 x86。调用方仓库自己写死 `runs-on: ubuntu-latest` 的 job（比如 wechat-mimic-finetune 的 `training-cpu`）不受变量管，要改成 `${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}`。
 
