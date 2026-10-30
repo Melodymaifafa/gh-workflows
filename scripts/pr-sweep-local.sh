@@ -30,6 +30,8 @@ sweep_once() (
   export GH_TOKEN="$CODEX_TRIGGER_TOKEN"
   export PUSHOVER_TOKEN="${PUSHOVER_TOKEN:-}" PUSHOVER_USER="${PUSHOVER_USER:-}"
   export OWNER="${OWNER:-Melodymaifafa}"
+  # 本机日志只有主人看得到：私有仓库也写真名和 PR 号，gh 报错照常输出（pr-sweeper.yml 不设，公开日志照旧打码）。
+  export SWEEP_LOG_REAL_NAMES=1
   unset CODEX_TRIGGER_TOKEN CLAUDE_CODE_OAUTH_TOKEN LINEAR_API_KEY
 
   # 总开关用本机 gh 的登录读（主人的账号，gh auth login 那个）：fine-grained PAT 没有 Variables 权限，

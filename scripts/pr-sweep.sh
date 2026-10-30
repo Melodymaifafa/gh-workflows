@@ -49,12 +49,14 @@
 #   PUSHOVER_TOKEN / PUSHOVER_USER  告警推送（都有才推）
 #
 #   LABEL_KEY        私有仓库日志标签的 HMAC 密钥（默认用 GH_TOKEN）
+#   SWEEP_LOG_REAL_NAMES  1 = 私有仓库在日志里也写真名、PR 号和 SHA，gh 的报错照常输出。
+#                    只给主人 Mac 上的日志用（pr-sweep-local.sh 设）；pr-sweeper.yml 不设，公开日志不变。
 #
 # 读调用桩也用 GH_TOKEN（CODEX_TRIGGER_TOKEN，带 Contents 权限）；以前那把单独的
 # SWEEP_READ_TOKEN 不再读 —— 留着一把过期的反而会顶掉能用的那把。
 #
 # 日志和 $GITHUB_STEP_SUMMARY 是公开的：私有仓库只写 repo-<HMAC 前 8 位>，不写名字、PR 号和 SHA，
-# gh 的报错也吞掉。Pushover 是私人通道，照写真名。
+# gh 的报错也吞掉。Pushover 是私人通道，照写真名。设了 SWEEP_LOG_REAL_NAMES=1 的本机日志也照写。
 set -euo pipefail
 
 : "${OWNER:?OWNER 没设}"
@@ -190,10 +192,13 @@ $pr[0] as $p | $cs[0] as $c | $rs[0] as $r | ($now | tonumber) as $now
   ] | @tsv
 '
 
+# hidden <private>：这个仓库在日志里要不要藏起来。私有仓库要藏，除非是只有主人看得到的本机日志。
+hidden() { [ "$1" = true ] && [ "${SWEEP_LOG_REAL_NAMES:-}" != 1 ]; }
+
 # 公开日志里的仓库名：私有仓库换成 repo-<HMAC-SHA256(full_name) 前 8 位>。
 # 用带密钥的 HMAC，不然别人拿猜的仓库名算一下就能对上。没有密钥就只写 repo-private。
 repo_label() {
-  [ "$2" = true ] || { printf '%s' "$1"; return 0; }
+  hidden "$2" || { printf '%s' "$1"; return 0; }
   local key="${LABEL_KEY:-${GH_TOKEN:-}}"
   [ -n "$key" ] || { printf 'repo-private'; return 0; }
   printf 'repo-%s' "$(printf '%s' "$1" | openssl dgst -sha256 -hmac "$key" | awk '{print $NF}' | cut -c1-8)"
@@ -338,7 +343,7 @@ save_quota() {
 }
 
 # 下面这些函数读 sweep_pr 设的 repo / n / H / alerts / url / who / hs，和主循环设的 dir（这个 PR 的数据目录）。
-# who / hs 是日志用的：公开仓库 "owner/名#N" 和 " (sha7)"，私有仓库只有标签、hs 为空。
+# who / hs 是日志用的："owner/名#N" 和 " (sha7)"；要藏的私有仓库（见 hidden）只有标签、hs 为空。
 post_comment() {
   gh api -X POST "repos/$repo/issues/$n/comments" -f "body=$1" --silent
 }
@@ -532,7 +537,7 @@ sweep_pr() {
   repo="$1" n="$2" private="$3" base="$4" watched="$5"
   H="$(jq -r .head.sha "$dir/pr.json")"
   url="$(jq -r .html_url "$dir/pr.json")"
-  if [ "$private" = true ]; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
+  if hidden "$private"; then who="$(repo_label "$repo" true)" hs=""; else who="$repo#$n" hs=" (${H:0:7})"; fi
 
   local idle referenced findings target retries kicks last_kick stalled_at until_active until_passed fix_reason state merged total_retries judged judged_reviews
   local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded thumbs eyes
@@ -701,8 +706,7 @@ for entry in $repos; do
   private="${rest%%:*}" default_branch="${rest#*:}"
   label="$(repo_label "$repo" "$private")"
   # 私有仓库的 gh 报错里有仓库名，吞掉，只留一句通用警告。
-  err=/dev/stderr
-  [ "$private" = false ] || err=/dev/null
+  if hidden "$private"; then err=/dev/null; else err=/dev/stderr; fi
   if ! prs="$(gh api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq '
       .[] | select(.draft | not)
       | select(.head.repo.full_name == .base.repo.full_name)
@@ -742,7 +746,7 @@ for entry in $repos; do
       [ "$legacy" = 0 ] || continue
       watched=0
     fi
-    if [ "$private" = true ]; then pr_label="$label"; else pr_label="$repo#$n"; fi
+    if hidden "$private"; then pr_label="$label"; else pr_label="$repo#$n"; fi
     k=$((k + 1)) dir="$tmp/pr/$k"
     mkdir -p "$dir"
     echo "$repo $n $private $base $watched $pr_label" >"$dir/meta"
@@ -760,8 +764,7 @@ done
 for k in $queued; do
   dir="$tmp/pr/$k"
   read -r repo n private base watched pr_label <"$dir/meta"
-  err=/dev/stderr
-  [ "$private" = false ] || err=/dev/null
+  if hidden "$private"; then err=/dev/null; else err=/dev/stderr; fi
   set +e
   (set -e; fetch_pr "$repo" "$n"; sweep_pr "$repo" "$n" "$private" "$base" "$watched") 2>"$err"
   rc=$?
