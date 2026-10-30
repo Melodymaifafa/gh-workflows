@@ -19,6 +19,11 @@ notify() {
     --form-string "title=$1" --form-string "message=$2" >/dev/null || echo "Pushover 发送失败" >&2
 }
 
+# 每行前加「日期 时间 」。用 date，不用 printf %(…)T：Mac 自带的 bash 3.2 没有。最后一行没换行也照打。
+stamp() {
+  while IFS= read -r line || [ -n "$line" ]; do printf '%s %s\n' "$(date '+%F %T')" "$line"; done
+}
+
 # 每轮在子 shell 里跑，密钥和环境不留到下一轮。退出码 3 = 本机 gh 读不了总开关（已推过一次手机）。
 sweep_once() (
   [ -r "$secrets" ] || { echo "读不到 $secrets" >&2; exit 1; }
@@ -30,6 +35,8 @@ sweep_once() (
   export GH_TOKEN="$CODEX_TRIGGER_TOKEN"
   export PUSHOVER_TOKEN="${PUSHOVER_TOKEN:-}" PUSHOVER_USER="${PUSHOVER_USER:-}"
   export OWNER="${OWNER:-Melodymaifafa}"
+  # 本机日志只有主人看得到：私有仓库也写真名和 PR 号，gh 报错照常输出（pr-sweeper.yml 不设，公开日志照旧打码）。
+  export SWEEP_LOG_REAL_NAMES=1
   unset CODEX_TRIGGER_TOKEN CLAUDE_CODE_OAUTH_TOKEN LINEAR_API_KEY
 
   # 总开关用本机 gh 的登录读（主人的账号，gh auth login 那个）：fine-grained PAT 没有 Variables 权限，
@@ -55,6 +62,9 @@ sweep_once() (
 
   exec "$here/pr-sweep.sh"
 )
+
+# 错误日志（这个循环自己的和 pr-sweep.sh 的）每行带时间；标准输出照旧，每轮开头有 == 时间 == 那一行。
+exec 2> >(stamp >&2)
 
 while :; do
   echo "== $(date '+%F %T') =="

@@ -23,6 +23,11 @@ export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.colima/default/docker.sock}"
 
 gh_owner() { env -u GH_TOKEN -u GITHUB_TOKEN gh "$@"; }
 
+# 每行前加「日期 时间 」。用 date，不用 printf %(…)T：Mac 自带的 bash 3.2 没有。最后一行没换行也照打。
+stamp() {
+  while IFS= read -r line || [ -n "$line" ]; do printf '%s %s\n' "$(date '+%F %T')" "$line"; done
+}
+
 notify() {
   (
     # shellcheck source=/dev/null
@@ -246,4 +251,8 @@ main() {
   done
 }
 
-[ "${BASH_SOURCE[0]}" != "$0" ] || main
+# 直接跑（pm2）时两路日志每行都带时间；测试 source 它时什么都不重定向。
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  exec > >(stamp) 2> >(stamp >&2)
+  main
+fi
