@@ -1,5 +1,7 @@
 # gh-workflows
 
+PR 开了自动审、自动修、自动合，卡住才叫你
+
 Melody 名下所有仓库共用的 GitHub Actions 逻辑。**改这里，所有仓库同时生效。**
 
 ## 分支标准
@@ -102,6 +104,7 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 - **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **漏接的仓库每轮都点名**（2026-10-06，MEL-308）：有开着的 PR 却没装共享调用桩的仓库，run 摘要和 warning 里每次都列出来，并给出 `./onboard.sh <仓库> <python|node>`。`unwatched` 告警是按 head 去重的，head 不变就只响一次 —— 但仓库漏接是仓库级的，换个 head 也不会自己好，所以这条不跟着 head 去重。MEL-308 查出来的就是这个：三个仓库漏接，5 个 PR 全停，最久的两周没人管。
 - **节奏**：主力是主人 Mac 上的 `scripts/pr-sweep-local.sh`，它自己常驻、每轮跑完歇 5 分钟，pm2 只管让它活着（密钥读 onboard.sh 用的同一份本机密钥文件，每轮重读）：`pm2 start scripts/pr-sweep-local.sh --name pr-sweeper --interpreter bash && pm2 save`。以前按 `--cron-restart '*/5 * * * *' --no-autorestart` 装过的，先 `pm2 delete pr-sweeper` 再按这条重装：pm2 的定时重启只管还活着的进程，跑一轮就退出的脚本不会再被拉起来。`pr-sweeper.yml` 兜底：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。Mac 上那份日志写真名（`owner/repo#N`，`pr-sweep-local.sh` 设了 `SWEEP_LOG_REAL_NAMES=1`），错误日志每行开头带 `YYYY-MM-DD HH:MM:SS`；`pr-sweeper.yml` 的日志照旧只写代号（2026-10-30，MEL-522）。pm2 跑的是本机这份仓库里的脚本，改了要 `git pull --ff-only` 再 `pm2 restart pr-sweeper ghwf-runner-pool`。
+- **自己跟上新代码**（2026-11-08，MEL-600）：Mac 上的巡检每轮开始时，本机仓库在 develop 上、已跟踪文件没改动，就 `git pull --ff-only`，日志写一行「更新到了 <短 SHA>」。合并后最多约 6 分钟跟上（歇 5 分钟加一轮约 40 秒）。不在 develop、有改动、拉失败都只记一行，这一轮照跑。`pr-sweep-local.sh` 和 `runner-pool.sh` 发现自己的文件变了（比 `cksum`，所以手动拉的也算）就记一行、退出码 0 退出，等 pm2 拉起新代码，所以 pm2 不能加 `--no-autorestart`。`pr-sweep.sh` 每轮重新启动，拉到就生效。
 - **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`：Mac 上那个也每轮读这个变量，下一轮起两边都停，不用去 Mac 上关。Mac 上用本机 `gh` 的登录读它（fine-grained PAT 没有 Variables 权限）；读不了就不敢动手、推一次手机通知。
 - **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
 - 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。

@@ -224,8 +224,14 @@ tick() {
 
 main() {
   mkdir -p "$state"
-  local last_refresh=0 now
+  local last_refresh=0 now self="${BASH_SOURCE[0]}" self_sum
+  self_sum="$(cksum "$self")"
   while :; do
+    # 这里不拉代码，由巡检拉（同一份检出）。自己变了就退出 0，pm2 拉起新代码；容器不归这个进程管，在跑的 job 不受影响。
+    if [ "$(cksum "$self")" != "$self_sum" ]; then
+      echo "自更新：$(basename "$self") 变了，退出让 pm2 拉起新代码"
+      exit 0
+    fi
     if ! ensure_docker; then
       alert docker "🤖 本机 runner 停了" "colima 里的 docker 起不来，私有仓库的 job 会一直排队（最多 24 小时后 GitHub 取消）。在 Mac 上跑 colima start 看报错。"
       sleep 15

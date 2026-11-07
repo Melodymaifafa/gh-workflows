@@ -10,6 +10,8 @@ set -euo pipefail
 
 secrets="${GH_WORKFLOWS_SECRETS:-$HOME/.config/gh-workflows/secrets.env}"
 here="$(cd "$(dirname "$0")" && pwd)"
+self="$here/$(basename "$0")"
+self_sum="$(cksum "$self")"
 switch_alerted=
 
 notify() {
@@ -22,6 +24,28 @@ notify() {
 # 每行前加「日期 时间 」。用 date，不用 printf %(…)T：Mac 自带的 bash 3.2 没有。最后一行没换行也照打。
 stamp() {
   while IFS= read -r line || [ -n "$line" ]; do printf '%s %s\n' "$(date '+%F %T')" "$line"; done
+}
+
+# 本机仓库跟上 develop，修复合并后不用等人来拉（做法照 wecom-agent-bot 的 src/self-update.js）。只在 develop 上、
+# 已跟踪文件没改动时才拉。未跟踪文件不算改动：pm2 或 runner 留的临时文件不该让更新永远卡住，真跟新提交冲突时拉取自己会失败。
+# 卡住的拉取会卡死之后每一轮，所以不等密码，连接没速度 60 秒就放弃。在 sweep_once 外面跑，碰不到密钥。
+update_checkout() {
+  local repo branch dirty before out
+  repo="$(git -C "$here" rev-parse --show-toplevel 2>/dev/null)" ||
+    { echo "自更新：${here} 不是 git 仓库，跳过"; return 0; }
+  branch="$(git -C "$repo" symbolic-ref --short -q HEAD)" || branch="（没有分支）"
+  [ "$branch" = develop ] || { echo "自更新：本机仓库在 ${branch}，不在 develop，跳过"; return 0; }
+  # 看不了也算有改动：拿不准就不拉。
+  dirty="$(git -C "$repo" status --porcelain --untracked-files=no 2>&1)"
+  [ -z "$dirty" ] || { echo "自更新：本机仓库有没提交的改动，跳过"; return 0; }
+  before="$(git -C "$repo" rev-parse HEAD)"
+  if ! out="$(GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=60 \
+    git -C "$repo" pull --ff-only origin develop 2>&1)"; then
+    echo "自更新：git pull 失败，这一轮照跑：$(printf '%s' "$out" | tr -s '[:space:]' ' ')"
+    return 0
+  fi
+  [ "$(git -C "$repo" rev-parse HEAD)" = "$before" ] ||
+    echo "自更新：更新到了 $(git -C "$repo" rev-parse --short HEAD)"
 }
 
 # 每轮在子 shell 里跑，密钥和环境不留到下一轮。退出码 3 = 本机 gh 读不了总开关（已推过一次手机）。
@@ -68,6 +92,12 @@ exec 2> >(stamp >&2)
 
 while :; do
   echo "== $(date '+%F %T') =="
+  update_checkout || true  # 更新出什么错，这一轮都照跑（|| 也让函数里的 set -e 不生效）
+  # 跑着的循环是旧代码，自己变了（刚拉到的，或别人拉的）就退出 0，pm2 拉起新代码。pr-sweep.sh 每轮重新启动，不用退出。
+  if [ "$(cksum "$self")" != "$self_sum" ]; then
+    echo "自更新：$(basename "$self") 变了，退出让 pm2 拉起新代码"
+    exit 0
+  fi
   rc=0
   sweep_once || rc=$?
   case "$rc" in
