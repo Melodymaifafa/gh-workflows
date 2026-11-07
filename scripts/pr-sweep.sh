@@ -4,8 +4,10 @@
 # 的定时任务兜底（cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次）。
 #
 # 集成分支 = 仓库默认分支上合并调用桩的 base_branch（见 integration_base）。
-# 每个 open、非草稿、同仓库、标题不带 [no-codex-merge]/[no-claude]、分支不是 agent/* 的 PR，按顺序只走第一条命中的规则：
-# （agent/* 是 momo 的分支：momo 在 Mac 上自己追 Codex、自己合并，两边一起动会互相撞推送。）
+# 每个 open、非草稿、同仓库、标题不带 [no-codex-merge]/[no-claude] 的 PR，按顺序只走第一条命中的规则：
+# （agent/* 是 momo 的分支：momo 在 Mac 上自己追 Codex、自己合并，两边一起动会互相撞推送。所以 24 小时内有动静
+# （看 updated_at）的不碰；严格超过 24 小时没动静，算 momo 不再跟进，当普通 PR 走下面的规则。巡检自己留言也刷新
+# updated_at，所以这种 PR 每动一次至少隔 24 小时。iterate 和合并工作流照旧跳过 agent/*，修不了也合不了，最后落到告警叫人。）
 #   0. 没人管            → 仓库没接共享自动化、或 PR 没打向集成分支：空闲 ≥ 60 分钟时告警一次（unwatched），停。
 #   1. 有冲突            → 留一条不推手机的 conflict 标记叫醒合并工作流，由它把集成分支合进来、停；
 #                          它解不了会自己告警（conflict-stuck）；留言后空闲 ≥ 2 小时还没动静就由巡检告警。
@@ -79,6 +81,8 @@ max_retries=2
 max_merge_rekicks=2
 # 撞额度的重试不计数，但总次数也要封顶，免得额度一直不够时无限重试。
 max_total_retries=6
+# agent/* 的 PR 严格超过这么多秒没动静才接手（见文件头）。
+agent_quiet_secs=86400
 
 summary() { printf '%s\n' "$*" >>"$summary_file"; }
 
@@ -711,7 +715,7 @@ for entry in $repos; do
       .[] | select(.draft | not)
       | select(.head.repo.full_name == .base.repo.full_name)
       | select((.title | contains("[no-codex-merge]") or contains("[no-claude]")) | not)
-      | select((.head.ref // "") | startswith("agent/") | not)
+      | select(((.head.ref // "") | startswith("agent/") | not) or '"$now"' - (.updated_at | fromdateiso8601) > '"$agent_quiet_secs"')
       | "\(.number):\(.base.ref)"' 2>"$err")"; then
     echo "::warning::$label 列 PR 失败"; failed=1; continue
   fi
