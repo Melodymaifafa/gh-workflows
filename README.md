@@ -211,6 +211,7 @@ jobs:
 - **只给私有仓库开**：公开仓库谁都能提 PR，陌生人的代码不能在主人的 Mac 上跑 —— 公开仓库设了变量也不理。注册 runner 用主人本机 `gh` 的登录，容器只拿到一次性的 JIT 配置。
 - **磁盘**：job 删掉的数据只在虚拟机里腾地方，Mac 上的磁盘文件不会自己缩，所以每 10 分钟 `fstrim` 一次还给 Mac（不 trim 时 2026-10-12 涨到 19 GB，trim 后 4 GB）。
 - **日志**：`ghwf-runner-pool` 的输出和错误每行开头带 `YYYY-MM-DD HH:MM:SS`（2026-10-30，MEL-522）。
+- **内存**：虚拟机占的 Mac 内存只涨不还（2026-11-13 连开 28 天占 4.1 GB，重启后 1 GB）。所以它开满 `RESTART_DAYS`（默认 7）天后，池子每 10 分钟看一次：没有 job 在跑、也没有池外的容器，就收掉空闲的 runner 并 `colima restart`，约 1 分钟后 runner 补齐。
 - **手机通知**：colima 起不来、注册不上 runner（多半是本机 `gh` 登录失效）、磁盘剩不到 5 GB，各推一次，恢复了再推一次。
 - **代价**：Mac 关机或睡眠时 job 排队，GitHub 排满 24 小时就取消；虚拟机是 arm64，不是 x86。调用方仓库自己写死 `runs-on: ubuntu-latest` 的 job（比如 wechat-mimic-finetune 的 `training-cpu`）不受变量管，要改成 `${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}`。
 

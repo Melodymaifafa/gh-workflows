@@ -14,6 +14,7 @@ OWNER="${OWNER:-Melodymaifafa}"
 MAX_EXTRA_RUNNERS="${MAX_EXTRA_RUNNERS:-4}"
 JOB_MEMORY="${JOB_MEMORY:-3g}"       # 单个 job 的内存上限，免得一个 job 撑爆整个虚拟机
 REFRESH_SECONDS="${REFRESH_SECONDS:-600}"
+RESTART_DAYS="${RESTART_DAYS:-7}"    # 虚拟机开满这么多天就趁空闲重启一次，见 recycle_vm
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 context_dir="$here/../runner"
 state="${RUNNER_POOL_STATE:-$HOME/.local/state/ghwf-runner-pool}"
@@ -96,6 +97,27 @@ prune() {
   # job 删掉的数据只在虚拟机里腾出地方，Mac 上的磁盘文件不会自己缩：不 trim 就只涨不缩
   # （2026-10-12 实测 19 GB，里面只用了 9 GB；trim 一次回到 4 GB）
   colima ssh -- sudo fstrim -a >/dev/null 2>&1 || true
+}
+
+# 虚拟机占的 Mac 内存只涨不还（2026-11-13 实测：连开 28 天占 4.1 GB，重启后 1 GB）。开满 RESTART_DAYS 天、
+# 池里没有 job 在跑、也没有池外的容器（主人别的东西）时重启一次。先收掉空闲的 runner 再重启：
+# 不收，它可能在这几秒里接到 job，跟着虚拟机一起没了。重启了返回 0，主循环回到开头重新确认 docker。
+recycle_vm() {
+  local up rows all name
+  up="$(colima ssh -- cut -d. -f1 /proc/uptime 2>/dev/null)" || return 1
+  case "$up" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$up" -ge $((RESTART_DAYS * 86400)) ] || return 1
+  rows="$(list_runners)" || return 1
+  case "$rows" in *' busy'*) return 1 ;; esac
+  all="$(docker ps -q)" || return 1
+  [ "$(awk 'NF' <<<"$all" | wc -l)" -eq "$(awk 'NF' <<<"$rows" | wc -l)" ] || return 1
+  while read -r name _; do
+    [ -n "$name" ] || continue
+    took_job "$name" && return 1
+    docker rm -f "$name" >/dev/null || return 1
+  done <<<"$rows"
+  echo "虚拟机开了 $((up / 86400)) 天，没有 job 在跑，重启它把内存还给 Mac"
+  colima restart >/dev/null 2>&1 || echo "colima restart 没成功，下一轮重新启动" >&2
 }
 
 # 重读名单：私有仓库里 GHWF_RUNNER 等于本池标签的。单个仓库读失败（不是 404）就照旧留着它。
@@ -243,6 +265,7 @@ main() {
       last_refresh="$now"
       refresh_repos || echo "读不到仓库名单，沿用上一份" >&2
       prune
+      if recycle_vm; then continue; fi
     fi
     # 先看磁盘再构建：构建要下 Ubuntu 的包，正是磁盘守的那点空间
     if [ -f "$state/repos" ] && check_disk; then
