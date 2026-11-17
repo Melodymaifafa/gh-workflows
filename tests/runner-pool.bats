@@ -116,3 +116,80 @@ spawn r1"
 b r1 idle
 c r2 busy"
 }
+
+# recycle_vm 的假环境：虚拟机开了 $1 秒，池里是 $2 这几行，docker ps -q 一共 $3 个容器。
+# 每次 docker rm / colima restart 记到 $calls。
+fake_vm() {
+  calls="$BATS_TEST_TMPDIR/calls"
+  : >"$calls"
+  vm_up="$1" pool_rows="$2" container_count="$3"
+  colima() {
+    case "$1" in
+      ssh) [ -n "$vm_up" ] && echo "$vm_up" ;;
+      restart) echo "colima restart" >>"$calls" ;;
+    esac
+  }
+  list_runners() { [ -z "$pool_rows" ] || printf '%s\n' "$pool_rows"; }
+  took_job() { [ "$1" = "${takes_job:-}" ]; }
+  docker() {
+    case "$1" in
+      ps) [ "$container_count" -eq 0 ] || seq "$container_count" ;;
+      rm) echo "docker rm $3" >>"$calls" ;;
+    esac
+  }
+}
+
+@test "a VM up for a week with only idle runners: they are removed, then it restarts" {
+  fake_vm $((8 * 86400)) 'a r1 idle
+b r2 stale' 2
+  run recycle_vm
+  [ "$status" -eq 0 ]
+  assert_equal "$(cat "$calls")" "docker rm a
+docker rm b
+colima restart"
+}
+
+@test "a VM up for less than RESTART_DAYS is left alone" {
+  fake_vm $((6 * 86400)) 'a r1 idle' 1
+  run recycle_vm
+  [ "$status" -eq 1 ]
+  assert_equal "$(cat "$calls")" ""
+}
+
+@test "a job is running: no restart, and the idle runners stay" {
+  fake_vm $((8 * 86400)) 'a r1 idle
+b r2 busy' 2
+  run recycle_vm
+  [ "$status" -eq 1 ]
+  assert_equal "$(cat "$calls")" ""
+}
+
+@test "a container from outside the pool is running: no restart" {
+  fake_vm $((8 * 86400)) 'a r1 idle' 2
+  run recycle_vm
+  [ "$status" -eq 1 ]
+  assert_equal "$(cat "$calls")" ""
+}
+
+@test "an idle runner that picks up a job before it is removed stops the restart" {
+  fake_vm $((8 * 86400)) 'a r1 idle
+b r2 idle' 2
+  takes_job=b
+  run recycle_vm
+  [ "$status" -eq 1 ]
+  assert_equal "$(cat "$calls")" "docker rm a"
+}
+
+@test "an unreadable VM uptime means no restart" {
+  fake_vm '' 'a r1 idle' 1
+  run recycle_vm
+  [ "$status" -eq 1 ]
+  assert_equal "$(cat "$calls")" ""
+}
+
+@test "an empty pool on an old VM still restarts" {
+  fake_vm $((8 * 86400)) '' 0
+  run recycle_vm
+  [ "$status" -eq 0 ]
+  assert_equal "$(cat "$calls")" "colima restart"
+}
