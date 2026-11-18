@@ -331,6 +331,31 @@ git -C '$clone' checkout -q topic"
   assert_equal "$(pushed)" 2
 }
 
+@test "behind over 24 hours, Pushover fails: the next round tries again, then stops once it gets through" {
+  stub_pushover
+  # 第 1 次推送失败，之后都成功。
+  stub curl "printf '%s\\n' \"\$*\" >>'$pushes'
+[ \"\$(grep -c api.pushover.net '$pushes')\" -gt 1 ] || exit 22"
+  git -C "$clone" checkout -q -b topic
+  old_remote_commit 25 notes.txt two
+  stub_sleeps ':' ':'
+  run_sweep
+  assert_equal "$(cat "$BATS_TEST_TMPDIR/sleeps")" 3
+  assert_equal "$(pushed)" 2
+  assert_equal "$(grep -c "Pushover 发送失败" "$err")" 1
+}
+
+@test "behind over 24 hours, no Pushover keys yet: pushes in the first round that has them" {
+  pushes="$BATS_TEST_TMPDIR/pushes"
+  stub curl "printf '%s\\n' \"\$*\" >>'$pushes'"
+  git -C "$clone" checkout -q -b topic
+  old_remote_commit 25 notes.txt two
+  stub_sleeps "printf '%s\\n' PUSHOVER_TOKEN=fake-token PUSHOVER_USER=fake-user >>'$GH_WORKFLOWS_SECRETS'" ':'
+  run_sweep
+  assert_equal "$(cat "$BATS_TEST_TMPDIR/sleeps")" 3
+  assert_equal "$(pushed)" 1
+}
+
 @test "runner pool: logs the commit it starts on" {
   setup_pool
   git -C "$BATS_TEST_TMPDIR/pool" init -q

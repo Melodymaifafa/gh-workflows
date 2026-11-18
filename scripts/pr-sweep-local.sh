@@ -15,11 +15,13 @@ self_sum="$(cksum "$self")"
 switch_alerted=
 behind_alerted=
 
+# 推出去了才返回 0：没钥匙或发送失败都返回 1，调用方靠它决定下一轮要不要再推。
 notify() {
-  if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then return 0; fi
+  if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then return 1; fi
   curl -q -sf -X POST https://api.pushover.net/1/messages.json \
     --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
-    --form-string "title=$1" --form-string "message=$2" >/dev/null || echo "Pushover 发送失败" >&2
+    --form-string "title=$1" --form-string "message=$2" >/dev/null ||
+    { echo "Pushover 发送失败" >&2; return 1; }
 }
 
 # 每行前加「日期 时间 」。用 date，不用 printf %(…)T：Mac 自带的 bash 3.2 没有。最后一行没换行也照打。
@@ -51,6 +53,7 @@ update_checkout() {
 
 # 每轮记一行本机代码在哪个提交。落后 develop 的最早那个提交已经合进去超过 24 小时（拉不了：不在 develop、有改动、
 # 拉取失败），推一次手机，追上了再重新算：11-08 合的自更新在 Mac 上一直没生效，没人发现（MEL-754）。
+# 推出去了才算推过：没钥匙、发送失败，下一轮再推。
 # 自更新跳过拉取时 origin/develop 不会动，所以这里自己 fetch 一次。推送用的密钥只在子 shell 里读。
 check_behind() {
   local repo head count oldest hours
@@ -68,10 +71,11 @@ check_behind() {
   oldest="$(git -C "$repo" log --first-parent --format=%ct HEAD..origin/develop | tail -n 1)"
   hours=$((($(date +%s) - oldest) / 3600))
   [ "$hours" -ge 24 ] && [ -z "$behind_alerted" ] || return 0
-  ( # shellcheck source=/dev/null
+  if ( # shellcheck source=/dev/null
     [ -r "$secrets" ] && . "$secrets"
-    notify "🤖 本机 PR 巡检没跟上新代码" "Mac 上的巡检代码（${repo}）停在 ${head}，落后 develop ${count} 个提交，最早那个 ${hours} 小时前就合进去了。自动更新没拉下来，原因看巡检日志里「自更新」开头的行。" )
-  behind_alerted=1
+    notify "🤖 本机 PR 巡检没跟上新代码" "Mac 上的巡检代码（${repo}）停在 ${head}，落后 develop ${count} 个提交，最早那个 ${hours} 小时前就合进去了。自动更新没拉下来，原因看巡检日志里「自更新」开头的行。" ); then
+    behind_alerted=1
+  fi
 }
 
 # 每轮在子 shell 里跑，密钥和环境不留到下一轮。退出码 3 = 本机 gh 读不了总开关（已推过一次手机）。
