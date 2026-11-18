@@ -187,6 +187,18 @@ b r2 idle' 2
   assert_equal "$(cat "$calls")" ""
 }
 
+@test "the VM's age is logged once a day, not on every check" {
+  local log="$BATS_TEST_TMPDIR/log"
+  fake_vm $((5 * 86400)) 'a r1 idle' 1
+  recycle_vm >>"$log" || true
+  vm_up=$((5 * 86400 + 600))
+  recycle_vm >>"$log" || true
+  vm_up=$((6 * 86400))
+  recycle_vm >>"$log" || true
+  assert_equal "$(cat "$log")" "虚拟机开了 5 天，满 7 天、没 job 在跑时重启
+虚拟机开了 6 天，满 7 天、没 job 在跑时重启"
+}
+
 @test "an empty pool on an old VM still restarts" {
   fake_vm $((8 * 86400)) '' 0
   run recycle_vm

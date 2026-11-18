@@ -13,6 +13,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 self="$here/$(basename "$0")"
 self_sum="$(cksum "$self")"
 switch_alerted=
+behind_alerted=
 
 notify() {
   if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then return 0; fi
@@ -46,6 +47,31 @@ update_checkout() {
   fi
   [ "$(git -C "$repo" rev-parse HEAD)" = "$before" ] ||
     echo "自更新：更新到了 $(git -C "$repo" rev-parse --short HEAD)"
+}
+
+# 每轮记一行本机代码在哪个提交。落后 develop 的最早那个提交已经合进去超过 24 小时（拉不了：不在 develop、有改动、
+# 拉取失败），推一次手机，追上了再重新算：11-08 合的自更新在 Mac 上一直没生效，没人发现（MEL-754）。
+# 自更新跳过拉取时 origin/develop 不会动，所以这里自己 fetch 一次。推送用的密钥只在子 shell 里读。
+check_behind() {
+  local repo head count oldest hours
+  repo="$(git -C "$here" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=60 \
+    git -C "$repo" fetch -q origin develop >/dev/null 2>&1 || true
+  head="$(git -C "$repo" rev-parse --short HEAD)"
+  count="$(git -C "$repo" rev-list --count HEAD..origin/develop 2>/dev/null)" || count=0
+  if [ "$count" = 0 ]; then
+    echo "自更新：本机代码在 ${head}"
+    behind_alerted=
+    return 0
+  fi
+  echo "自更新：本机代码在 ${head}，落后 develop ${count} 个提交"
+  oldest="$(git -C "$repo" log --first-parent --format=%ct HEAD..origin/develop | tail -n 1)"
+  hours=$((($(date +%s) - oldest) / 3600))
+  [ "$hours" -ge 24 ] && [ -z "$behind_alerted" ] || return 0
+  ( # shellcheck source=/dev/null
+    [ -r "$secrets" ] && . "$secrets"
+    notify "🤖 本机 PR 巡检没跟上新代码" "Mac 上的巡检代码（${repo}）停在 ${head}，落后 develop ${count} 个提交，最早那个 ${hours} 小时前就合进去了。自动更新没拉下来，原因看巡检日志里「自更新」开头的行。" )
+  behind_alerted=1
 }
 
 # 每轮在子 shell 里跑，密钥和环境不留到下一轮。退出码 3 = 本机 gh 读不了总开关（已推过一次手机）。
@@ -93,6 +119,7 @@ exec 2> >(stamp >&2)
 while :; do
   echo "== $(date '+%F %T') =="
   update_checkout || true  # 更新出什么错，这一轮都照跑（|| 也让函数里的 set -e 不生效）
+  check_behind || true
   # 跑着的循环是旧代码，自己变了（刚拉到的，或别人拉的）就退出 0，pm2 拉起新代码。pr-sweep.sh 每轮重新启动，不用退出。
   if [ "$(cksum "$self")" != "$self_sum" ]; then
     echo "自更新：$(basename "$self") 变了，退出让 pm2 拉起新代码"

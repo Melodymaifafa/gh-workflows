@@ -48,6 +48,27 @@ touch '$slept'
 $1"
 }
 
+# stub_sleeps <命令…>：第 k 次 sleep 跑第 k 条命令再放行；命令用完了就让循环停。
+stub_sleeps() {
+  local i=0 c
+  for c in "$@"; do
+    i=$((i + 1))
+    printf '%s\n' "$c" >"$BATS_TEST_TMPDIR/sleep.$i"
+  done
+  stub sleep "n=\$((\$(cat '$BATS_TEST_TMPDIR/sleeps' 2>/dev/null || echo 0) + 1))
+echo \$n >'$BATS_TEST_TMPDIR/sleeps'
+[ -e '$BATS_TEST_TMPDIR/sleep.'\$n ] || exit 1
+. '$BATS_TEST_TMPDIR/sleep.'\$n"
+}
+
+# stub_pushover：密钥文件里加上 Pushover 的两把假钥匙，替身 curl 每次推送记一行到 $pushes。
+stub_pushover() {
+  pushes="$BATS_TEST_TMPDIR/pushes"
+  printf '%s\n' PUSHOVER_TOKEN=fake-token PUSHOVER_USER=fake-user >>"$GH_WORKFLOWS_SECRETS"
+  stub curl "printf '%s\\n' \"\$*\" >>'$pushes'"
+}
+pushed() { if [ -e "$pushes" ]; then grep -c api.pushover.net "$pushes"; else echo 0; fi; }
+
 # run_split <命令…>：stdout 存进 $out、stderr 存进 $err、退出码存进 $code。
 run_split() {
   { {
@@ -71,6 +92,15 @@ seed_commit() {
 remote_commit() {
   seed_commit "$@"
   git -C "$seed" push -q origin develop
+}
+
+# old_remote_commit <几小时前> <文件> [内容]：同上，提交时间（合进 develop 的时间）是那么多小时以前。
+old_remote_commit() {
+  local hours="$1"
+  shift
+  export GIT_COMMITTER_DATE="$(($(date +%s) - hours * 3600)) +0000"
+  remote_commit "$@"
+  unset GIT_COMMITTER_DATE
 }
 
 # setup_pool：runner 池的一份副本（它开头要读 runner/Dockerfile），docker 连不上，循环只走到 sleep。
@@ -173,8 +203,8 @@ edit"
   run_sweep
   assert_head "$start"
   assert_equal "$(grep -c '^自更新：git pull 失败，这一轮照跑：.*no-such-remote' "$out")" 1
-  # 失败原因压成一行：除了 == 时间 ==、这一行和巡检，没有别的。
-  assert_equal "$(wc -l <"$out" | tr -d ' ')" 3
+  # 失败原因压成一行：除了 == 时间 ==、这一行、本机代码那一行和巡检，没有别的。
+  assert_equal "$(wc -l <"$out" | tr -d ' ')" 4
   assert_swept
   assert_code 1
 }
@@ -240,6 +270,74 @@ git -C '$clone' pull -q --ff-only origin develop"
   grep -qx "自更新：pr-sweep-local.sh 变了，退出让 pm2 拉起新代码" "$out"
   refute_contains "$(cat "$out")" "更新到了"
   assert_swept 1
+}
+
+@test "every round logs the commit the local copy is on" {
+  remote_commit notes.txt two
+  stub_sleeps ':'
+  run_sweep
+  assert_head "$new"
+  assert_equal "$(grep -cx "自更新：本机代码在 $(git -C "$seed" rev-parse --short HEAD)" "$out")" 2
+}
+
+@test "behind develop for over 24 hours: logs how far behind, and pushes once, not every round" {
+  stub_pushover
+  git -C "$clone" checkout -q -b topic
+  old_remote_commit 25 notes.txt two
+  stub_sleeps ':' ':'
+  run_sweep
+  assert_head "$start"
+  assert_equal "$(grep -cx "自更新：本机代码在 ${start:0:7}，落后 develop 1 个提交" "$out")" 3
+  assert_equal "$(pushed)" 1
+  assert_contains "$(cat "$pushes")" "落后 develop 1 个提交，最早那个 25 小时前就合进去了"
+  assert_contains "$(cat "$pushes")" "token=fake-token"
+}
+
+@test "behind develop for 23 hours: logs it, no push yet" {
+  stub_pushover
+  git -C "$clone" checkout -q -b topic
+  old_remote_commit 23 notes.txt two
+  run_sweep
+  grep -qx "自更新：本机代码在 ${start:0:7}，落后 develop 1 个提交" "$out"
+  assert_equal "$(pushed)" 0
+}
+
+@test "a dirty checkout that cannot pull still finds out it is behind" {
+  stub_pushover
+  old_remote_commit 25 notes.txt two
+  echo edit >>"$clone/notes.txt"
+  run_sweep
+  assert_head "$start"
+  grep -qx "自更新：本机仓库有没提交的改动，跳过" "$out"
+  grep -qx "自更新：本机代码在 ${start:0:7}，落后 develop 1 个提交" "$out"
+  assert_equal "$(pushed)" 1
+}
+
+@test "catching up resets the push: falling behind again pushes again" {
+  stub_pushover
+  git -C "$clone" checkout -q -b topic
+  old_remote_commit 25 notes.txt two
+  # 第 1 轮落后、推一次；第 2 轮切回 develop 拉到最新、不推；第 3 轮又落后一天多，再推一次。
+  stub_sleeps "git -C '$clone' checkout -q develop" \
+    "export GIT_COMMITTER_DATE='$(($(date +%s) - 30 * 3600)) +0000'
+echo three >>'$seed/notes.txt'
+git -C '$seed' commit -qam three
+git -C '$seed' push -q origin develop
+git -C '$clone' checkout -q topic"
+  run_sweep
+  assert_equal "$(cat "$BATS_TEST_TMPDIR/sleeps")" 3
+  grep -qx "自更新：本机代码在 $(git -C "$clone" rev-parse --short develop)" "$out"
+  grep -qx "自更新：本机代码在 ${start:0:7}，落后 develop 2 个提交" "$out"
+  assert_equal "$(pushed)" 2
+}
+
+@test "runner pool: logs the commit it starts on" {
+  setup_pool
+  git -C "$BATS_TEST_TMPDIR/pool" init -q
+  git -C "$BATS_TEST_TMPDIR/pool" add -A
+  git -C "$BATS_TEST_TMPDIR/pool" commit -q -m pool
+  run_pool
+  grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} 启动：本机代码在 $(git -C "$BATS_TEST_TMPDIR/pool" rev-parse --short HEAD)\$" "$out"
 }
 
 @test "runner pool: its own file changes, so it logs a stamped line and exits 0" {

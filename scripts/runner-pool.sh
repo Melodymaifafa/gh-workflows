@@ -106,6 +106,11 @@ recycle_vm() {
   local up rows all name
   up="$(colima ssh -- cut -d. -f1 /proc/uptime 2>/dev/null)" || return 1
   case "$up" in '' | *[!0-9]*) return 1 ;; esac
+  # 每过一天记一行：日志里看得出重启的倒计时在走（MEL-754）。
+  if [ "$((up / 86400))" != "${vm_days_logged:-}" ]; then
+    vm_days_logged=$((up / 86400))
+    echo "虚拟机开了 ${vm_days_logged} 天，满 ${RESTART_DAYS} 天、没 job 在跑时重启"
+  fi
   [ "$up" -ge $((RESTART_DAYS * 86400)) ] || return 1
   rows="$(list_runners)" || return 1
   case "$rows" in *' busy'*) return 1 ;; esac
@@ -248,6 +253,8 @@ main() {
   mkdir -p "$state"
   local last_refresh=0 now self="${BASH_SOURCE[0]}" self_sum
   self_sum="$(cksum "$self")"
+  # 记下跑的是哪个提交：巡检拉了新代码后，看得出 pm2 拉起的是不是新代码（MEL-754）。
+  echo "启动：本机代码在 $(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo '（不是 git 仓库）')"
   while :; do
     # 这里不拉代码，由巡检拉（同一份检出）。自己变了就退出 0，pm2 拉起新代码；容器不归这个进程管，在跑的 job 不受影响。
     if [ "$(cksum "$self")" != "$self_sum" ]; then
