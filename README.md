@@ -99,12 +99,13 @@ Claude 这一步的形状同代审：只给 Read/Glob/Grep、只读令牌、根�
 
 合并用主人的 PAT（`CODEX_TRIGGER_TOKEN`），不用 `github.token`：GitHub 不让 `github.token` 的 push 触发别的 workflow，那样调用方 `ci.yml` 的 `on: push` 不跑，合并出来的 commit 上没有 CI，`ff-main` 就永远不挪 main（2026-10-07 wechat-mimic-finetune 实测）。仓库没设这把 PAT、或它合不动（失效 / 权限不够），就退回 `github.token`：照样合，只是那个 commit 上没 CI。
 
-**巡检**（`scripts/pr-sweep.sh`）：替合并环节盯 Codex（见上方「不在 runner 上等 Codex」），修复那轮推上去的 head 离上一条 review 满 6 分钟就召唤，并批掉 GitHub 扣住等批准的 CI（只批带 M7 的 head，也就是流水线自己推的）；没人碰过的 head 空闲 10 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused` `carried-open`、CI 红）等人处理。有冲突的 head 先留一条 `conflict` 标记叫醒合并环节自动解（见上方「冲突」）。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
+**巡检**（`scripts/pr-sweep.sh`）：替合并环节盯 Codex（见上方「不在 runner 上等 Codex」），修复那轮推上去的 head 离上一条 review 满 6 分钟就召唤，并批掉 GitHub 扣住等批准的 CI（只批带 M7 的 head，也就是流水线自己推的）；没人碰过的 head 空闲 10 分钟、或任何 head 空闲 60 分钟就重新叫审（每个 head 3 次、间隔 ≥ 60 分钟，之后告警 `stalled`，再每天一次共 7 天）；有意见但修复失败的 head 重修最多 2 次（撞额度的不算，但总数封顶 6 次），之后告警 `retry-exhausted`。停车的 head（`no-fix` `round-cap` `retry-exhausted` `merge-refused` `carried-open`、CI 红）等人处理。CI 红停车后严格超过 24 小时没动静（不看分支名），告警一次 `ci-stale` 叫人，之后日志里不再每轮记它（2026-11-19，MEL-754：一个 PR 停了 5 天，日志记了 1312 行没人接）。有冲突的 head 先留一条 `conflict` 标记叫醒合并环节自动解（见上方「冲突」）。没人管的 PR（仓库没接共享调用桩，或 PR 没打向集成分支）空闲 60 分钟后每个 head 告警一次 `unwatched`，不叫审不重修。
 
 - **集成分支**：每个仓库从默认分支上的 `.github/workflows/codex-approved-merge.yml` 读 `base_branch`（本仓库读 `self-codex-approved-merge.yml`），没写就是 develop。读不到（多半是 `CODEX_TRIGGER_TOKEN` 缺 Contents 权限）就按旧规则只扫默认分支是 develop 的仓库，run 里警告一次。
 - **漏接的仓库每轮都点名**（2026-10-06，MEL-308）：有开着的 PR 却没装共享调用桩的仓库，run 摘要和 warning 里每次都列出来，并给出 `./onboard.sh <仓库> <python|node>`。`unwatched` 告警是按 head 去重的，head 不变就只响一次 —— 但仓库漏接是仓库级的，换个 head 也不会自己好，所以这条不跟着 head 去重。MEL-308 查出来的就是这个：三个仓库漏接，5 个 PR 全停，最久的两周没人管。
 - **节奏**：主力是主人 Mac 上的 `scripts/pr-sweep-local.sh`，它自己常驻、每轮跑完歇 5 分钟，pm2 只管让它活着（密钥读 onboard.sh 用的同一份本机密钥文件，每轮重读）：`pm2 start scripts/pr-sweep-local.sh --name pr-sweeper --interpreter bash && pm2 save`。以前按 `--cron-restart '*/5 * * * *' --no-autorestart` 装过的，先 `pm2 delete pr-sweeper` 再按这条重装：pm2 的定时重启只管还活着的进程，跑一轮就退出的脚本不会再被拉起来。`pr-sweeper.yml` 兜底：cron 写的每 15 分钟，GitHub 实际 2–7 小时才跑一次。急的话手动点 **Actions → PR sweeper → Run workflow**，取消勾选 `dry_run` 才会动手。Mac 上那份日志写真名（`owner/repo#N`，`pr-sweep-local.sh` 设了 `SWEEP_LOG_REAL_NAMES=1`），错误日志每行开头带 `YYYY-MM-DD HH:MM:SS`；`pr-sweeper.yml` 的日志照旧只写代号（2026-10-30，MEL-522）。pm2 跑的是本机这份仓库里的脚本。MEL-600 上线前就在跑的进程，要手动 `git pull --ff-only` 再 `pm2 restart pr-sweeper ghwf-runner-pool` 一次，之后自动（见下一条）。
 - **自己跟上新代码**（2026-11-08，MEL-600）：Mac 上的巡检每轮开始时，本机仓库在 develop 上、已跟踪文件没改动，就 `git pull --ff-only`，日志写一行「更新到了 <短 SHA>」。合并后最多约 6 分钟跟上（歇 5 分钟加一轮约 40 秒）。不在 develop、有改动、拉失败都只记一行，这一轮照跑。`pr-sweep-local.sh` 和 `runner-pool.sh` 发现自己的文件变了（比 `cksum`，所以手动拉的也算）就记一行、退出码 0 退出，等 pm2 拉起新代码，所以 pm2 不能加 `--no-autorestart`。`pr-sweep.sh` 每轮重新启动，拉到就生效。
+- **没跟上就推手机**（2026-11-19，MEL-754）：每轮日志写一行「本机代码在 <短 SHA>」，落后时带上落后 develop 几个提交。拉不了（不在 develop、有改动、拉失败）、落后的最早那个提交已合进 develop 超过 24 小时，推一次手机；没推出去（没钥匙、发送失败）下一轮再推，追上后重新算。11-08 合的自更新在 Mac 上 11 天没生效，就是因为没人发现。
 - **开关**：本仓库的 Actions 变量 `SWEEP_MODE` = `off`（默认，没设也是 off）/ `dry`（只在 run 摘要里写「会做什么」）/ `live`。出问题先改回 `off`：Mac 上那个也每轮读这个变量，下一轮起两边都停，不用去 Mac 上关。Mac 上用本机 `gh` 的登录读它（fine-grained PAT 没有 Variables 权限）；读不了就不敢动手、推一次手机通知。
 - **本仓库需要 4 个密钥**，巡检才能跑（2026-09-18 已加）；读各仓库调用桩也用其中的 `CODEX_TRIGGER_TOKEN`，不用另配。
 - 本仓库是 public，run 日志人人能看：私有仓库只写 `repo-<HMAC 前 8 位>`，不写名字、分支名、PR 号和 SHA。
@@ -210,7 +211,7 @@ jobs:
 - **每个仓库常备一个空闲的**：合并环节会占着 runner 等 CI（最多 30 分钟），一个仓库只有一个 runner 就会互相等死。空闲的约 40 MB。容器总数到「仓库数 + `MAX_EXTRA_RUNNERS`（默认 4）」就不再补，排队等；空闲的随时会接 job，所以这也是同时跑的 job 上限。满了时，有 job 在跑的仓库可以收掉一个「没 job 在跑的仓库」的空闲 runner 给自己用（runner 只服务注册它的仓库）。虚拟机自己限 4 GB 内存，挤不到 Mac。
 - **只给私有仓库开**：公开仓库谁都能提 PR，陌生人的代码不能在主人的 Mac 上跑 —— 公开仓库设了变量也不理。注册 runner 用主人本机 `gh` 的登录，容器只拿到一次性的 JIT 配置。
 - **磁盘**：job 删掉的数据只在虚拟机里腾地方，Mac 上的磁盘文件不会自己缩，所以每 10 分钟 `fstrim` 一次还给 Mac（不 trim 时 2026-10-12 涨到 19 GB，trim 后 4 GB）。
-- **日志**：`ghwf-runner-pool` 的输出和错误每行开头带 `YYYY-MM-DD HH:MM:SS`（2026-10-30，MEL-522）。
+- **日志**：`ghwf-runner-pool` 的输出和错误每行开头带 `YYYY-MM-DD HH:MM:SS`（2026-10-30，MEL-522）。启动时写一行「本机代码在 <短 SHA>」，虚拟机每多开一天写一行开了几天（2026-11-19，MEL-754）。
 - **内存**：虚拟机占的 Mac 内存只涨不还（2026-11-13 连开 28 天占 4.1 GB，重启后 1 GB）。所以它开满 `RESTART_DAYS`（默认 7）天后，池子每 10 分钟看一次：没有 job 在跑、也没有池外的容器，就收掉空闲的 runner 并 `colima restart`，约 1 分钟后 runner 补齐。
 - **手机通知**：colima 起不来、注册不上 runner（多半是本机 `gh` 登录失效）、磁盘剩不到 5 GB，各推一次，恢复了再推一次。
 - **代价**：Mac 关机或睡眠时 job 排队，GitHub 排满 24 小时就取消；虚拟机是 arm64，不是 x86。调用方仓库自己写死 `runs-on: ubuntu-latest` 的 job（比如 wechat-mimic-finetune 的 `training-cpu`）不受变量管，要改成 `${{ vars.GHWF_RUNNER || 'ubuntu-latest' }}`。

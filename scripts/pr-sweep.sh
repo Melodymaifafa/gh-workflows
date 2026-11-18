@@ -12,6 +12,8 @@
 #   1. 有冲突            → 留一条不推手机的 conflict 标记叫醒合并工作流，由它把集成分支合进来、停；
 #                          它解不了会自己告警（conflict-stuck）；留言后空闲 ≥ 2 小时还没动静就由巡检告警。
 #   2. 这个 head 已停车  → 停（no-fix、round-cap、retry-exhausted、merge-refused、carried-open、CI 红且 unstable）。
+#                          CI 红停车后严格超过 24 小时没动静（不看分支名）：告警一次 ci-stale 叫人，之后这个 head
+#                          每轮不再记日志（MEL-754：一个 PR 停了 5 天，日志里记了 1312 行，没人接）。
 #   3. 额度还没恢复      → 停（这个 head 上最晚的 until 还没到）。
 #   4. head 有审查意见   → 空闲 ≥ 60 分钟或额度已恢复时发 M5 让 iterate 再修，每个 head 最多算 2 次
 #                          （M5 之后又撞额度的那次不算），但 M5 总数封顶 6 次；用完且空闲 ≥ 60 分钟就告警一次
@@ -83,6 +85,8 @@ max_merge_rekicks=2
 max_total_retries=6
 # agent/* 的 PR 严格超过这么多秒没动静才接手（见文件头）。
 agent_quiet_secs=86400
+# CI 红停车后严格超过这么多秒没动静，就叫人（规则 2）。
+ci_parked_secs=86400
 
 summary() { printf '%s\n' "$*" >>"$summary_file"; }
 
@@ -547,6 +551,8 @@ sweep_pr() {
   local summon_id summon_at m7_round last_review_at codex_comments codex_quota codex_reviews handed woken codex_concluded thumbs eyes
   local quota_seen codex_ok_seen summary_id summary_status summary_at summary_woken receipt_h
   read_facts
+  # CI 红停车、已叫过人（规则 2 的 ci-stale）：等人处理，每轮不再记一遍。
+  case ",$alerts," in *,ci-stale,*) [ "$state" != unstable ] || return 0 ;; esac
   echo "$who$hs: idle=${idle}s state=$state findings=$findings retries=$retries kicks=$kicks alerts=$alerts"
 
   # 0. 没人管：不叫审、不重修，告警一次。空闲 60 分钟再告，给人留时间改 base 或关掉。
@@ -583,7 +589,17 @@ sweep_pr() {
   # 一条请修复的 review、修过一轮还没关掉，或者没有主人的 PAT 补不了。再叫审只会再拿一个「通过」、
   # 再被拦一次。
   case ",$alerts," in *,no-fix,*|*,round-cap,*|*,retry-exhausted,*|*,merge-refused,*|*,carried-open,*) echo "  已停车"; return 0 ;; esac
-  case ",$alerts," in *,ci,*) [ "$state" != unstable ] || { echo "  CI 红，已停车"; return 0; } ;; esac
+  # CI 红停了一天多没人动：合并工作流停车时推过一次，这里再叫一次人，之后只等人。
+  case ",$alerts," in *,ci,*)
+    if [ "$state" = unstable ]; then
+      if [ "$idle" -gt "$ci_parked_secs" ]; then
+        alert_once ci-stale - "🤖 巡检：CI 没通过，这个 PR 已经停了超过 24 小时没人动。修好 CI 推上来，会重新审、自动合；不要了就关掉。"
+      else
+        echo "  CI 红，已停车"
+      fi
+      return 0
+    fi ;;
+  esac
 
   # 3. 额度还没恢复（取这个 head 上最晚的 until）。
   [ "$until_active" = 0 ] || { echo "  等额度恢复"; return 0; }
