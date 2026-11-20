@@ -167,6 +167,16 @@ false'
   refute_contains "$(step_env_keys "$WF" 'Verify the Codex fix')" 'GH_TOKEN'
 }
 
+# ubuntu-26.04 的 tail（uutils coreutils 0.10）拿到 FIFO 当 stdin 会按路径再 open 一次；验证命令
+# 退得快、tee 已经关了写端的话，这个 open 永远不返回，那串进程攥着本步的输出不放（2026-11：
+# 本仓库 CI 挂满 6 小时）。所以 FIFO 只许 tr 读，tail 排在匿名管道后面。
+@test "verify: the output FIFO is read by tr; no tail gets it as stdin" {
+  body="$(fix_guard_body verify_the_fix | grep -v '^[[:space:]]*#')"
+  assert_contains "$body" "exec 8< <(tr -d '\000' <\"\$verify_tail_fifo\" | tail -c 65536 | tail -n 30)"
+  # 同一段管道里 tail 后面（下一个 | 之前）不许再出现这个 FIFO：重定向给它、当参数给它都不行
+  ! printf '%s\n' "$body" | grep -E 'tail [^|]*"\$verify_tail_fifo"'
+}
+
 # 带令牌的那一步只从 output 拿这两样（真跑时 env: 接过去），不读验证命令写得动的 $RUNNER_TEMP。
 @test "verify: the step that posts the comment reads the command and tail from step outputs only" {
   env_block="$(awk '$0 == "      - name: Say why this round pushed nothing" { f = 1; next }

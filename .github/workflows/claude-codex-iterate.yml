@@ -1351,7 +1351,11 @@ jobs:
             # 清点证明它名下没活进程之后才读，那时写端已经全关了。
             verify_tail_fifo="$(mktemp -d "$RUNNER_TEMP/verify-tail-XXXXXX")/tail"
             mkfifo "$verify_tail_fifo"
-            exec 8< <(tail -c 65536 <"$verify_tail_fifo" | tail -n 30 | tr -d '\000')
+            # 读 FIFO 的必须是 tr，不能是 tail：ubuntu-26.04 的 tail（uutils coreutils 0.10）发现 stdin 是
+            # FIFO 就按路径再 open 一次，写端（tee）那时已经关了的话这个 open 永远不返回 —— 这串进程
+            # 攥着本步的 stderr 不放，step 退了也收不了尾（2026-11 本仓库 CI 挂满 6 小时）。tail 排在
+            # 匿名管道后面就没有路径可重开。
+            exec 8< <(tr -d '\000' <"$verify_tail_fifo" | tail -c 65536 | tail -n 30)
             exec 9> >(tee "$verify_tail_fifo")
             set -m
             trap - EXIT
