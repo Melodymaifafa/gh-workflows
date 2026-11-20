@@ -30,6 +30,10 @@ on:
         description: Runner label. Use macos-latest for packages restricted to darwin.
         type: string
         default: ubuntu-latest
+      test_timeout_minutes:
+        description: Cap on the Test step. The default is GitHub's own job cap, so nothing changes unless a caller lowers it.
+        type: number
+        default: 360
 
 jobs:
   lint-and-test:
@@ -82,7 +86,10 @@ jobs:
               default_lint='./actionlint -color && git ls-files "*.sh" | xargs -r shellcheck'
               # 没有 tests/*.bats 的仓库保持原样跳过 —— shell runtime 是共享的,
               # 这里一改,别的仓库会突然多出一条它们从没写过的测试命令。
-              default_test='if ls tests/*.bats >/dev/null 2>&1; then bats tests/; else echo "::notice::no bats tests"; fi'
+              # BATS_TEST_TIMEOUT：单条测试（连 setup）超过 300 秒就判它失败、接着跑下一条。没有它时一条
+              # 卡住的测试挂到 360 分钟的 job 上限才收（2026-11：验证留下的进程攥着 `run` 的管道，占了
+              # runner 6 小时）。这套测试最慢的一条也就十几秒。
+              default_test='if ls tests/*.bats >/dev/null 2>&1; then BATS_TEST_TIMEOUT=300 bats tests/; else echo "::notice::no bats tests"; fi'
               ;;
             *)
               echo "::error::unknown runtime '$RUNTIME' (expected python, node or shell)"
@@ -119,7 +126,10 @@ jobs:
           fi
           eval "$LINT_CMD"
 
+      # 同 Lint 那条超时，防的是「挂住」：上面那个单条超时管不到的（setup_file、别的 runtime 的
+      # 测试命令）由这一条收。默认 360 = job 上限，调用方不传就跟以前一样。
       - name: Test
+        timeout-minutes: ${{ inputs.test_timeout_minutes }}
         run: |
           if [ "$TEST_CMD" = skip ]; then
             echo "::notice::tests skipped by caller"

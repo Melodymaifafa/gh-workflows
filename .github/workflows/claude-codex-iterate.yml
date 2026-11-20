@@ -571,7 +571,12 @@ jobs:
             # 证不出来就回退，而回退的时候最好一个归它的文件都没留下（留了的话 runner
             # 自己清 $RUNNER_TEMP 都会撞权限）。
             [ "$(as_root -E -u "$verify_account" id -u 2>/dev/null)" = "$uid" ] || return 1
-            as_root -E -u "$verify_account" test -w "$verify_ws" >/dev/null 2>&1 || return 1
+            # 「写得动」问 bash 自己（内建的 -w，内核按附加组算），不问 PATH 上的 test：ubuntu-26.04 那份
+            # （uutils coreutils 0.10）只看主组，账号靠附加组写得动工作区也被报成写不动 —— 这一条
+            # 自测于是必败，每轮静默回退到 runner 用户（2026-11 ubuntu-latest 换成 26.04 之后）。
+            # shellcheck disable=SC2016  # $1 留给里面那层展开
+            as_root -E -u "$verify_account" "$verify_bash" -c '[ -w "$1" ]' "$verify_bash" "$verify_ws" \
+              >/dev/null 2>&1 || return 1
             # 第三条自测，也是这一整道清点唯一的正面证据：在那个账号下真起一个进程，
             # 确认清点看得见它（上面那段 the_sweep_can_see_that_account）。排在这里是
             # 因为它要以那个账号的身份启动，而上面那两条刚刚证明了这台机器上
@@ -1346,7 +1351,11 @@ jobs:
             # 清点证明它名下没活进程之后才读，那时写端已经全关了。
             verify_tail_fifo="$(mktemp -d "$RUNNER_TEMP/verify-tail-XXXXXX")/tail"
             mkfifo "$verify_tail_fifo"
-            exec 8< <(tail -c 65536 <"$verify_tail_fifo" | tail -n 30 | tr -d '\000')
+            # 读 FIFO 的必须是 tr，不能是 tail：ubuntu-26.04 的 tail（uutils coreutils 0.10）发现 stdin 是
+            # FIFO 就按路径再 open 一次，写端（tee）那时已经关了的话这个 open 永远不返回 —— 这串进程
+            # 攥着本步的 stderr 不放，step 退了也收不了尾（2026-11 本仓库 CI 挂满 6 小时）。tail 排在
+            # 匿名管道后面就没有路径可重开。
+            exec 8< <(tr -d '\000' <"$verify_tail_fifo" | tail -c 65536 | tail -n 30)
             exec 9> >(tee "$verify_tail_fifo")
             set -m
             trap - EXIT
