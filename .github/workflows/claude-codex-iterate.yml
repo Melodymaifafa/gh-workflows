@@ -571,7 +571,12 @@ jobs:
             # 证不出来就回退，而回退的时候最好一个归它的文件都没留下（留了的话 runner
             # 自己清 $RUNNER_TEMP 都会撞权限）。
             [ "$(as_root -E -u "$verify_account" id -u 2>/dev/null)" = "$uid" ] || return 1
-            as_root -E -u "$verify_account" test -w "$verify_ws" >/dev/null 2>&1 || return 1
+            # 「写得动」问 bash 自己（内建的 -w，内核按附加组算），不问 PATH 上的 test：ubuntu-26.04 那份
+            # （uutils coreutils 0.10）只看主组，账号靠附加组写得动工作区也被报成写不动 —— 这一条
+            # 自测于是必败，每轮静默回退到 runner 用户（2026-11 ubuntu-latest 换成 26.04 之后）。
+            # shellcheck disable=SC2016  # $1 留给里面那层展开
+            as_root -E -u "$verify_account" "$verify_bash" -c '[ -w "$1" ]' "$verify_bash" "$verify_ws" \
+              >/dev/null 2>&1 || return 1
             # 第三条自测，也是这一整道清点唯一的正面证据：在那个账号下真起一个进程，
             # 确认清点看得见它（上面那段 the_sweep_can_see_that_account）。排在这里是
             # 因为它要以那个账号的身份启动，而上面那两条刚刚证明了这台机器上
