@@ -59,6 +59,26 @@ load test_helper/common
   assert_contains "$output" 'ok 1 sanity'
 }
 
+# ---------- 一条测试挂住的时候同理（2026-11：验证留下的进程攥着 `run` 的管道，占了 runner 6 小时） ----------
+
+# 单条超时：bats 自己把挂住的那条判失败、接着跑下一条。取 60 秒到 10 分钟之间 —— 再短会误杀
+# 慢机器上的正常测试，再长就不算「几分钟内红」。
+@test "shell runtime gives every bats test a timeout" {
+  resolve_commands shell
+  seconds="$(resolved TEST_CMD | sed -nE 's/.*BATS_TEST_TIMEOUT=([0-9]+) bats tests\/.*/\1/p')"
+  [ -n "$seconds" ] || { echo 'the shell test command sets no BATS_TEST_TIMEOUT' >&2; return 1; }
+  [ "$seconds" -ge 60 ] && [ "$seconds" -le 600 ]
+}
+
+# 整步超时兜底（单条超时管不到 setup_file）。调用方不传就是 job 上限，本仓库自己传 60 以内。
+@test "the test step takes its timeout from the caller, and this repo's own CI sets one" {
+  # shellcheck disable=SC2016  # 找的就是字面量 ${{
+  assert_equal "$(step_key "$CI_WORKFLOW" Test timeout-minutes)" '${{ inputs.test_timeout_minutes }}'
+  minutes="$(sed -nE 's/^ +test_timeout_minutes: ([0-9]+)$/\1/p' "$REPO_ROOT/.github/workflows/self-ci.yml")"
+  [ -n "$minutes" ] || { echo 'self-ci.yml passes no test_timeout_minutes' >&2; return 1; }
+  [ "$minutes" -le 60 ]
+}
+
 # ---------- lint 挂住的时候要红得出来，而不是一声不响挂满 6 小时（MEL-291） ----------
 
 # actionlint 对每个 run: 块自动跑 shellcheck，块是写进那个进程 stdin 的；一超过 64 KiB

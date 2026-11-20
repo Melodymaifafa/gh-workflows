@@ -154,7 +154,7 @@ jobs:
       runtime: node
 ```
 
-`runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm` + `npm run test --if-present`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。
+`runtime` 三种：`python`（`uv + ruff + pytest`）、`node`（`npm` + `npm run test --if-present`）、`shell`（`actionlint + shellcheck`，给只有 bash 脚本和 workflow YAML 的仓库用，本仓库自己就走这个）。仓库有特殊情况时可以用 `install_cmd` / `lint_cmd` / `test_cmd` 单独覆盖；传 `skip` 表示该仓库暂时没有 lint 或测试。测试挂住时有两道超时：`shell` 的 bats 单条测试 300 秒（`BATS_TEST_TIMEOUT`）；`test_timeout_minutes` 给整个测试步骤设上限（默认 360 分钟，等于不设，本仓库传 30）。
 
 **修复那一轮的默认验证命令跟 `ci.yml` 的默认值逐字一样**，`tests/iterate-gate.bats` 有一条判定把两边钉在一起。差一个字的代价是单向的：没有 `package-lock.json` 的仓库 `npm ci` 直接失败，没有 `test` 脚本的仓库 `npm test` 报 Missing script —— CI 两样都绿着放过，修复那一轮却必然红（MEL-293）。`ci.yml` 用 `install_cmd` / `test_cmd` 覆盖过默认值的仓库，`claude-codex-iterate.yml` 的 `verify_cmd` 也要跟着覆盖，否则同一个坑换个地方出现。
 

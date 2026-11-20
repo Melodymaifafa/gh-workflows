@@ -11,6 +11,5 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       runtime: shell
-      # 钉在 24.04：ubuntu-latest 2026-11 换成 26.04 后，claude-verify-creds.bats 的专用账号那条测试挂、
-      # 推送被拒那条测试卡到 6 小时超时（PR #81）。这两条在 26.04 上修好之前别改回 ubuntu-latest。
-      runs_on: ubuntu-24.04
+      # 整套 bats 在 GitHub 的机器上跑 10 分钟左右；30 分钟还没完就是挂住了。
+      test_timeout_minutes: 30
