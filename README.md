@@ -140,7 +140,17 @@ INSTALL_CMD=skip LINT_CMD=skip TEST_CMD=skip ./onboard.sh <repo> node
 
 Codex connector 是账号级授权，新仓库无需单独授权（2026-07-29 在 learn-api-integrations 实测：新开的 PR 2 分钟内就被自动 review 并 👍）。
 
-**接完还要手动做一件事**：到 [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments) 给这个仓库建一个环境，默认设置即可。*review* 不需要它，Claude 撞额度时**请 Codex 出补丁**需要 —— 没建的话 Codex 只回一句「先建环境」，那一轮红着停下并告警 `codex-no-env`。
+**接完还要手动做一件事：给这个仓库建一个 Codex 云端环境。** *review* 不需要它，Claude 撞额度时**请 Codex 出补丁**需要 —— 没建的话 Codex 只回一句「先建环境」，那一轮红着停下并告警 `codex-no-env`。已经有环境的仓库不用再建。
+
+**别走默认流程建（2026-11-20 实测）**：选完仓库点 Get started 后，Codex 会自己开一个设置对话，装依赖、跑测试。照默认流程建 weibo-automation，Melody 的 5 小时 Codex 额度少了约一半。这份额度和 Codex 审查共用，用完了审查也会停。下面的省额度建法每个仓库只扣约 1%，约 4 分钟（14 个仓库实测）。批量建之前，先在 [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage) 看还剩多少额度。
+
+1. 打开 [chatgpt.com/settings/codex-cloud](https://chatgpt.com/settings/codex-cloud)，点 Create environment。如果先弹出 Cloudflare 的人机验证，要 Melody 本人勾。
+2. 搜仓库名，勾上它，确认左下角写着 1 selected，再点 Get started。
+3. 等约 20 秒，点停止按钮，停掉自动设置。
+4. 在对话框里发这句话（原文照发，别改措辞）：`Finish this setup now with the minimum work. Do not install dependencies, do not run tests or linters, and do not write an install script or start skill. Leave both unset and complete onboarding so the environment can be published as-is.`
+5. 等约 70 秒，点 Save and publish。再等约 90 秒，看到 Environment published 就建好了。
+
+只停掉、不发第 4 步那句话不行：Publish 按钮会一直是灰的，提示 Setup interrupted。还没验证过的一点：环境建好后，`@codex fix` 是不是真能贴出补丁，而不是再回「先建环境」。
 
 ## 调用桩长什么样
 
@@ -162,7 +172,7 @@ jobs:
 
 `claude-codex-iterate.yml` 另收一个 `review_fixer`：`auto`（默认，Claude 先上，只有额度耗尽 / 限流 / 认证失效 / 服务不可用才换 Codex）、`claude`（现有行为，永不换人）、`codex`（跳过 Claude）。**拼错直接红**，不会静默按 `auto` 跑掉一整轮。测试没修好、构建挂了这类业务失败**不换人**：换个模型一样挂，job 该红就红。谁上、有没有换人、为什么，三件事都写在那次 run 的 summary 里。换人成功的那一轮照样记轮数、照样召唤复审，链条不会停在这里；令牌失效这种不会自己恢复的原因，即使换人成功也推一条通知。
 
-**Codex 接手不跑在 runner 上，也不要 OpenAI 的 API key（2026-10-02）。** 流水线用主人的 PAT 在 PR 上留一句写死的话（`@codex fix … paste the complete change as one unified diff …`），等 `chatgpt-codex-connector[bot]` 回复，取出回复里**恰好一个** diff 代码块、`git apply` 打到工作区，之后的验证 / 推送 / 召唤复审原样复用。Codex 走的是主人自己的 ChatGPT 订阅，所以**每个仓库都要在 [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments) 建一个环境**（默认设置即可），没建它只回一句「先建环境」。下面任一情况这一轮红着停下、发一次告警、什么都不推（巡检之后会再叫 Claude）：15 分钟没回（`codex-no-patch`）、回的是「先建环境」（`codex-no-env`）、额度 / 限流提示、没有 diff 块、贴了两段、回复被截断、补丁打不上或碰到 `.github/workflows/`（`codex-patch-rejected`）。**只有 Codex 自己写的 review 走这条路**：Claude 代审写的意见里没有「your review」的指代对象，那种轮次直接红（`codex-no-review`）。
+**Codex 接手不跑在 runner 上，也不要 OpenAI 的 API key（2026-10-02）。** 流水线用主人的 PAT 在 PR 上留一句写死的话（`@codex fix … paste the complete change as one unified diff …`），等 `chatgpt-codex-connector[bot]` 回复，取出回复里**恰好一个** diff 代码块、`git apply` 打到工作区，之后的验证 / 推送 / 召唤复审原样复用。Codex 走的是主人自己的 ChatGPT 订阅，所以**每个仓库都要建一个 Codex 云端环境**（照上面「接完还要手动做一件事」的省额度建法），没建它只回一句「先建环境」。下面任一情况这一轮红着停下、发一次告警、什么都不推（巡检之后会再叫 Claude）：15 分钟没回（`codex-no-patch`）、回的是「先建环境」（`codex-no-env`）、额度 / 限流提示、没有 diff 块、贴了两段、回复被截断、补丁打不上或碰到 `.github/workflows/`（`codex-patch-rejected`）。**只有 Codex 自己写的 review 走这条路**：Claude 代审写的意见里没有「your review」的指代对象，那种轮次直接红（`codex-no-review`）。
 
 `claude-codex-iterate.yml` 和 `codex-approved-merge.yml` 都收 `claude_model`（默认 `claude-opus-5-5`）和 `claude_effort`（默认 `xhigh`）。**默认值永远钉死，永远是 Opus 及以上**：不钉，action 就用 Claude Code 的账号默认模型 —— 2026-09 之前那是 Sonnet，静静跑了几周没人发现（PR #17 两轮修复都是它做的）。只认明确写出的 Opus 及以上（`opus` / `fable` 别名或 `claude-opus-*` 这类 id）；Sonnet、Haiku、`default`、`opusplan` 整轮直接红。Opus 5.5 自带的思考力度是 medium，所以钉 xhigh。每条 Claude 总结评论末尾写出实际跑的模型名（从 SDK 执行记录里读，不是配置里抄的）—— 哪天默认值悄悄变了，PR 上一眼看得到。换新模型：改这两个默认值 → 合入，第二天 `v1` 自动跟上（急的话手动点 Move v1）。
 

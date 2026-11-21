@@ -3332,8 +3332,9 @@ jobs:
       # 为什么不再用 openai/codex-action：那条路要一把 platform.openai.com 的
       # API key（按用量付费）。走云端 Codex 用的是仓库主人自己的 ChatGPT 订阅，
       # 不另花钱，而且不必把一把密钥复制进每个仓库（CODEX_API_KEY 本轮退役）。
-      # 代价：每个仓库都要在 chatgpt.com/codex/cloud/settings/environments 建一个
-      # 环境，没建的话 Codex 只回一句「先建环境」—— 那种回复在下面算失败。
+      # 代价：每个仓库都要在 chatgpt.com/settings/codex-cloud 建一个环境（照 README
+      # 的省额度建法，别走默认的自动设置），没建的话 Codex 只回一句「先建环境」——
+      # 那种回复在下面算失败。
       # MEL-266 实测：75 秒回了完整 diff，git apply 干净打上。
       - name: Ask Codex for the fix as a patch
         id: codex
@@ -3568,7 +3569,7 @@ jobs:
           case "$reason" in
             ok) ;;
             no-environment)
-              give_up codex-no-env '要先在 ChatGPT 里给这个仓库建一个 Codex 云端环境（默认设置即可，地址 chatgpt.com/codex/cloud/settings/environments），Codex 才接得了活；这一轮什么都没推。'
+              give_up codex-no-env '要先在 ChatGPT 里给这个仓库建一个 Codex 云端环境（地址 chatgpt.com/settings/codex-cloud），Codex 才接得了活；这一轮什么都没推。照 gh-workflows README「接完还要手动做一件事」那段的省额度建法建，别走默认的自动设置：那样会烧掉约一半的 5 小时 Codex 额度，审查也跟着停。'
               ;;
             codex-quota)
               give_up codex-no-patch 'Codex 这会儿也到额度上限了，这一轮什么都没推；过一会儿巡检会再修一次。'
