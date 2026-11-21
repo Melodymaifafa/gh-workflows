@@ -491,6 +491,11 @@ ask_codex() {
   body="$(fake_last_body 'gh pr comment')"
   assert_contains "$body" '建一个 Codex 云端环境'
   assert_contains "$body" 'reason=codex-no-env'
+  # 旧地址现在跳到通用设置页，默认的自动设置会烧掉约一半的 5 小时额度（MEL-809）。
+  assert_contains "$body" 'chatgpt.com/settings/codex-cloud'
+  assert_contains "$body" '省额度建法'
+  refute_contains "$body" 'codex/cloud/settings/environments'
+  refute_contains "$body" '默认设置即可'
 }
 
 @test "patch: a Codex quota reply is a red round, not a silent pass" {
